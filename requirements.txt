@@ -190,3 +190,7 @@ yaml                      0.2.5                he774522_0    https://mirrors.tun
 yarl                      1.20.0                   pypi_0    pypi
 zlib                      1.2.13               h8cc25b3_1    https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
 zstd                      1.5.6                h8880b57_0    https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+fastapi
+uvicorn[standard]
+python-multipart
+sse-starlette
