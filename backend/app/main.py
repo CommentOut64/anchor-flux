@@ -13,7 +13,7 @@ from datetime import datetime
 # 添加当前目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from processor import JobSettings, get_processor
+from processor import JobSettings, CPUAffinityConfig, get_processor
 
 app = FastAPI(title="Video To SRT API", version="0.3.0")
 
@@ -48,6 +48,11 @@ class TranscribeSettings(BaseModel):
     device: str = "cuda"
     batch_size: int = 16
     word_timestamps: bool = False
+    # CPU亲和性配置
+    cpu_affinity_enabled: bool = True
+    cpu_affinity_strategy: str = "auto"  # "auto", "half", "custom"
+    cpu_affinity_custom_cores: Optional[List[int]] = None
+    cpu_affinity_exclude_cores: Optional[List[int]] = None
 
 class UploadResponse(BaseModel):
     job_id: str
@@ -188,8 +193,25 @@ async def start(job_id: str = Form(...), settings: str = Form(...)):
     job = proc.get_job(job_id)
     if not job:
         return {"error": "无效 job_id"}
+    
+    # 创建CPU亲和性配置
+    cpu_config = CPUAffinityConfig(
+        enabled=settings_obj.cpu_affinity_enabled,
+        strategy=settings_obj.cpu_affinity_strategy,
+        custom_cores=settings_obj.cpu_affinity_custom_cores,
+        exclude_cores=settings_obj.cpu_affinity_exclude_cores
+    )
+    
     # 覆盖设置
-    job.settings = JobSettings(**settings_obj.dict())
+    job.settings = JobSettings(
+        model=settings_obj.model,
+        compute_type=settings_obj.compute_type,
+        device=settings_obj.device,
+        batch_size=settings_obj.batch_size,
+        word_timestamps=settings_obj.word_timestamps,
+        cpu_affinity=cpu_config
+    )
+    
     proc.start_job(job_id)
     return {"job_id": job_id, "started": True}
 
@@ -287,6 +309,23 @@ async def copy_result_to_source(job_id: str):
 @app.get("/api/ping")
 async def ping():
     return {"pong": True}
+
+@app.get("/api/cpu-info")
+async def get_cpu_info():
+    """获取系统CPU信息和亲和性支持状态"""
+    try:
+        cpu_info = proc.cpu_manager.get_system_info()
+        return {
+            "success": True,
+            "cpu_info": cpu_info,
+            "available_strategies": ["auto", "half", "custom"]
+        }
+    except Exception as e:
+        return {
+            "success": False, 
+            "error": str(e),
+            "cpu_info": {"supported": False}
+        }
 
 if __name__ == "__main__":
     import uvicorn

@@ -194,3 +194,4 @@ fastapi
 uvicorn[standard]
 python-multipart
 sse-starlette
+psutil

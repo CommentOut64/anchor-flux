@@ -9,7 +9,9 @@
       "Bash(curl:*)",
       "Bash(uvicorn:*)",
       "Bash(BACKEND_PORT=8002 npm run dev)",
-      "Bash(taskkill:*)"
+      "Bash(taskkill:*)",
+      "Bash(pip install:*)",
+      "Read(\\/**)"
     ],
     "deny": [],
     "ask": [],
