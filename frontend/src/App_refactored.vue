@@ -48,6 +48,7 @@
             @cancel-job="cancelJob"
             @restart-job="restartJob"
             @reset-selection="resetSelection"
+            @show-hardware="showHardwareDialog = true"
           />
 
           <!-- 3. 进度显示区域 -->
@@ -67,6 +68,9 @@
         </el-col>
       </el-row>
     </el-main>
+
+    <!-- 硬件信息对话框 -->
+    <HardwareDialog v-model="showHardwareDialog" />
   </el-container>
 </template>
 
@@ -78,6 +82,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import FileSelector from './components/file-management/FileSelector.vue'
 import TranscriptionSettings from './components/transcription/TranscriptionSettings.vue'
 import ProgressDisplay from './components/transcription/ProgressDisplay.vue'
+import HardwareDialog from './components/hardware/HardwareDialog.vue'
 
 // 导入服务
 import { FileService } from './services/fileService.js'
@@ -92,6 +97,9 @@ const inputDirPath = ref('input/')
 const uploading = ref(false)
 const uploadProgress = ref(0)
 const showUpload = ref(false) // 默认使用本地input模式
+
+// 硬件信息对话框
+const showHardwareDialog = ref(false)
 
 // 任务相关 
 const jobId = ref("")

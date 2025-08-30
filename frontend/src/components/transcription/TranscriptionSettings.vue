@@ -7,6 +7,16 @@
       <div class="card-header">
         <el-icon><Setting /></el-icon>
         <span>2. 设置参数并开始转录</span>
+        <div style="margin-left:auto; display:flex; gap:8px;">
+          <el-button 
+            type="info" 
+            size="small"
+            @click="$emit('show-hardware')"
+            plain>
+            <el-icon><Monitor /></el-icon>
+            硬件信息
+          </el-button>
+        </div>
       </div>
     </template>
     
@@ -130,7 +140,8 @@ const emits = defineEmits([
   'start-job',
   'cancel-job', 
   'restart-job',
-  'reset-selection'
+  'reset-selection',
+  'show-hardware'
 ])
 </script>
 

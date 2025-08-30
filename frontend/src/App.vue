@@ -26,6 +26,15 @@
                 <span>1. 选择媒体文件</span>
                 <div style="margin-left: auto; display: flex; gap: 8px;">
                   <el-button 
+                    type="info" 
+                    size="small"
+                    @click="showHardwareDialog = true"
+                    plain
+                  >
+                    <el-icon><Monitor /></el-icon>
+                    硬件信息
+                  </el-button>
+                  <el-button 
                     type="success" 
                     size="small"
                     @click="toggleUploadMode"
@@ -353,6 +362,9 @@
         </el-col>
       </el-row>
     </el-main>
+    
+    <!-- 硬件信息对话框 -->
+    <HardwareDialog v-model="showHardwareDialog" />
   </el-container>
 </template>
 
@@ -360,6 +372,7 @@
 import { ref, reactive, onMounted, computed, onUnmounted } from "vue";
 import axios from "axios";
 import { ElMessage, ElMessageBox } from 'element-plus';
+import HardwareDialog from './components/hardware/HardwareDialog.vue';
 
 // 文件选择相关
 const availableFiles = ref([]);
@@ -370,6 +383,9 @@ const inputDirPath = ref('input/');
 const uploading = ref(false);
 const uploadProgress = ref(0);
 const showUpload = ref(false); // 默认使用本地input模式
+
+// 硬件信息对话框
+const showHardwareDialog = ref(false);
 
 // 任务相关 
 const jobId = ref("");

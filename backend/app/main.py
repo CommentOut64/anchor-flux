@@ -327,6 +327,71 @@ async def get_cpu_info():
             "cpu_info": {"supported": False}
         }
 
+@app.get("/api/hardware/basic")
+async def get_hardware_basic():
+    """获取核心硬件信息"""
+    try:
+        # 创建临时的硬件检测服务以获取信息
+        from services.hardware_service import get_hardware_detector
+        detector = get_hardware_detector()
+        hardware_info = detector.detect()
+        
+        return {
+            "success": True,
+            "hardware": hardware_info.to_dict(),
+            "message": "硬件信息获取成功"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"获取硬件信息失败: {str(e)}"
+        }
+
+@app.get("/api/hardware/optimize")
+async def get_hardware_optimization():
+    """获取基于硬件的优化配置"""
+    try:
+        from services.hardware_service import get_hardware_detector, get_hardware_optimizer
+        detector = get_hardware_detector()
+        optimizer = get_hardware_optimizer()
+        
+        hardware_info = detector.detect()
+        optimization_config = optimizer.get_optimization_config(hardware_info)
+        
+        return {
+            "success": True,
+            "optimization": optimization_config.to_dict(),
+            "message": "优化配置获取成功"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"获取优化配置失败: {str(e)}"
+        }
+
+@app.get("/api/hardware/status")
+async def get_hardware_status():
+    """获取完整的硬件状态和优化信息"""
+    try:
+        from services.hardware_service import get_hardware_detector, get_hardware_optimizer
+        detector = get_hardware_detector()
+        optimizer = get_hardware_optimizer()
+        
+        hardware_info = detector.detect()
+        optimization_config = optimizer.get_optimization_config(hardware_info)
+        
+        return {
+            "success": True,
+            "hardware": hardware_info.to_dict(),
+            "optimization": optimization_config.to_dict(),
+            "message": "硬件状态获取成功"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"获取硬件状态失败: {str(e)}"
+        }
+
 if __name__ == "__main__":
     import uvicorn
     # 直接传入 app，关闭 reload，确保使用当前文件内定义的应用实例

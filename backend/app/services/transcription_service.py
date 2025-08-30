@@ -1,7 +1,7 @@
 """
 转录处理服务
 """
-import os, subprocess, uuid, threading, json, math, gc
+import os, subprocess, uuid, threading, json, math, gc, logging
 from typing import List, Dict, Optional, Tuple
 from pydub import AudioSegment, silence
 import whisperx
@@ -9,6 +9,8 @@ import torch
 import shutil
 
 from models.job_models import JobSettings, JobState
+from models.hardware_models import HardwareInfo, OptimizationConfig
+from services.hardware_service import get_hardware_detector, get_hardware_optimizer
 
 # 全局模型缓存 (按 (model, compute_type, device) 键)
 _model_cache: Dict[Tuple[str, str, str], object] = {}
@@ -40,6 +42,57 @@ class TranscriptionService:
         os.makedirs(self.jobs_root, exist_ok=True)
         self.jobs: Dict[str, JobState] = {}
         self.lock = threading.Lock()
+        self.logger = logging.getLogger(__name__)
+        
+        # 初始化硬件检测和优化
+        self.hardware_detector = get_hardware_detector()
+        self.hardware_optimizer = get_hardware_optimizer()
+        self._hardware_info: Optional[HardwareInfo] = None
+        self._optimization_config: Optional[OptimizationConfig] = None
+        
+        # 执行硬件检测
+        self._detect_hardware()
+
+    def _detect_hardware(self):
+        """执行硬件检测并生成优化配置"""
+        try:
+            self.logger.info("开始硬件检测...")
+            self._hardware_info = self.hardware_detector.detect()
+            self._optimization_config = self.hardware_optimizer.get_optimization_config(self._hardware_info)
+            
+            # 记录检测结果
+            hw = self._hardware_info
+            opt = self._optimization_config
+            self.logger.info(f"硬件检测完成 - GPU: {'✓' if hw.cuda_available else '✗'}, "
+                           f"CPU: {hw.cpu_cores}核/{hw.cpu_threads}线程, "
+                           f"内存: {hw.memory_total_mb}MB, "
+                           f"优化配置: batch={opt.batch_size}, device={opt.recommended_device}")
+        except Exception as e:
+            self.logger.error(f"硬件检测失败: {e}")
+    
+    def get_hardware_info(self) -> Optional[HardwareInfo]:
+        """获取硬件信息"""
+        return self._hardware_info
+    
+    def get_optimization_config(self) -> Optional[OptimizationConfig]:
+        """获取优化配置"""  
+        return self._optimization_config
+    
+    def get_optimized_job_settings(self, base_settings: Optional[JobSettings] = None) -> JobSettings:
+        """获取基于硬件优化的任务设置"""
+        # 使用硬件优化配置作为默认值
+        if self._optimization_config:
+            optimized = JobSettings(
+                model=base_settings.model if base_settings else "medium",
+                compute_type=base_settings.compute_type if base_settings else "float16",
+                device=self._optimization_config.recommended_device,
+                batch_size=self._optimization_config.batch_size,
+                word_timestamps=base_settings.word_timestamps if base_settings else False
+            )
+            return optimized
+        
+        # 如果没有硬件信息，使用传入的设置或默认设置
+        return base_settings or JobSettings()
 
     def create_job(self, filename: str, src_path: str, settings: JobSettings, job_id: Optional[str] = None) -> JobState:
         """创建转录任务"""

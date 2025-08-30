@@ -12,6 +12,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from services import get_transcription_service, FileManagementService
 from api.routes import create_file_router, create_transcription_router
+from api.routes.hardware_routes import create_hardware_router
 
 # FastAPI应用实例
 app = FastAPI(title="Video To SRT API", version="0.4.0")
@@ -47,10 +48,12 @@ file_service = FileManagementService(INPUT_DIR, OUTPUT_DIR)
 # 创建路由
 file_router = create_file_router(file_service)
 transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
+hardware_router = create_hardware_router(transcription_service)
 
 # 注册路由
 app.include_router(file_router)
 app.include_router(transcription_router)
+app.include_router(hardware_router)
 
 
 @app.get("/api/ping")

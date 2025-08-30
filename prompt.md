@@ -30,12 +30,9 @@
 
 ---
 
-请为video_to_srt_gpu项目实现模型预加载机制，优化模型加载性能。
 
-当前状态分析：
-- 现有代码在processor.py中使用全局模型缓存_model_cache
-- 模型在首次使用时才加载，导致首个任务启动较慢
-- 需要在服务启动时预加载常用模型
+
+请为video_to_srt_gpu项目实现模型预加载机制，优化模型加载性能。
 
 具体需求：
 1. 在服务启动时预加载默认模型配置（默认为medium）
@@ -58,6 +55,119 @@
 - 保持向后兼容
 - 详细的错误处理和日志
 - 清晰的进度反馈
+
+---
+请为video_to_srt_gpu项目实现核心硬件检测，专注于影响转录性能的关键硬件信息。
+
+检测重点（仅影响转录性能的核心部分）：
+1. GPU核心信息
+   - CUDA GPU数量
+   - 每个GPU显存容量（用于批处理大小决策）
+   - 是否支持CUDA（决定device参数）
+
+2. CPU基础信息
+   - CPU核心数（用于并发控制和CPU绑定）
+   - 是否支持多线程（影响并行策略）
+
+3. 内存关键信息
+   - 系统总内存（决定是否使用内存映射）
+   - 当前可用内存（防止内存不足）
+
+4. 存储基础信息
+   - 临时目录可用空间（确保有足够空间处理大文件）
+
+技术实现：
+1. 简化的硬件信息结构
+   ```python
+   @dataclass
+   class HardwareInfo:
+       # GPU关键信息
+       gpu_count: int
+       gpu_memory_mb: List[int]  # 每个GPU显存容量
+       cuda_available: bool
+       
+       # CPU关键信息  
+       cpu_cores: int
+       cpu_threads: int
+       
+       # 内存关键信息
+       memory_total_mb: int
+       memory_available_mb: int
+       
+       # 存储关键信息
+       temp_space_available_gb: int
+```
+2. 核心优化决策器
+```
+class CoreOptimizer:
+    def get_optimal_batch_size(self, gpu_memory_mb: int) -> int:
+        """根据GPU显存计算最优批处理大小"""
+        return min(32, gpu_memory_mb // 500)  # 每500MB支持batch_size=1
+    
+    def get_optimal_concurrency(self, cpu_cores: int, gpu_memory_mb: int) -> int:
+        """计算最优并发数"""
+        return min(cpu_cores // 2, gpu_memory_mb // 2000)
+    
+    def should_use_memory_mapping(self, memory_total_mb: int) -> bool:
+        """决定是否使用内存映射"""
+        return memory_total_mb < 8000  # 小于8GB强制使用
+    
+    def get_cpu_affinity_cores(self, total_cores: int) -> List[int]:
+        """获取CPU绑定核心列表"""
+        return list(range(min(4, total_cores // 2)))
+```
+3. 检测实现（只检测核心信息）
+```
+class CoreHardwareDetector:
+    def detect(self) -> HardwareInfo:
+        # GPU检测
+        gpu_info = self._detect_gpu()
+        
+        # CPU检测  
+        cpu_info = self._detect_cpu()
+        
+        # 内存检测
+        memory_info = self._detect_memory()
+        
+        # 存储检测
+        storage_info = self._detect_storage()
+        
+        return HardwareInfo(**gpu_info, **cpu_info, **memory_info, **storage_info)
+        ```
+        
+使用的库：
+torch: GPU信息检测
+psutil: CPU、内存信息
+shutil: 磁盘空间检测
+集成方式：
+
+在TranscriptionProcessor初始化时检测一次
+将结果用于JobSettings的默认值优化
+在API中提供简单的硬件状态端点
+输出示例：
+检测到硬件配置：
+- GPU: RTX 4090 (24GB显存)
+- CPU: 16核心/32线程
+- 内存: 32GB总量，28GB可用
+- 存储: 500GB可用空间
+
+自动优化配置：
+- 批处理大小: 48
+- 并发数: 8
+- 启用内存映射: 否
+- CPU绑定: 核心0-7
+
+预期效果：
+
+5秒内完成所有关键硬件检测
+自动生成针对当前硬件的最优配置
+为后续优化阶段提供必要的硬件基础信息
+检测失败时使用保守默认值，不影响功能
+API接口（简化）：
+
+GET /api/hardware/basic - 获取核心硬件信息
+GET /api/hardware/optimize - 获取基于硬件的优化配置
+
 
 ---
 
