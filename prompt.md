@@ -134,7 +134,7 @@ class CoreHardwareDetector:
         
         return HardwareInfo(**gpu_info, **cpu_info, **memory_info, **storage_info)
         ```
-        
+
 使用的库：
 torch: GPU信息检测
 psutil: CPU、内存信息
