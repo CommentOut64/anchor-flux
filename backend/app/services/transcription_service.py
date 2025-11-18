@@ -14,27 +14,13 @@ from models.job_models import JobSettings, JobState
 from models.hardware_models import HardwareInfo, OptimizationConfig
 from services.hardware_service import get_hardware_detector, get_hardware_optimizer
 from services.cpu_affinity_service import CPUAffinityManager, CPUAffinityConfig
+from core.config import config  # 导入统一配置
 
 # 全局模型缓存 (按 (model, compute_type, device) 键)
 _model_cache: Dict[Tuple[str, str, str], object] = {}
 _align_model_cache: Dict[str, Tuple[object, object]] = {}
 _model_lock = threading.Lock()
 _align_lock = threading.Lock()
-
-# 音频处理配置
-SEGMENT_LEN_MS = 60_000
-SILENCE_SEARCH_MS = 2_000
-MIN_SILENCE_LEN_MS = 300
-SILENCE_THRESH_DBFS = -40
-
-# 进度权重配置
-PHASE_WEIGHTS = {
-    "extract": 5,
-    "split": 10,
-    "transcribe": 80,
-    "srt": 5
-}
-TOTAL_WEIGHT = sum(PHASE_WEIGHTS.values())
 
 
 class TranscriptionService:
@@ -249,15 +235,19 @@ class TranscriptionService:
         """
         job.phase = phase
 
+        # 使用配置中的进度权重
+        phase_weights = config.PHASE_WEIGHTS
+        total_weight = config.TOTAL_WEIGHT
+
         # 计算累计进度
         done_weight = 0
-        for p, w in PHASE_WEIGHTS.items():
+        for p, w in phase_weights.items():
             if p == phase:
                 break
             done_weight += w
 
-        current_weight = PHASE_WEIGHTS.get(phase, 0) * max(0.0, min(1.0, phase_ratio))
-        job.progress = round((done_weight + current_weight) / TOTAL_WEIGHT * 100, 2)
+        current_weight = phase_weights.get(phase, 0) * max(0.0, min(1.0, phase_ratio))
+        job.progress = round((done_weight + current_weight) / total_weight * 100, 2)
 
         if message:
             job.message = message
@@ -403,16 +393,9 @@ class TranscriptionService:
             self.logger.debug(f"音频文件已存在，跳过提取: {audio_out}")
             return True
 
-        # 优先使用项目内的FFmpeg（支持独立打包）
-        project_root = Path(__file__).parent.parent.parent
-        local_ffmpeg = project_root / "ffmpeg" / "bin" / "ffmpeg.exe"
-
-        if local_ffmpeg.exists():
-            ffmpeg_cmd = str(local_ffmpeg)
-            self.logger.debug(f"使用项目内FFmpeg: {ffmpeg_cmd}")
-        else:
-            ffmpeg_cmd = 'ffmpeg'
-            self.logger.debug("使用系统FFmpeg")
+        # 使用配置中的FFmpeg命令（支持独立打包）
+        ffmpeg_cmd = config.get_ffmpeg_command()
+        self.logger.debug(f"使用FFmpeg: {ffmpeg_cmd}")
 
         cmd = [
             ffmpeg_cmd, '-y', '-i', input_file,
@@ -457,6 +440,13 @@ class TranscriptionService:
             List[Dict]: 段信息列表，每项包含 file 和 start_ms
         """
         self.logger.debug(f"开始音频分段: {audio_path}")
+
+        # 使用配置中的音频处理参数
+        audio_config = config.get_audio_config()
+        SEGMENT_LEN_MS = audio_config['segment_length_ms']
+        SILENCE_SEARCH_MS = audio_config['silence_search_ms']
+        MIN_SILENCE_LEN_MS = audio_config['min_silence_len_ms']
+        SILENCE_THRESH_DBFS = audio_config['silence_threshold_dbfs']
 
         audio = AudioSegment.from_wav(audio_path)
         length = len(audio)

@@ -16,6 +16,10 @@ from datetime import datetime
 # 添加当前目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+# 导入核心配置和日志
+from core.config import config
+from core.logging import setup_logging
+
 # 导入新的转录服务（替换processor）
 from services.transcription_service import get_transcription_service
 from models.job_models import JobSettings
@@ -29,6 +33,9 @@ from services.model_preload_manager import (
     get_cache_status
 )
 from config.model_config import ModelPreloadConfig
+
+# 配置日志（在其他初始化之前）
+logger = setup_logging()
 
 app = FastAPI(title="Video To SRT API", version="0.3.0")
 
@@ -50,7 +57,7 @@ async def startup_event():
         model_manager = initialize_model_manager(preload_config)
         logger.info("模型管理器初始化成功")
 
-        # 不在启动时预加载模型，等待前端就绪后通过API调用
+        # 不在启动时预加载模型，等待前端��绪后通过API调用
         logger.info("后端服务已就绪，等待前端启动后进行模型预加载")
 
     except Exception as e:
@@ -67,28 +74,14 @@ async def shutdown_event():
     except Exception as e:
         logger.error(f"清理资源失败: {str(e)}")
 
-# 目录配置
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-INPUT_DIR = os.path.join(BASE_DIR, "input")
-OUTPUT_DIR = os.path.join(BASE_DIR, "output") 
-JOBS_DIR = os.path.join(BASE_DIR, "jobs")
-TEMP_DIR = os.path.join(BASE_DIR, "temp")
+# 使用统一配置中的目录
+INPUT_DIR = str(config.INPUT_DIR)
+OUTPUT_DIR = str(config.OUTPUT_DIR)
+JOBS_DIR = str(config.JOBS_DIR)
+TEMP_DIR = str(config.TEMP_DIR)
 
-print(f"DEBUG: BASE_DIR = {BASE_DIR}")
-print(f"DEBUG: INPUT_DIR = {INPUT_DIR}")
-print(f"DEBUG: INPUT_DIR exists = {os.path.exists(INPUT_DIR)}")
-
-# 确保目录存在
-for dir_path in [INPUT_DIR, OUTPUT_DIR, JOBS_DIR, TEMP_DIR]:
-    os.makedirs(dir_path, exist_ok=True)
-
-# 初始化转录服务（替换processor）
+# 初始化转录服务
 transcription_service = get_transcription_service(JOBS_DIR)
-
-# 配置日志
-logging.basicConfig(level=logging.INFO, 
-                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 # 初始化模型预加载管理器
 preload_config = ModelPreloadConfig.get_preload_config()
