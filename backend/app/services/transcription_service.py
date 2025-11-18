@@ -538,6 +538,8 @@ class TranscriptionService:
         """
         获取对齐模型（带缓存）
 
+        集成模型管理器：如果模型不存在，会自动触发下载并等待完成
+
         Args:
             lang: 语言代码
             device: 设备 (cuda/cpu)
@@ -546,10 +548,64 @@ class TranscriptionService:
             Tuple[model, metadata]: 对齐模型和元数据
         """
         with _align_lock:
+            # 检查本地缓存
             if lang in _align_model_cache:
                 self.logger.debug(f"✅ 命中对齐模型缓存: {lang}")
                 return _align_model_cache[lang]
 
+            # 尝试使用模型预加载管理器（优先从LRU缓存获取）
+            try:
+                from services.model_preload_manager import get_model_manager as get_preload_manager
+                preload_mgr = get_preload_manager()
+                if preload_mgr:
+                    self.logger.debug("✅ 尝试从预加载管理器获取对齐模型")
+                    am, meta = preload_mgr.get_align_model(lang, device)
+                    _align_model_cache[lang] = (am, meta)
+                    return am, meta
+            except Exception as e:
+                self.logger.debug(f"预加载管理器获取失败，使用直接加载: {e}")
+
+            # 检查模型是否需要下载（使用模型管理服务）
+            try:
+                from services.model_manager_service import get_model_manager
+                model_mgr = get_model_manager()
+                align_model_info = model_mgr.align_models.get(lang)
+
+                if align_model_info and align_model_info.status == "not_downloaded":
+                    self.logger.warning(f"⚠️ 对齐模型未下载: {lang}")
+                    self.logger.info(f"🚀 自动触发下载对齐模型: {lang}")
+
+                    # 触发下载
+                    model_mgr.download_align_model(lang)
+
+                    # 等待下载完成（最多等待5分钟）
+                    import time
+                    max_wait_time = 300  # 5分钟
+                    wait_interval = 5  # 每5秒检查一次
+                    elapsed = 0
+
+                    while elapsed < max_wait_time:
+                        time.sleep(wait_interval)
+                        elapsed += wait_interval
+
+                        current_status = model_mgr.align_models[lang].status
+                        progress = model_mgr.align_models[lang].download_progress
+
+                        if current_status == "ready":
+                            self.logger.info(f"✅ 对齐模型下载完成: {lang}")
+                            break
+                        elif current_status == "error":
+                            raise RuntimeError(f"对齐模型下载失败: {lang}")
+                        else:
+                            self.logger.info(f"⏳ 等待对齐模型下载... {progress:.1f}% ({elapsed}s/{max_wait_time}s)")
+
+                    if elapsed >= max_wait_time:
+                        raise TimeoutError(f"对齐模型下载超时: {lang}")
+
+            except Exception as e:
+                self.logger.warning(f"模型管理服务检查失败: {e}")
+
+            # 直接加载模型（如果已下载或下载完成）
             self.logger.info(f"🔍 加载对齐模型: {lang}")
             am, meta = whisperx.load_align_model(language_code=lang, device=device)
             _align_model_cache[lang] = (am, meta)

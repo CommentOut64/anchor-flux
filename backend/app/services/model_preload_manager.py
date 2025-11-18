@@ -522,6 +522,181 @@ class ModelPreloadManager:
         
         self.logger.info(f"🗑️ 已清空所有模型缓存: Whisper={whisper_count}个, 对齐={align_count}个, 释放内存={total_memory}MB")
 
+    # ========== 单模型管理接口 - 委托给模型管理服务 ==========
+
+    def download_whisper_model(self, model_id: str) -> bool:
+        """
+        下载单个Whisper模型（委托给模型管理服务）
+
+        Args:
+            model_id: 模型ID (tiny, base, small, medium, large-v2, large-v3)
+
+        Returns:
+            bool: 是否成功启动下载
+        """
+        try:
+            from services.model_manager_service import get_model_manager
+            model_mgr = get_model_manager()
+            success = model_mgr.download_whisper_model(model_id)
+
+            if success:
+                self.logger.info(f"✅ 已委托模型管理服务下载Whisper模型: {model_id}")
+            return success
+
+        except Exception as e:
+            self.logger.error(f"❌ 下载Whisper模型失败: {model_id} - {e}")
+            return False
+
+    def download_align_model(self, language: str) -> bool:
+        """
+        下载单个对齐模型（委托给模型管理服务）
+
+        Args:
+            language: 语言代码
+
+        Returns:
+            bool: 是否成功启动下载
+        """
+        try:
+            from services.model_manager_service import get_model_manager
+            model_mgr = get_model_manager()
+            success = model_mgr.download_align_model(language)
+
+            if success:
+                self.logger.info(f"✅ 已委托模型管理服务下载对齐模型: {language}")
+            return success
+
+        except Exception as e:
+            self.logger.error(f"❌ 下载对齐模型失败: {language} - {e}")
+            return False
+
+    def delete_whisper_model(self, model_id: str) -> bool:
+        """
+        删除Whisper模型（委托给模型管理服务，并清理缓存）
+
+        Args:
+            model_id: 模型ID
+
+        Returns:
+            bool: 是否删除成功
+        """
+        try:
+            from services.model_manager_service import get_model_manager
+            model_mgr = get_model_manager()
+
+            # 先从缓存中移除
+            with self._global_lock:
+                keys_to_remove = [k for k in self._whisper_cache.keys() if k[0] == model_id]
+                for key in keys_to_remove:
+                    info = self._whisper_cache.pop(key)
+                    del info.model
+                    self.logger.debug(f"🗑️ 从缓存中移除模型: {key}")
+
+                # 更新缓存版本号
+                self._preload_status["cache_version"] = int(time.time())
+
+            # 清理GPU内存
+            if keys_to_remove:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            # 委托给模型管理服务删除磁盘文件
+            success = model_mgr.delete_whisper_model(model_id)
+
+            if success:
+                self.logger.info(f"✅ 已删除Whisper模型: {model_id}")
+            return success
+
+        except Exception as e:
+            self.logger.error(f"❌ 删除Whisper模型失败: {model_id} - {e}")
+            return False
+
+    def delete_align_model(self, language: str) -> bool:
+        """
+        删除对齐模型（委托给模型管理服务，并清理缓存）
+
+        Args:
+            language: 语言代码
+
+        Returns:
+            bool: 是否删除成功
+        """
+        try:
+            from services.model_manager_service import get_model_manager
+            model_mgr = get_model_manager()
+
+            # 先从缓存中移除
+            with self._global_lock:
+                if language in self._align_cache:
+                    del self._align_cache[language]
+                    self.logger.debug(f"🗑️ 从缓存中移除对齐模型: {language}")
+
+                    # 更新缓存版本号
+                    self._preload_status["cache_version"] = int(time.time())
+
+            # 委托给模型管理服务删除磁盘文件
+            success = model_mgr.delete_align_model(language)
+
+            if success:
+                self.logger.info(f"✅ 已删除对齐模型: {language}")
+            return success
+
+        except Exception as e:
+            self.logger.error(f"❌ 删除对齐模型失败: {language} - {e}")
+            return False
+
+    def list_all_models(self) -> Dict[str, Any]:
+        """
+        列出所有模型的状态（整合磁盘状态和缓存状态）
+
+        Returns:
+            Dict: 包含whisper和align模型的状态信息
+        """
+        try:
+            from services.model_manager_service import get_model_manager
+            model_mgr = get_model_manager()
+
+            # 获取磁盘上的模型状态
+            whisper_models = [
+                {
+                    "model_id": m.model_id,
+                    "size_mb": m.size_mb,
+                    "status": m.status,
+                    "download_progress": m.download_progress,
+                    "local_path": m.local_path,
+                    "description": m.description,
+                    "cached": any(k[0] == m.model_id for k in self._whisper_cache.keys())
+                }
+                for m in model_mgr.list_whisper_models()
+            ]
+
+            align_models = [
+                {
+                    "language": m.language,
+                    "language_name": m.language_name,
+                    "status": m.status,
+                    "download_progress": m.download_progress,
+                    "local_path": m.local_path,
+                    "cached": m.language in self._align_cache
+                }
+                for m in model_mgr.list_align_models()
+            ]
+
+            return {
+                "whisper_models": whisper_models,
+                "align_models": align_models,
+                "cache_info": {
+                    "whisper_cached": len(self._whisper_cache),
+                    "align_cached": len(self._align_cache),
+                    "total_memory_mb": sum(info.memory_size for info in self._whisper_cache.values())
+                }
+            }
+
+        except Exception as e:
+            self.logger.error(f"❌ 列出模型失败: {e}")
+            return {"error": str(e)}
+
 
 class MemoryMonitor:
     """内存监控器"""
