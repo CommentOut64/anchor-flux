@@ -174,6 +174,14 @@ function connectGlobalSSE() {
     const data = JSON.parse(e.data);
     console.log("[SSE] 模型不完整:", data);
     updateGlobalModelProgress(data.type, data.model_id, 0, "incomplete");
+
+    // 弹窗提示用户
+    const modelName = data.type === "whisper" ? `Whisper模型 ${data.model_id}` : `对齐模型 ${data.model_id}`;
+    ElMessage.warning({
+      message: `${modelName} 文件不完整，请重新下载`,
+      duration: 5000,
+      showClose: true
+    });
   });
 
   // 监听心跳

@@ -155,6 +155,7 @@ async def get_download_progress():
 # ========== SSE 实时进度推送端点 ==========
 
 # 存储活动的 SSE 连接队列（改用 asyncio.Queue）
+# 增大队列容量，避免频繁更新时队列溢出
 sse_queues: List[asyncio.Queue] = []
 
 # 获取当前事件循环的引用（在应用启动时设置）
@@ -166,18 +167,32 @@ def set_event_loop():
     try:
         _event_loop = asyncio.get_running_loop()
         logger.info("✅ SSE事件循环已设置")
-    except RuntimeError:
-        logger.warning("⚠️ 无法获取事件循环，SSE功能可能无法正常工作")
+        return True
+    except RuntimeError as e:
+        logger.warning(f"⚠️ 无法获取事件循环: {e}")
+        return False
 
 def get_event_loop():
-    """获取事件循环引用"""
+    """获取事件循环引用（线程安全，支持延迟获取）"""
     global _event_loop
-    if _event_loop is None:
-        set_event_loop()
+    if _event_loop is None or _event_loop.is_closed():
+        try:
+            _event_loop = asyncio.get_running_loop()
+            logger.debug("🔄 延迟获取事件循环成功")
+        except RuntimeError:
+            logger.debug("⚠️ 当前线程没有运行中的事件循环")
+            return None
     return _event_loop
 
 def progress_callback(model_type: str, model_id: str, progress: float, status: str, message: str = ""):
-    """进度回调函数，用于推送到所有 SSE 连接（线程安全）"""
+    """
+    进度回调函数，用于推送到所有 SSE 连接（线程安全，优化队列溢出处理）
+
+    关键优化：
+    1. 检查队列容量，避免 QueueFull 异常
+    2. 队列满时跳过更新，而不是抛出异常
+    3. 降低日志级别，避免日志洪水
+    """
     event_data = {
         "type": model_type,
         "model_id": model_id,
@@ -190,16 +205,43 @@ def progress_callback(model_type: str, model_id: str, progress: float, status: s
     # 获取事件循环
     loop = get_event_loop()
     if loop is None:
-        logger.warning("⚠️ 事件循环未设置，无法推送SSE消息")
+        # 只在第一次失败时警告，避免日志洪水
+        if not hasattr(progress_callback, '_warned'):
+            logger.warning(f"⚠️ 事件循环未设置，无法推送SSE消息")
+            progress_callback._warned = True
         return
 
     # 使用 call_soon_threadsafe 从下载线程向主事件循环注入消息
+    success_count = 0
+    skipped_count = 0
+
     for q in sse_queues[:]:  # 使用切片复制列表
         try:
+            # 关键优化：检查队列容量，避免 QueueFull 异常
+            current_size = q.qsize()
+            max_size = q.maxsize
+
+            # 如果队列使用率超过90%，跳过此次更新（保留紧急容量）
+            if current_size >= max_size * 0.9:
+                skipped_count += 1
+                # 只记录 debug 级别，避免日志洪水
+                if skipped_count == 1:  # 只记录第一次跳过
+                    logger.debug(f"队列接近满({current_size}/{max_size})，跳过更新: {model_type}/{model_id}")
+                continue
+
             # 线程安全地将消息放入队列
             loop.call_soon_threadsafe(q.put_nowait, event_data)
+            success_count += 1
+
         except Exception as e:
-            logger.warning(f"⚠️ 推送SSE消息失败: {e}")
+            # 降低日志级别，避免日志洪水
+            logger.debug(f"推送SSE消息失败: {e}")
+
+    # 只在成功推送或有跳过时记录 debug 日志
+    if success_count > 0:
+        logger.debug(f"SSE消息已推送到 {success_count} 个连接: {model_type}/{model_id} - {status} ({progress:.1f}%)")
+    if skipped_count > 0 and skipped_count % 10 == 0:  # 每10次跳过才记录一次
+        logger.debug(f"已跳过 {skipped_count} 次更新（队列繁忙）")
 
 # 注册进度回调
 model_manager.register_progress_callback(progress_callback)
@@ -221,9 +263,9 @@ async def stream_all_progress(request: Request):
     """
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        """SSE事件生成器（非阻塞实现）"""
-        # 创建此连接的专用 asyncio.Queue
-        event_queue = asyncio.Queue(maxsize=100)
+        """SSE事件生成器（非阻塞实现，优化队列大小）"""
+        # 创建此连接的专用 asyncio.Queue（增大容量到1000，避免频繁溢出）
+        event_queue = asyncio.Queue(maxsize=1000)
         sse_queues.append(event_queue)
 
         heartbeat_counter = 0

@@ -53,6 +53,58 @@ class ModelManagerService:
         "hi": "印地语 (Hindi)",
     }
 
+    # 对齐模型的实际路径名称映射（HuggingFace仓库中的完整名称）
+    ALIGN_MODEL_PATHS = {
+        "zh": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn",
+            "models--facebook--wav2vec2-large-xlsr-53-chinese-zh-cn",
+        ],
+        "en": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-english",
+            "models--facebook--wav2vec2-large-xlsr-53-english",
+        ],
+        "ja": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-japanese",
+            "models--facebook--wav2vec2-large-xlsr-53-japanese",
+        ],
+        "ko": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-korean",
+            "models--facebook--wav2vec2-large-xlsr-53-korean",
+        ],
+        "es": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-spanish",
+            "models--facebook--wav2vec2-large-xlsr-53-spanish",
+        ],
+        "fr": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-french",
+            "models--facebook--wav2vec2-large-xlsr-53-french",
+        ],
+        "de": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-german",
+            "models--facebook--wav2vec2-large-xlsr-53-german",
+        ],
+        "ru": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-russian",
+            "models--facebook--wav2vec2-large-xlsr-53-russian",
+        ],
+        "pt": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-portuguese",
+            "models--facebook--wav2vec2-large-xlsr-53-portuguese",
+        ],
+        "it": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-italian",
+            "models--facebook--wav2vec2-large-xlsr-53-italian",
+        ],
+        "ar": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-arabic",
+            "models--facebook--wav2vec2-large-xlsr-53-arabic",
+        ],
+        "hi": [
+            "models--jonatasgrosman--wav2vec2-large-xlsr-53-hindi",
+            "models--facebook--wav2vec2-large-xlsr-53-hindi",
+        ],
+    }
+
     # Whisper模型推荐的对齐模型（默认为中文）
     WHISPER_RECOMMENDED_ALIGN_MODELS = {
         "tiny": "zh",
@@ -73,6 +125,11 @@ class ModelManagerService:
         self.models_dir = models_dir or config.MODELS_DIR
         self.logger = logging.getLogger(__name__)
 
+        print("="*80)
+        print("🚀 ModelManagerService 初始化开始")
+        print(f"📁 模型目录: {self.models_dir}")
+        print("="*80)
+
         # 模型状态跟踪
         self.whisper_models: Dict[str, ModelInfo] = {}
         self.align_models: Dict[str, AlignModelInfo] = {}
@@ -86,49 +143,190 @@ class ModelManagerService:
         self.progress_callbacks: List[Callable] = []
 
         # 初始化模型信息
+        print("🔍 开始快速扫描本地模型...")
         self._init_model_info()
+        print(f"✅ 模型扫描完成: Whisper={len([m for m in self.whisper_models.values() if m.status == 'ready'])}/{len(self.whisper_models)}, Align={len([m for m in self.align_models.values() if m.status == 'ready'])}/{len(self.align_models)}")
 
         # 启动后台验证任务
+        print("🔧 启动后台验证线程...")
         threading.Thread(target=self._background_validate_models, daemon=True).start()
+        print("="*80)
 
     def _init_model_info(self):
-        """扫描本地已有模型并验证完整性"""
-        self.logger.info("🔍 扫描本地已有模型...")
+        """快速扫描本地已有模型（不进行完整性验证，留给后台任务）"""
+        self.logger.info("🔍 快速扫描本地模型...")
+        print("🔍 快速扫描本地模型...")
 
-        # 初始化Whisper模型信息
+        # 初始化Whisper模型信息（仅检查目录是否存在）
         for model_id, info in self.WHISPER_MODELS.items():
-            status, local_path, validation_msg = self._check_whisper_model_exists(model_id)
-            
-            self.whisper_models[model_id] = ModelInfo(
-                model_id=model_id,
-                size_mb=info["size_mb"],
-                status=status,
-                download_progress=100.0 if status == "ready" else 0.0,
-                local_path=str(local_path) if local_path else None,
-                description=info["desc"]
-            )
-            
-            if status == "ready":
-                self.logger.info(f"✅ 发现完整的Whisper模型: {model_id}")
-            elif status == "incomplete":
-                self.logger.warning(f"⚠️ Whisper模型不完整: {model_id}\n{validation_msg}")
+            # 快速检测：只检查目录是否存在
+            exists, local_path = self._quick_check_whisper_model(model_id)
 
-        # 初始化对齐模型信息
+            if exists:
+                # 目录存在，先标记为ready，后台会验证完整性
+                self.whisper_models[model_id] = ModelInfo(
+                    model_id=model_id,
+                    size_mb=info["size_mb"],
+                    status="ready",
+                    download_progress=100.0,
+                    local_path=str(local_path) if local_path else None,
+                    description=info["desc"]
+                )
+                print(f"   ✅ Whisper模型 {model_id}: 已下载 (路径: {local_path})")
+                self.logger.info(f"✅ 发现Whisper模型目录: {model_id}（待后台验证）")
+            else:
+                # 目录不存在，标记为未下载
+                self.whisper_models[model_id] = ModelInfo(
+                    model_id=model_id,
+                    size_mb=info["size_mb"],
+                    status="not_downloaded",
+                    download_progress=0.0,
+                    local_path=None,
+                    description=info["desc"]
+                )
+                print(f"   ⚪ Whisper模型 {model_id}: 未下载")
+
+        # 初始化对齐模型信息（仅检查目录是否存在）
         for lang, name in self.SUPPORTED_LANGUAGES.items():
-            status, local_path, validation_msg = self._check_align_model_exists(lang)
-            
-            self.align_models[lang] = AlignModelInfo(
-                language=lang,
-                language_name=name,
-                status=status,
-                download_progress=100.0 if status == "ready" else 0.0,
-                local_path=str(local_path) if local_path else None
-            )
-            
-            if status == "ready":
-                self.logger.info(f"✅ 发现完整的对齐模型: {lang} ({name})")
-            elif status == "incomplete":
-                self.logger.warning(f"⚠️ 对齐模型不完整: {lang}\n{validation_msg}")
+            # 快速检测：只检查目录是否存在
+            exists, local_path = self._quick_check_align_model(lang)
+
+            if exists:
+                # 目录存在，先标记为ready，后台会验证完整性
+                self.align_models[lang] = AlignModelInfo(
+                    language=lang,
+                    language_name=name,
+                    status="ready",
+                    download_progress=100.0,
+                    local_path=str(local_path) if local_path else None
+                )
+                print(f"   ✅ 对齐模型 {lang} ({name}): 已下载 (路径: {local_path})")
+                self.logger.info(f"✅ 发现对齐模型目录: {lang} ({name})（待后台验证）")
+            else:
+                # 目录不存在，标记为未下载
+                self.align_models[lang] = AlignModelInfo(
+                    language=lang,
+                    language_name=name,
+                    status="not_downloaded",
+                    download_progress=0.0,
+                    local_path=None
+                )
+                print(f"   ⚪ 对齐模型 {lang} ({name}): 未下载")
+
+    def _get_latest_snapshot(self, model_dir: Path) -> Optional[Path]:
+        """
+        获取模型的最新快照（优先使用refs/main指向的快照）
+
+        Args:
+            model_dir: 模型目录
+
+        Returns:
+            最新快照路径，如果不存在则返回None
+        """
+        # 优先使用refs/main指向的快照
+        main_ref = model_dir / "refs" / "main"
+        if main_ref.exists():
+            try:
+                snapshot_id = main_ref.read_text().strip()
+                snapshot_path = model_dir / "snapshots" / snapshot_id
+                if snapshot_path.exists() and snapshot_path.is_dir():
+                    self.logger.debug(f"   使用main引用的快照: {snapshot_id}")
+                    return snapshot_path
+            except Exception as e:
+                self.logger.warning(f"   读取main引用失败: {e}")
+
+        # 回退到最新修改时间的快照
+        snapshots_dir = model_dir / "snapshots"
+        if not snapshots_dir.exists():
+            return None
+
+        snapshots = [d for d in snapshots_dir.iterdir() if d.is_dir()]
+        if not snapshots:
+            return None
+
+        latest = max(snapshots, key=lambda p: p.stat().st_mtime)
+        self.logger.debug(f"   使用最新快照（按时间）: {latest.name}")
+        return latest
+
+    def _quick_check_whisper_model(self, model_id: str) -> tuple[bool, Optional[Path]]:
+        """
+        快速检查Whisper模型目录是否存在（不验证完整性）
+
+        Args:
+            model_id: 模型ID
+
+        Returns:
+            tuple: (是否存在, 本地路径)
+        """
+        # 模型实际存储在 HF_CACHE_DIR 直接目录下（不是hub子目录）
+        hf_cache = config.HF_CACHE_DIR
+
+        print(f"      🔍 检查 {model_id}")
+        print(f"         HF缓存: {hf_cache}")
+        print(f"         是否存在: {hf_cache.exists()}")
+
+        # 检查可能的模型缓存路径
+        possible_paths = [
+            hf_cache / f"models--Systran--faster-whisper-{model_id}",
+            hf_cache / f"models--guillaumekln--faster-whisper-{model_id}",
+        ]
+
+        for model_dir in possible_paths:
+            print(f"         检查路径: {model_dir}")
+            print(f"         路径存在: {model_dir.exists()}")
+            if not model_dir.exists():
+                continue
+
+            # 使用统一的快照选择逻辑
+            latest_snapshot = self._get_latest_snapshot(model_dir)
+            if latest_snapshot:
+                print(f"         ✅ 找到快照: {latest_snapshot}")
+                self.logger.info(f"   ✓ 检测到Whisper模型: {model_id} (路径: {latest_snapshot.name})")
+                return (True, latest_snapshot)
+
+        self.logger.debug(f"   ✗ 未检测到Whisper模型: {model_id}")
+        return (False, None)
+
+    def _quick_check_align_model(self, language: str) -> tuple[bool, Optional[Path]]:
+        """
+        快速检查对齐模型目录是否存在（不验证完整性）
+
+        Args:
+            language: 语言代码
+
+        Returns:
+            tuple: (是否存在, 本地路径)
+        """
+        # 模型实际存储在 HF_CACHE_DIR 直接目录下（不是hub子目录）
+        hf_cache = config.HF_CACHE_DIR
+
+        # 使用预定义的路径映射
+        model_patterns = self.ALIGN_MODEL_PATHS.get(language, [])
+
+        if not model_patterns:
+            self.logger.warning(f"⚠️ 语言 {language} 没有对应的模型路径映射")
+            return (False, None)
+
+        print(f"      🔍 检查对齐模型 {language}")
+        print(f"         候选路径: {model_patterns}")
+
+        for pattern in model_patterns:
+            model_dir = hf_cache / pattern
+            print(f"         检查: {model_dir}")
+            print(f"         存在: {model_dir.exists()}")
+
+            if not model_dir.exists():
+                continue
+
+            # 使用统一的快照选择逻辑
+            latest_snapshot = self._get_latest_snapshot(model_dir)
+            if latest_snapshot:
+                print(f"         ✅ 找到快照: {latest_snapshot}")
+                self.logger.info(f"   ✓ 检测到对齐模型: {language} (路径: {latest_snapshot.name})")
+                return (True, latest_snapshot)
+
+        self.logger.debug(f"   ✗ 未检测到对齐模型: {language}")
+        return (False, None)
 
     def _check_whisper_model_exists(self, model_id: str) -> tuple[str, Optional[Path], str]:
         """
@@ -142,7 +340,7 @@ class ModelManagerService:
             状态可以是: "ready"(完整), "incomplete"(不完整), "not_downloaded"(不存在)
         """
         # WhisperX模型缓存在HuggingFace缓存目录中
-        hf_cache = config.HF_CACHE_DIR / "hub"
+        hf_cache = config.HF_CACHE_DIR  # 修复：直接使用 HF_CACHE_DIR，不加 hub
 
         # 检查可能的模型缓存路径
         possible_paths = [
@@ -158,14 +356,12 @@ class ModelManagerService:
                 self.logger.debug(f"    ✗ 路径不存在")
                 continue
 
-            # 查找快照目录
-            snapshots = ModelValidator.find_model_snapshots(hf_cache, model_dir.name)
-            self.logger.debug(f"    找到 {len(snapshots)} 个快照")
-            if not snapshots:
+            # 使用统一的快照选择逻辑
+            latest_snapshot = self._get_latest_snapshot(model_dir)
+            if not latest_snapshot:
+                self.logger.debug(f"    ✗ 未找到有效快照")
                 continue
 
-            # 检查最新的快照
-            latest_snapshot = max(snapshots, key=lambda p: p.stat().st_mtime)
             self.logger.debug(f"    最新快照: {latest_snapshot}")
 
             # 验证完整性
@@ -192,30 +388,27 @@ class ModelManagerService:
             tuple: (状态, 本地路径, 验证信息)
         """
         # 对齐模型也缓存在HuggingFace目录中
-        hf_cache = config.HF_CACHE_DIR / "hub"
+        hf_cache = config.HF_CACHE_DIR  # 修复：直接使用 HF_CACHE_DIR，不加 hub
 
-        # 不同语言的模型名称可能不同
-        model_patterns = [
-            f"models--jonatasgrosman--wav2vec2-large-xlsr-53-{language}",
-            f"models--facebook--wav2vec2-large-xlsr-53-{language}",
-        ]
+        # 使用预定义的路径映射
+        model_patterns = self.ALIGN_MODEL_PATHS.get(language, [])
+
+        if not model_patterns:
+            return ("not_downloaded", None, f"语言 {language} 没有对应的模型路径映射")
 
         for pattern in model_patterns:
             model_dir = hf_cache / pattern
             if not model_dir.exists():
                 continue
-            
-            # 查找快照目录
-            snapshots = ModelValidator.find_model_snapshots(hf_cache, pattern)
-            if not snapshots:
+
+            # 使用统一的快照选择逻辑
+            latest_snapshot = self._get_latest_snapshot(model_dir)
+            if not latest_snapshot:
                 continue
-            
-            # 检查最新的快照
-            latest_snapshot = max(snapshots, key=lambda p: p.stat().st_mtime)
-            
+
             # 验证完整性
             is_complete, missing_files, detail = ModelValidator.validate_align_model(latest_snapshot)
-            
+
             if is_complete:
                 return ("ready", latest_snapshot, detail)
             else:
@@ -250,29 +443,55 @@ class ModelManagerService:
                 self.logger.error(f"进度回调失败: {e}")
     
     def _background_validate_models(self):
-        """后台异步验证所有模型完整性"""
-        time.sleep(10)  # 启动后延迟10秒再验证
-        
+        """后台异步验证所有模型完整性（立即启动，无延迟）"""
         self.logger.info("🔍 开始后台验证模型完整性...")
-        
+
         # 验证 Whisper 模型
         for model_id, model in self.whisper_models.items():
             if model.status == "ready":
+                self.logger.debug(f"🔍 验证Whisper模型: {model_id}")
                 status, local_path, detail = self._check_whisper_model_exists(model_id)
+
                 if status != "ready":
-                    self.logger.warning(f"⚠️ 后台验证发现模型不完整: {model_id}")
+                    # 验证失败，立即更新状态并通知前端
+                    self.logger.warning(f"⚠️ 后台验证发现模型不完整: {model_id}\n{detail}")
                     model.status = "incomplete"
-                    self._notify_progress("whisper", model_id, 0, "incomplete", "模型文件不完整，请重新下载")
-        
+                    model.download_progress = 0.0
+
+                    # 通过SSE通知前端
+                    self._notify_progress(
+                        "whisper",
+                        model_id,
+                        0,
+                        "incomplete",
+                        f"模型文件不完整：{detail}"
+                    )
+                else:
+                    self.logger.info(f"✅ Whisper模型验证通过: {model_id}")
+
         # 验证对齐模型
         for lang, model in self.align_models.items():
             if model.status == "ready":
+                self.logger.debug(f"🔍 验证对齐模型: {lang}")
                 status, local_path, detail = self._check_align_model_exists(lang)
+
                 if status != "ready":
-                    self.logger.warning(f"⚠️ 后台验证发现对齐模型不完整: {lang}")
+                    # 验证失败，立即更新状态并通知前端
+                    self.logger.warning(f"⚠️ 后台验证发现对齐模型不完整: {lang}\n{detail}")
                     model.status = "incomplete"
-                    self._notify_progress("align", lang, 0, "incomplete", "模型文件不完整，请重新下载")
-        
+                    model.download_progress = 0.0
+
+                    # 通过SSE通知前端
+                    self._notify_progress(
+                        "align",
+                        lang,
+                        0,
+                        "incomplete",
+                        f"模型文件不完整：{detail}"
+                    )
+                else:
+                    self.logger.info(f"✅ 对齐模型验证通过: {lang}")
+
         self.logger.info("✅ 后台模型验证完成")
 
     def download_whisper_model(self, model_id: str) -> bool:
@@ -324,15 +543,20 @@ class ModelManagerService:
             # 标记为下载中
             self.downloading_models[model_key] = True
 
-        # 如果模型不完整，清理旧文件
+        # 如果模型不完整，清理旧文件（只清理该模型，不影响其他模型）
         if status == "incomplete" and local_path:
             self.logger.warning(f"🗑️ 清理不完整的模型文件: {model_id}")
             try:
-                # 删除整个模型目录
-                model_parent = local_path.parent.parent.parent
-                if model_parent.exists():
-                    shutil.rmtree(model_parent)
-                    self.logger.info(f"✅ 已清理: {model_parent}")
+                # 获取该模型的根目录：snapshots的上两级
+                # 结构: models--Systran--faster-whisper-xxx/snapshots/hash/
+                # 需要删除: models--Systran--faster-whisper-xxx/
+                model_root = local_path.parent.parent
+                if model_root.exists() and model_root.name.startswith("models--"):
+                    self.logger.info(f"🗑️ 删除不完整模型目录: {model_root}")
+                    shutil.rmtree(model_root)
+                    self.logger.info(f"✅ 已清理不完整模型: {model_root.name}")
+                else:
+                    self.logger.warning(f"⚠️ 模型路径异常，跳过清理: {model_root}")
             except Exception as e:
                 self.logger.error(f"清理失败: {e}")
 
@@ -431,7 +655,7 @@ class ModelManagerService:
 
     def delete_whisper_model(self, model_id: str) -> bool:
         """
-        删除Whisper模型
+        删除Whisper模型（只删除指定模型，不影响其他模型）
 
         Args:
             model_id: 模型ID
@@ -449,11 +673,19 @@ class ModelManagerService:
             return False
 
         try:
-            # 删除模型目录
+            # 获取模型的根目录（删除整个模型缓存，而非仅快照）
             local_path = Path(model.local_path)
-            if local_path.exists():
-                shutil.rmtree(local_path)
-                self.logger.info(f"🗑️ 已删除Whisper模型: {model_id}")
+            # 结构: models--Systran--faster-whisper-xxx/snapshots/hash/
+            # 需要删除: models--Systran--faster-whisper-xxx/
+            model_root = local_path.parent.parent
+
+            if model_root.exists() and model_root.name.startswith("models--"):
+                self.logger.info(f"🗑️ 删除Whisper模型目录: {model_root}")
+                shutil.rmtree(model_root)
+                self.logger.info(f"✅ 已删除Whisper模型: {model_id} ({model_root.name})")
+            else:
+                self.logger.warning(f"⚠️ 模型路径异常: {model_root}")
+                return False
 
             # 更新状态
             model.status = "not_downloaded"
@@ -468,7 +700,7 @@ class ModelManagerService:
 
     def delete_align_model(self, language: str) -> bool:
         """
-        删除对齐模型
+        删除对齐模型（只删除指定模型，不影响其他模型）
 
         Args:
             language: 语言代码
@@ -486,11 +718,19 @@ class ModelManagerService:
             return False
 
         try:
-            # 删除模型目录
+            # 获取模型的根目录（删除整个模型缓存，而非仅快照）
             local_path = Path(model.local_path)
-            if local_path.exists():
-                shutil.rmtree(local_path)
-                self.logger.info(f"🗑️ 已删除对齐模型: {language}")
+            # 结构: models--jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn/snapshots/hash/
+            # 需要删除: models--jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn/
+            model_root = local_path.parent.parent
+
+            if model_root.exists() and model_root.name.startswith("models--"):
+                self.logger.info(f"🗑️ 删除对齐模型目录: {model_root}")
+                shutil.rmtree(model_root)
+                self.logger.info(f"✅ 已删除对齐模型: {language} ({model_root.name})")
+            else:
+                self.logger.warning(f"⚠️ 模型路径异常: {model_root}")
+                return False
 
             # 更新状态
             model.status = "not_downloaded"
@@ -603,82 +843,251 @@ class ModelManagerService:
             last_error = None
             local_dir = None  # 初始化下载路径变量
             
-            # 方式1: 使用 huggingface_hub 直接下载（更可控）
+            # 方式1: 使用 requests 手动下载（完全控制，带实时进度追踪）
             if not download_success:
                 try:
-                    self.logger.info(f"🔄 方式1: 使用 huggingface_hub 下载...")
-                    self._notify_progress("whisper", model_id, 10, "downloading", "连接下载源...")
-                    
-                    from huggingface_hub import snapshot_download
-                    
+                    self.logger.info(f"🔄 方式1: 使用手动下载方式...")
+                    self._notify_progress("whisper", model_id, 0, "downloading", "准备下载...")
+
+                    import requests
+                    from huggingface_hub import hf_hub_url, list_repo_files
+                    from pathlib import Path as PathlibPath
+
                     repo_id = f"Systran/faster-whisper-{model_id}"
                     cache_dir = str(config.HF_CACHE_DIR)
-                    
+
                     if use_mirror:
                         self.logger.info(f"📦 从镜像站下载: {config.HF_ENDPOINT}")
                     else:
                         self.logger.info(f"📦 从官方源下载: {repo_id}")
-                    
-                    self._notify_progress("whisper", model_id, 20, "downloading", "正在下载模型文件...")
-                    model.download_progress = 20.0
-                    
-                    local_dir = snapshot_download(
-                        repo_id=repo_id,
-                        cache_dir=cache_dir,
-                        local_files_only=False,
-                    )
-                    
+
+                    # 获取文件列表
+                    self.logger.info("📋 获取模型文件列表...")
+                    files = list_repo_files(repo_id, repo_type="model")
+
+                    # 分类文件：小文件和大文件（model.bin）
+                    small_files = [f for f in files if not f.endswith('.bin')]
+                    large_files = [f for f in files if f.endswith('.bin')]
+
+                    self.logger.info(f"📦 需要下载 {len(small_files)} 个配置文件和 {len(large_files)} 个模型文件")
+
+                    # 确定保存路径（使用HuggingFace的标准路径结构）
+                    # 格式：models--Systran--faster-whisper-{model_id}
+                    repo_path = repo_id.replace("/", "--")
+                    storage_folder = PathlibPath(cache_dir) / f"models--{repo_path}"
+
+                    # 创建snapshots目录
+                    snapshots_dir = storage_folder / "snapshots"
+                    # 使用时间戳作为snapshot ID
+                    import hashlib
+                    snapshot_id = hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
+                    snapshot_dir = snapshots_dir / snapshot_id
+                    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+                    # 阶段1：下载小文件（0% -> 10%）
+                    for idx, filename in enumerate(small_files):
+                        try:
+                            progress = (idx / len(small_files)) * 10
+                            self._notify_progress("whisper", model_id, progress, "downloading", f"下载配置文件 ({idx+1}/{len(small_files)})")
+                            model.download_progress = progress
+
+                            url = hf_hub_url(repo_id, filename, repo_type="model")
+                            response = requests.get(url, timeout=(30, 300))  # 连接30秒，读取5分钟
+                            response.raise_for_status()
+
+                            file_path = snapshot_dir / filename
+                            file_path.parent.mkdir(parents=True, exist_ok=True)
+                            file_path.write_bytes(response.content)
+
+                            self.logger.info(f"  ✓ {filename}")
+                        except Exception as e:
+                            self.logger.warning(f"  ✗ {filename}: {e}")
+                            raise  # 小文件下载失败就终止
+
+                    self._notify_progress("whisper", model_id, 10, "downloading", "配置文件下载完成，开始下载模型文件...")
+                    model.download_progress = 10.0
+
+                    # 阶段2：下载大文件（10% -> 100%）
+                    for filename in large_files:
+                        self.logger.info(f"📥 开始下载大文件: {filename}")
+
+                        url = hf_hub_url(repo_id, filename, repo_type="model")
+
+                        # 获取文件大小
+                        head_response = requests.head(url, allow_redirects=True, timeout=30)
+                        total_size = int(head_response.headers.get('content-length', 0))
+
+                        self.logger.info(f"📊 文件大小: {total_size / 1024 / 1024:.1f} MB")
+
+                        # 流式下载并追踪进度
+                        response = requests.get(url, stream=True, timeout=(30, 600))  # 连接30秒，读取10分钟
+                        response.raise_for_status()
+
+                        # 创建临时文件
+                        temp_file = snapshot_dir / f"{filename}.download"
+                        final_file = snapshot_dir / filename
+                        temp_file.parent.mkdir(parents=True, exist_ok=True)
+
+                        downloaded = 0
+                        chunk_size = 1024 * 1024  # 1MB chunks
+                        last_reported_progress = 0  # 记录上次报告的进度
+
+                        with open(temp_file, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=chunk_size):
+                                if chunk:
+                                    f.write(chunk)
+                                    downloaded += len(chunk)
+
+                                    # 计算进度：10% + (当前下载/总大小) * 90%
+                                    if total_size > 0:
+                                        file_progress = (downloaded / total_size) * 90
+                                        total_progress = 10 + file_progress
+
+                                        # 优化：只在进度变化超过0.5%时才更新（避免频繁更新）
+                                        if total_progress - last_reported_progress >= 0.5 or downloaded == total_size:
+                                            self._notify_progress("whisper", model_id, total_progress, "downloading",
+                                                                f"下载模型文件 {downloaded/1024/1024:.1f}/{total_size/1024/1024:.1f} MB ({total_progress:.1f}%)")
+                                            model.download_progress = total_progress
+                                            last_reported_progress = total_progress
+
+                        # 下载完成，重命名文件
+                        temp_file.rename(final_file)
+                        self.logger.info(f"  ✓ {filename} 下载完成")
+
+                    # 创建 refs/main 指向当前snapshot
+                    refs_dir = storage_folder / "refs"
+                    refs_dir.mkdir(parents=True, exist_ok=True)
+                    (refs_dir / "main").write_text(snapshot_id)
+
+                    local_dir = snapshot_dir
                     self.logger.info(f"✅ 方式1成功下载到: {local_dir}")
-                    self._notify_progress("whisper", model_id, 80, "downloading", "验证模型文件...")
-                    model.download_progress = 80.0
+                    self._notify_progress("whisper", model_id, 100, "downloading", "下载完成，验证文件...")
+                    model.download_progress = 100.0
                     download_success = True
-                    
+
                 except Exception as e1:
                     last_error = e1
                     self.logger.warning(f"⚠️ 方式1失败: {e1}")
-                    self._notify_progress("whisper", model_id, 10, "downloading", f"方式1失败，尝试其他方式...")
+                    self._notify_progress("whisper", model_id, 0, "downloading", f"方式1失败，尝试其他方式...")
             
             # 方式2: 如果方式1失败且使用了镜像，尝试切换到官方源
             if not download_success and use_mirror:
                 try:
                     self.logger.info(f"🔄 方式2: 切换到官方源重试...")
-                    self._notify_progress("whisper", model_id, 15, "downloading", "切换到官方源...")
-                    
+                    self._notify_progress("whisper", model_id, 0, "downloading", "切换到官方源...")
+
                     # 临时切换到官方源
                     old_endpoint = os.environ.get('HF_ENDPOINT')
                     if 'HF_ENDPOINT' in os.environ:
                         del os.environ['HF_ENDPOINT']
-                    
+
                     try:
-                        from huggingface_hub import snapshot_download
-                        
+                        import requests
+                        from huggingface_hub import hf_hub_url, list_repo_files
+                        from pathlib import Path as PathlibPath
+
                         repo_id = f"Systran/faster-whisper-{model_id}"
                         cache_dir = str(config.HF_CACHE_DIR)
-                        
+
                         self.logger.info(f"📦 从官方源下载: https://huggingface.co")
-                        self._notify_progress("whisper", model_id, 25, "downloading", "正在从官方源下载...")
-                        model.download_progress = 25.0
-                        
-                        local_dir = snapshot_download(
-                            repo_id=repo_id,
-                            cache_dir=cache_dir,
-                            local_files_only=False,
-                        )
-                        
+
+                        # 获取文件列表
+                        files = list_repo_files(repo_id, repo_type="model")
+                        small_files = [f for f in files if not f.endswith('.bin')]
+                        large_files = [f for f in files if f.endswith('.bin')]
+
+                        # 确定保存路径
+                        repo_path = repo_id.replace("/", "--")
+                        storage_folder = PathlibPath(cache_dir) / f"models--{repo_path}"
+                        snapshots_dir = storage_folder / "snapshots"
+
+                        import hashlib
+                        snapshot_id = hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
+                        snapshot_dir = snapshots_dir / snapshot_id
+                        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+                        # 下载小文件（0% -> 10%）
+                        for idx, filename in enumerate(small_files):
+                            progress = (idx / len(small_files)) * 10
+                            self._notify_progress("whisper", model_id, progress, "downloading", f"下载配置文件 ({idx+1}/{len(small_files)})")
+                            model.download_progress = progress
+
+                            url = hf_hub_url(repo_id, filename, repo_type="model")
+                            response = requests.get(url, timeout=(30, 300))
+                            response.raise_for_status()
+
+                            file_path = snapshot_dir / filename
+                            file_path.parent.mkdir(parents=True, exist_ok=True)
+                            file_path.write_bytes(response.content)
+
+                            self.logger.info(f"  ✓ {filename}")
+
+                        self._notify_progress("whisper", model_id, 10, "downloading", "配置文件下载完成，开始下载模型文件...")
+                        model.download_progress = 10.0
+
+                        # 下载大文件（10% -> 100%）
+                        for filename in large_files:
+                            self.logger.info(f"📥 开始下载大文件: {filename}")
+
+                            url = hf_hub_url(repo_id, filename, repo_type="model")
+
+                            # 获取文件大小
+                            head_response = requests.head(url, allow_redirects=True, timeout=30)
+                            total_size = int(head_response.headers.get('content-length', 0))
+                            self.logger.info(f"📊 文件大小: {total_size / 1024 / 1024:.1f} MB")
+
+                            # 流式下载
+                            response = requests.get(url, stream=True, timeout=(30, 600))
+                            response.raise_for_status()
+
+                            temp_file = snapshot_dir / f"{filename}.download"
+                            final_file = snapshot_dir / filename
+                            temp_file.parent.mkdir(parents=True, exist_ok=True)
+
+                            downloaded = 0
+                            chunk_size = 1024 * 1024
+                            last_reported_progress = 0  # 记录上次报告的进度
+
+                            with open(temp_file, 'wb') as f:
+                                for chunk in response.iter_content(chunk_size=chunk_size):
+                                    if chunk:
+                                        f.write(chunk)
+                                        downloaded += len(chunk)
+
+                                        if total_size > 0:
+                                            file_progress = (downloaded / total_size) * 90
+                                            total_progress = 10 + file_progress
+
+                                            # 优化：只在进度变化超过0.5%时才更新（避免频繁更新）
+                                            if total_progress - last_reported_progress >= 0.5 or downloaded == total_size:
+                                                self._notify_progress("whisper", model_id, total_progress, "downloading",
+                                                                    f"下载模型文件 {downloaded/1024/1024:.1f}/{total_size/1024/1024:.1f} MB ({total_progress:.1f}%)")
+                                                model.download_progress = total_progress
+                                                last_reported_progress = total_progress
+
+                            temp_file.rename(final_file)
+                            self.logger.info(f"  ✓ {filename} 下载完成")
+
+                        # 创建 refs/main
+                        refs_dir = storage_folder / "refs"
+                        refs_dir.mkdir(parents=True, exist_ok=True)
+                        (refs_dir / "main").write_text(snapshot_id)
+
+                        local_dir = snapshot_dir
                         self.logger.info(f"✅ 方式2成功")
-                        self._notify_progress("whisper", model_id, 80, "downloading", "验证模型文件...")
-                        model.download_progress = 80.0
+                        self._notify_progress("whisper", model_id, 100, "downloading", "下载完成，验证文件...")
+                        model.download_progress = 100.0
                         download_success = True
-                        
+
                     finally:
                         # 恢复镜像源设置
                         if old_endpoint:
                             os.environ['HF_ENDPOINT'] = old_endpoint
-                    
+
                 except Exception as e2:
                     last_error = e2
                     self.logger.error(f"❌ 方式2也失败: {e2}")
-                    self._notify_progress("whisper", model_id, 15, "downloading", "方式2失败，尝试最后方式...")
+                    self._notify_progress("whisper", model_id, 0, "downloading", "方式2失败，尝试最后方式...")
             
             # 方式3: 使用 whisperx 加载（会触发下载）
             if not download_success:

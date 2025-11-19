@@ -64,8 +64,19 @@ async def startup_event():
         logger.info("服务启动中...")
         logger.info("=" * 60)
 
-        # 1. FFmpeg检测和自动下载
-        logger.info("步骤 1/2: 检测FFmpeg...")
+        # 1. 设置SSE事件循环引用（必须在模型管理器初始化之前！）
+        logger.info("步骤 1/3: 设置SSE事件循环...")
+        try:
+            from api.routes.model_routes import set_event_loop
+            if set_event_loop():
+                logger.info("✅ SSE事件循环已设置")
+            else:
+                logger.warning("⚠️ SSE事件循环设置失败，将使用备用机制")
+        except Exception as e:
+            logger.warning(f"设置SSE事件循环异常: {e}")
+
+        # 2. FFmpeg检测和自动下载
+        logger.info("步骤 2/3: 检测FFmpeg...")
         ffmpeg_mgr = get_ffmpeg_manager()
         try:
             ffmpeg_path = ffmpeg_mgr.ensure_ffmpeg()
@@ -75,18 +86,10 @@ async def startup_event():
             logger.warning(f"FFmpeg检测失败: {e}")
             logger.warning("转录功能可能无法使用，请手动安装FFmpeg")
 
-        # 2. 初始化模型管理器
-        logger.info("步骤 2/2: 初始化模型管理器...")
+        # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
+        logger.info("步骤 3/3: 初始化模型管理器...")
         model_manager = initialize_model_manager(preload_config)
         logger.info("模型管理器初始化成功")
-
-        # 3. 设置SSE事件循环引用
-        try:
-            from api.routes.model_routes import set_event_loop
-            set_event_loop()
-            logger.info("SSE事件循环已设置")
-        except Exception as e:
-            logger.warning(f"设置SSE事件循环失败: {e}")
 
         # 不在启动时预加载模型，等待前端就绪后通过API调用
         logger.info("后端服务已就绪，等待前端启动后进行模型预加载")

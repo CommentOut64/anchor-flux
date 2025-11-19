@@ -44,10 +44,10 @@ class ProjectConfig:
         # HuggingFace 镜像源配置（解决国内访问问题）
         # 默认启用镜像源，可通过环境变量 USE_HF_MIRROR=false 禁用
         use_mirror = os.getenv('USE_HF_MIRROR', 'true').lower() == 'true'
-        
+
         if use_mirror:
-            # 使用国内镜像源（默认）
-            self.HF_ENDPOINT = 'https://mirrors.tuna.tsinghua.edu.cn'
+            # 使用国内镜像源（HF-Mirror 公益镜像）
+            self.HF_ENDPOINT = 'https://hf-mirror.com'
             os.environ['HF_ENDPOINT'] = self.HF_ENDPOINT
             print(f"🌐 HuggingFace 镜像源: {self.HF_ENDPOINT}")
             print("💡 提示：如需使用官方源，请设置环境变量 USE_HF_MIRROR=false")
