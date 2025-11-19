@@ -526,10 +526,15 @@ class TranscriptionService:
                 return _model_cache[key]
 
             self.logger.info(f"🔍 加载模型: {key}")
+
+            # ✅ 修复：添加 download_root 和 local_files_only 参数，避免重复下载
+            from core.config import config
             m = whisperx.load_model(
                 settings.model,
                 settings.device,
-                compute_type=settings.compute_type
+                compute_type=settings.compute_type,
+                download_root=str(config.HF_CACHE_DIR),  # 指定缓存路径
+                local_files_only=True  # 禁止自动下载，只使用本地文件
             )
             _model_cache[key] = m
             return m
@@ -607,7 +612,14 @@ class TranscriptionService:
 
             # 直接加载模型（如果已下载或下载完成）
             self.logger.info(f"🔍 加载对齐模型: {lang}")
-            am, meta = whisperx.load_align_model(language_code=lang, device=device)
+
+            # ✅ 修复：添加 model_dir 参数，指定缓存路径
+            from core.config import config
+            am, meta = whisperx.load_align_model(
+                language_code=lang,
+                device=device,
+                model_dir=str(config.HF_CACHE_DIR)  # 指定缓存路径
+            )
             _align_model_cache[lang] = (am, meta)
             return am, meta
 

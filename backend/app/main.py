@@ -80,6 +80,14 @@ async def startup_event():
         model_manager = initialize_model_manager(preload_config)
         logger.info("模型管理器初始化成功")
 
+        # 3. 设置SSE事件循环引用
+        try:
+            from api.routes.model_routes import set_event_loop
+            set_event_loop()
+            logger.info("SSE事件循环已设置")
+        except Exception as e:
+            logger.warning(f"设置SSE事件循环失败: {e}")
+
         # 不在启动时预加载模型，等待前端就绪后通过API调用
         logger.info("后端服务已就绪，等待前端启动后进行模型预加载")
 

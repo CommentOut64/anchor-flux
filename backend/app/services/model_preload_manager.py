@@ -176,9 +176,42 @@ class ModelPreloadManager:
                             "current_model": model_name,
                             "progress": (i / total_models) * 100
                         })
-                    
+
                     self.logger.info(f"🔄 [{i+1}/{total_models}] 处理模型: {model_name}")
-                    
+
+                    # ✅ 新增：检查模型是否正在下载（防御机制）
+                    from services.model_manager_service import get_model_manager
+                    model_mgr = get_model_manager()
+
+                    if model_mgr.is_model_downloading("whisper", model_name):
+                        self.logger.info(f"⏳ 模型 {model_name} 正在下载中，等待完成...")
+
+                        # 更新状态
+                        with self._global_lock:
+                            self._preload_status.update({
+                                "current_model": f"{model_name} (等待下载完成)",
+                                "progress": (i / total_models) * 100
+                            })
+
+                        # 等待下载完成（最多10分钟）
+                        if not model_mgr.wait_for_download_complete("whisper", model_name, timeout=600):
+                            error_msg = f"等待模型 {model_name} 下载超时或失败"
+                            self.logger.warning(f"⚠️ {error_msg}")
+                            with self._global_lock:
+                                self._preload_status["errors"].append(error_msg)
+                            continue
+
+                        self.logger.info(f"✅ 模型 {model_name} 下载完成，继续预加载")
+
+                    # ✅ 新增：检查磁盘状态（确保模型已就绪）
+                    status, local_path, detail = model_mgr._check_whisper_model_exists(model_name)
+                    if status != "ready":
+                        error_msg = f"模型 {model_name} 未就绪（状态: {status}），跳过预加载"
+                        self.logger.warning(f"⚠️ {error_msg}")
+                        with self._global_lock:
+                            self._preload_status["errors"].append(error_msg)
+                        continue
+
                     # 检查内存
                     if not self._memory_monitor.check_memory_available():
                         error_msg = f"内存不足，跳过模型 {model_name}"
@@ -186,48 +219,48 @@ class ModelPreloadManager:
                         with self._global_lock:
                             self._preload_status["errors"].append(error_msg)
                         continue
-                    
+
                     # 检查模型是否已缓存
                     device = "cuda" if torch.cuda.is_available() else "cpu"
                     key = (model_name, "float16", device)
-                    
+
                     with self._global_lock:
                         if key in self._whisper_cache:
                             self.logger.info(f"✅ 模型 {model_name} 已在缓存中")
                             self._preload_status["loaded_models"] += 1
                             success_count += 1
                             continue
-                    
+
                     # 加载新模型
                     settings = JobSettings(
                         model=model_name,
                         compute_type="float16",
                         device=device
                     )
-                    
+
                     self.logger.info(f"🔍 开始加载模型: {model_name} (device={device})")
                     start_time = time.time()
-                    
+
                     model = self._load_whisper_model(settings)
-                    
+
                     load_time = time.time() - start_time
-                    
+
                     # 预热模型
                     if self.config.warmup_enabled:
                         self.logger.info(f"🔥 预热模型: {model_name}")
                         self._warmup_model(model)
-                    
+
                     with self._global_lock:
                         self._preload_status["loaded_models"] += 1
                     success_count += 1
-                    
+
                     self.logger.info(f"✅ 模型 {model_name} 加载成功 (耗时: {load_time:.2f}s)")
-                    
+
                     # 调用进度回调
                     if progress_callback:
                         with self._global_lock:
                             progress_callback(self._preload_status.copy())
-                    
+
                 except Exception as e:
                     error_msg = f"加载模型 {model_name} 失败: {str(e)}"
                     self.logger.error(f"❌ {error_msg}", exc_info=True)
@@ -321,7 +354,7 @@ class ModelPreloadManager:
     def _load_whisper_model(self, settings: JobSettings):
         """加载Whisper模型 - 简化版本带并发保护"""
         key = (settings.model, settings.compute_type, settings.device)
-        
+
         # 再次检查缓存（避免并发加载同一模型）
         with self._global_lock:
             if key in self._whisper_cache:
@@ -330,33 +363,39 @@ class ModelPreloadManager:
                 self._whisper_cache.move_to_end(key)
                 self.logger.debug(f"⚡ 并发检查命中缓存，避免重复加载: {key}")
                 return info.model
-        
+
         self.logger.info(f"🔍 开始加载新Whisper模型: {key}")
-        
+
         # 检查内存
         if not self._memory_monitor.check_memory_available():
             self.logger.warning("⚠️ 内存不足，尝试清理缓存")
             self._cleanup_old_models()
-        
+
         # 检查缓存大小
         with self._global_lock:
             if len(self._whisper_cache) >= self.config.max_cache_size:
                 self._evict_lru_model()
-        
+
         try:
             start_time = time.time()
             self.logger.info(f"🚀 正在从磁盘加载模型 {settings.model} (device={settings.device}, compute_type={settings.compute_type})")
-            
+
+            # 导入配置以获取缓存路径
+            from core.config import config
+
+            # ✅ 修复：添加 download_root 和 local_files_only 参数，避免重复下载
             model = whisperx.load_model(
-                settings.model, 
-                settings.device, 
-                compute_type=settings.compute_type
+                settings.model,
+                settings.device,
+                compute_type=settings.compute_type,
+                download_root=str(config.HF_CACHE_DIR),  # 指定缓存路径
+                local_files_only=True  # 禁止自动下载，只使用本地文件
             )
             load_time = time.time() - start_time
-            
+
             # 估算内存使用
             memory_size = self._estimate_model_memory(model)
-            
+
             # 添加到缓存
             info = ModelCacheInfo(
                 model=model,
@@ -365,15 +404,15 @@ class ModelPreloadManager:
                 last_used=time.time(),
                 memory_size=memory_size
             )
-            
+
             with self._global_lock:
                 self._whisper_cache[key] = info
                 # 更新缓存版本号
                 self._preload_status["cache_version"] = int(time.time())
-            
+
             self.logger.info(f"✅ 成功加载并缓存Whisper模型 {key} (内存: {memory_size}MB, 耗时: {load_time:.2f}s)")
             return model
-            
+
         except Exception as e:
             self.logger.error(f"❌ 加载Whisper模型失败 {key}: {str(e)}", exc_info=True)
             raise
@@ -393,7 +432,13 @@ class ModelPreloadManager:
             # 缓存未命中，加载新模型
             self.logger.info(f"🔄 加载新对齐模型: {lang}")
             try:
-                model, meta = whisperx.load_align_model(language_code=lang, device=device)
+                # ✅ 修复：添加 model_dir 参数，指定缓存路径
+                from core.config import config
+                model, meta = whisperx.load_align_model(
+                    language_code=lang,
+                    device=device,
+                    model_dir=str(config.HF_CACHE_DIR)  # 指定缓存路径
+                )
                 
                 # 添加到缓存 (限制大小)
                 if len(self._align_cache) >= 5:  # 对齐模型缓存上限

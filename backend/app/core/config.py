@@ -39,6 +39,25 @@ class ProjectConfig:
         os.environ['HF_HOME'] = str(self.HF_CACHE_DIR)
         os.environ['TORCH_HOME'] = str(self.TORCH_CACHE_DIR)
         os.environ['TRANSFORMERS_CACHE'] = str(self.HF_CACHE_DIR / "transformers")
+        os.environ['HF_HUB_CACHE'] = str(self.HF_CACHE_DIR / "hub")
+        
+        # HuggingFace 镜像源配置（解决国内访问问题）
+        # 默认启用镜像源，可通过环境变量 USE_HF_MIRROR=false 禁用
+        use_mirror = os.getenv('USE_HF_MIRROR', 'true').lower() == 'true'
+        
+        if use_mirror:
+            # 使用国内镜像源（默认）
+            self.HF_ENDPOINT = 'https://mirrors.tuna.tsinghua.edu.cn'
+            os.environ['HF_ENDPOINT'] = self.HF_ENDPOINT
+            print(f"🌐 HuggingFace 镜像源: {self.HF_ENDPOINT}")
+            print("💡 提示：如需使用官方源，请设置环境变量 USE_HF_MIRROR=false")
+        else:
+            # 使用官方源
+            self.HF_ENDPOINT = 'https://huggingface.co'
+            if 'HF_ENDPOINT' in os.environ:
+                del os.environ['HF_ENDPOINT']
+            print(f"🌐 使用 HuggingFace 官方源: {self.HF_ENDPOINT}")
+            print("💡 提示：如遇访问问题，可设置环境变量 USE_HF_MIRROR=true 使用镜像源")
 
         # 确保目录存在
         for dir_path in [

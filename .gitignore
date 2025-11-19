@@ -27,6 +27,7 @@ frontend/.env.production.local
 # 任务文件和上传内容
 jobs/
 uploads/
+models/
 
 # 日志文件
 *.log
