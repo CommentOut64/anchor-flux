@@ -423,6 +423,41 @@ class ModelManagerService:
     def list_align_models(self) -> List[AlignModelInfo]:
         """列出所有对齐模型状态"""
         return list(self.align_models.values())
+
+    def get_largest_ready_model(self) -> Optional[str]:
+        """
+        获取体积最大的已就绪（ready）的Whisper模型
+
+        Returns:
+            Optional[str]: 模型ID，如果没有ready的模型则返回None
+        """
+        ready_models = [
+            (model_id, model.size_mb)
+            for model_id, model in self.whisper_models.items()
+            if model.status == "ready"
+        ]
+
+        if not ready_models:
+            return None
+
+        # 按体积排序，返回最大的
+        largest_model = max(ready_models, key=lambda x: x[1])
+        self.logger.debug(f"📊 最大的ready模型: {largest_model[0]} ({largest_model[1]}MB)")
+        return largest_model[0]
+
+    def get_ready_whisper_models(self) -> List[str]:
+        """
+        获取所有已就绪（ready）的Whisper模型ID列表
+
+        Returns:
+            List[str]: 模型ID列表
+        """
+        ready_models = [
+            model_id
+            for model_id, model in self.whisper_models.items()
+            if model.status == "ready"
+        ]
+        return ready_models
     
     def register_progress_callback(self, callback: Callable):
         """注册进度回调函数（用于SSE推送）"""

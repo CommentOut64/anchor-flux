@@ -589,7 +589,7 @@ async def reset_preload_attempts():
     try:
         from services.model_preload_manager import get_model_manager
         model_manager = get_model_manager()
-        
+
         if model_manager:
             model_manager.reset_preload_attempts()
             logger.info("手动重置预加载失败计数成功")
@@ -602,12 +602,187 @@ async def reset_preload_attempts():
                 "success": False,
                 "message": "模型管理器未初始化"
             }
-            
     except Exception as e:
-        logger.error(f"重置预加载失败计数失败: {str(e)}", exc_info=True)
+        logger.error(f"❌ 重置预加载失败计数失败: {str(e)}", exc_info=True)
         return {
             "success": False,
             "message": f"重置失败: {str(e)}"
+        }
+
+# ========== 默认预加载模型配置API ==========
+
+@app.get("/api/models/preload/config")
+async def get_default_preload_config():
+    """获取默认预加载模型配置"""
+    try:
+        from services.user_config_service import get_user_config_service
+        from services.model_manager_service import get_model_manager
+
+        user_config = get_user_config_service()
+        model_manager = get_model_manager()
+
+        # 获取用户选择的模型
+        user_selected = user_config.get_default_preload_model()
+
+        # 获取所有ready的模型
+        ready_models = model_manager.get_ready_whisper_models() if model_manager else []
+
+        # 获取体积最大的ready模型
+        largest_model = model_manager.get_largest_ready_model() if model_manager else None
+
+        # 确定实际会使用的模型
+        actual_model = user_selected if user_selected and user_selected in ready_models else largest_model
+
+        return {
+            "success": True,
+            "data": {
+                "user_selected": user_selected,  # 用户选择的模型
+                "largest_model": largest_model,  # 体积最大的ready模型
+                "actual_model": actual_model,    # 实际会使用的模型
+                "ready_models": ready_models     # 所有ready的模型列表
+            }
+        }
+    except Exception as e:
+        logger.error(f"❌ 获取默认预加载配置失败: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"获取配置失败: {str(e)}"
+        }
+
+@app.post("/api/models/preload/config")
+async def set_default_preload_model(request: dict):
+    """设置默认预加载模型"""
+    try:
+        from services.user_config_service import get_user_config_service
+
+        model_id = request.get("model_id")
+        user_config = get_user_config_service()
+
+        success = user_config.set_default_preload_model(model_id)
+
+        if success:
+            logger.info(f"✅ 设置默认预加载模型: {model_id}")
+            return {
+                "success": True,
+                "message": f"默认预加载模型已设置为: {model_id or '自动选择'}"
+            }
+        else:
+            return {
+                "success": False,
+                "message": "设置失败"
+            }
+    except Exception as e:
+        logger.error(f"❌ 设置默认预加载模型失败: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"设置失败: {str(e)}"
+        }
+
+# ========== 模型加载/卸载API ==========
+
+@app.post("/api/models/cache/unload")
+async def unload_model(request: dict):
+    """卸载指定模型"""
+    try:
+        from services.model_preload_manager import get_model_manager as get_preload_manager
+
+        model_id = request.get("model_id")
+        device = request.get("device", "cuda")
+        compute_type = request.get("compute_type", "float16")
+
+        if not model_id:
+            return {
+                "success": False,
+                "message": "缺少model_id参数"
+            }
+
+        preload_manager = get_preload_manager()
+        if not preload_manager:
+            return {
+                "success": False,
+                "message": "模型管理器未初始化"
+            }
+
+        preload_manager.evict_model(model_id, device, compute_type)
+        logger.info(f"✅ 卸载模型: {model_id}")
+
+        return {
+            "success": True,
+            "message": f"模型 {model_id} 已卸载"
+        }
+    except Exception as e:
+        logger.error(f"❌ 卸载模型失败: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"卸载失败: {str(e)}"
+        }
+
+@app.post("/api/models/preload/load-specific")
+async def load_specific_model(request: dict):
+    """加载指定模型"""
+    try:
+        from services.model_preload_manager import get_model_manager as get_preload_manager, PreloadConfig
+        from models.job_models import JobSettings
+        import torch
+
+        model_id = request.get("model_id")
+
+        if not model_id:
+            return {
+                "success": False,
+                "message": "缺少model_id参数"
+            }
+
+        preload_manager = get_preload_manager()
+        if not preload_manager:
+            return {
+                "success": False,
+                "message": "模型管理器未初始化"
+            }
+
+        # 检查模型状态
+        from services.model_manager_service import get_model_manager
+        model_mgr = get_model_manager()
+        status, local_path, detail = model_mgr._check_whisper_model_exists(model_id)
+
+        if status != "ready":
+            return {
+                "success": False,
+                "message": f"模型未就绪: {status}"
+            }
+
+        # 准备加载参数
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        settings = JobSettings(
+            model=model_id,
+            compute_type="float16",
+            device=device
+        )
+
+        # 加载模型
+        logger.info(f"🔄 开始加载模型: {model_id}")
+        model = await asyncio.get_event_loop().run_in_executor(
+            None,
+            preload_manager.get_model,
+            settings
+        )
+
+        if model:
+            logger.info(f"✅ 模型加载成功: {model_id}")
+            return {
+                "success": True,
+                "message": f"模型 {model_id} 加载成功"
+            }
+        else:
+            return {
+                "success": False,
+                "message": "模型加载失败"
+            }
+    except Exception as e:
+        logger.error(f"❌ 加载模型失败: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"加载失败: {str(e)}"
         }
 
 @app.post("/api/shutdown")

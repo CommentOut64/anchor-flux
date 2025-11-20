@@ -140,35 +140,70 @@ class ModelPreloadManager:
             return cache_status
     
     async def preload_models(self, progress_callback=None) -> Dict[str, Any]:
-        """预加载默认模型 - 简化版实现，带幂等性保证"""
+        """预加载默认模型 - 简化版实现，带幂等性保证
+
+        预加载逻辑：
+        1. 如果用户选择了默认预加载模型，使用用户选择的模型
+        2. 如果用户未选择（或选择的模型不可用），自动选择体积最大的ready模型
+        3. 如果没有ready的模型，返回失败
+        """
         with self._global_lock:
             # 检查是否已经在预加载中（幂等性检查）
             if self._preload_status["is_preloading"]:
                 self.logger.info("⚡ 预加载已在进行中，返回已有任务")
                 return {"success": True, "message": "预加载已在进行中"}
-            
+
             if not self.config.enabled:
                 self.logger.warning("⚠️ 模型预加载功能已禁用")
                 return {"success": False, "message": "预加载功能已禁用"}
+
+            # 🔄 根据用户配置确定要加载的模型
+            from services.user_config_service import get_user_config_service
+            from services.model_manager_service import get_model_manager as get_model_mgr
+
+            user_config = get_user_config_service()
+            model_mgr = get_model_mgr()
+
+            # 获取用户选择的模型
+            user_selected = user_config.get_default_preload_model()
+
+            # 获取所有ready的模型
+            ready_models = model_mgr.get_ready_whisper_models() if model_mgr else []
+
+            # 确定要加载的模型
+            models_to_load = []
+            if user_selected and user_selected in ready_models:
+                # 用户选择了有效的模型
+                models_to_load = [user_selected]
+                self.logger.info(f"✅ 使用用户选择的默认预加载模型: {user_selected}")
+            else:
+                # 用户未选择或选择的模型不可用，自动选择最大的模型
+                largest_model = model_mgr.get_largest_ready_model() if model_mgr else None
+                if largest_model:
+                    models_to_load = [largest_model]
+                    self.logger.info(f"✅ 自动选择体积最大的ready模型: {largest_model}")
+                else:
+                    self.logger.warning("⚠️ 没有可用的ready模型")
+                    return {"success": False, "message": "没有可用的ready模型"}
 
             # 设置预加载状态
             self._preload_status.update({
                 "is_preloading": True,
                 "progress": 0.0,
                 "current_model": "",
-                "total_models": len(self.config.default_models),
+                "total_models": len(models_to_load),
                 "loaded_models": 0,
                 "errors": [],
                 "last_attempt_time": time.time()
             })
-            
-            self.logger.info(f"🚀 开始预加载任务: {self.config.default_models}")
+
+            self.logger.info(f"🚀 开始预加载任务: {models_to_load}")
 
         try:
             success_count = 0
-            total_models = len(self.config.default_models)
-            
-            for i, model_name in enumerate(self.config.default_models):
+            total_models = len(models_to_load)
+
+            for i, model_name in enumerate(models_to_load):
                 try:
                     # 更新当前进度
                     with self._global_lock:
