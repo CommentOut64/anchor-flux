@@ -8,6 +8,8 @@ __pycache__/
 *.so
 .pytest_cache/
 .coverage
+.claude
+.github
 
 # PyInstaller 构建文件
 build/
