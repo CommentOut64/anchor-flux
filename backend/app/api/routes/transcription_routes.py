@@ -107,14 +107,40 @@ def create_transcription_router(
 
     @router.post("/start")
     async def start_job(job_id: str = Form(...), settings: str = Form(...)):
-        """启动转录任务"""
+        """启动转录任务（支持断点续传参数校验）"""
         try:
+            from pathlib import Path
+
             settings_obj = TranscribeSettings(**json.loads(settings))
             job = transcription_service.get_job(job_id)
             if not job:
                 raise HTTPException(status_code=404, detail="无效 job_id")
-            
-            # 覆盖设置
+
+            # 检查是否有checkpoint（断点续传场景）
+            job_dir = Path(job.dir)
+            checkpoint_path = job_dir / "checkpoint.json"
+
+            if checkpoint_path.exists():
+                # 有checkpoint，需要校验参数并强制覆盖禁止修改的参数
+                try:
+                    with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                        checkpoint_data = json.load(f)
+
+                    original_settings = checkpoint_data.get("original_settings", {})
+
+                    if original_settings:
+                        # 强制覆盖禁止修改的参数
+                        # 1. word_timestamps - 禁止修改
+                        if "word_timestamps" in original_settings:
+                            settings_obj.word_timestamps = original_settings["word_timestamps"]
+
+                        # 注意：device和model虽然会警告，但仍允许用户修改
+                        # 前端应该在调用此接口前显示警告并获得用户确认
+                except Exception as e:
+                    # 如果读取checkpoint失败，记录日志但继续
+                    print(f"读取checkpoint设置失败: {e}")
+
+            # 应用设置
             job.settings = JobSettings(**settings_obj.dict())
             transcription_service.start_job(job_id)
             return {"job_id": job_id, "started": True}
@@ -285,5 +311,142 @@ def create_transcription_router(
                 "can_resume": False,
                 "message": f"检查点文件损坏: {str(e)}"
             }
+
+    @router.get("/checkpoint-settings/{job_id}")
+    async def get_checkpoint_settings(job_id: str):
+        """获取checkpoint中保存的原始设置（用于参数校验）"""
+        from pathlib import Path
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        job_dir = Path(job.dir)
+        checkpoint_path = job_dir / "checkpoint.json"
+
+        if not checkpoint_path.exists():
+            return {"has_checkpoint": False}
+
+        try:
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            return {
+                "has_checkpoint": True,
+                "original_settings": data.get("original_settings", {}),
+                "progress": {
+                    "phase": data.get("phase"),
+                    "processed": len(data.get("processed_indices", [])),
+                    "total": data.get("total_segments", 0)
+                }
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"读取检查点失败: {str(e)}")
+
+    @router.post("/validate-resume-settings")
+    async def validate_resume_settings(
+        job_id: str = Form(...),
+        new_settings: str = Form(...)
+    ):
+        """
+        校验恢复任务时的参数修改
+
+        返回：
+        - valid: bool - 是否可以使用新参数
+        - warnings: list - 警告信息
+        - errors: list - 错误信息（禁止修改的参数）
+        - force_original: dict - 必须强制使用的原始参数
+        """
+        from pathlib import Path
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        job_dir = Path(job.dir)
+        checkpoint_path = job_dir / "checkpoint.json"
+
+        if not checkpoint_path.exists():
+            return {
+                "valid": True,
+                "warnings": [],
+                "errors": [],
+                "force_original": {},
+                "message": "无检查点，可以使用任意参数"
+            }
+
+        try:
+            # 加载checkpoint
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                checkpoint_data = json.load(f)
+
+            original_settings = checkpoint_data.get("original_settings", {})
+            if not original_settings:
+                return {
+                    "valid": True,
+                    "warnings": [],
+                    "errors": [],
+                    "force_original": {},
+                    "message": "旧版checkpoint格式，建议使用默认参数"
+                }
+
+            # 解析新设置
+            new_settings_obj = json.loads(new_settings)
+
+            warnings = []
+            errors = []
+            force_original = {}
+
+            # 检查禁止修改的参数
+            # 1. word_timestamps - 禁止修改
+            if "word_timestamps" in original_settings:
+                if new_settings_obj.get("word_timestamps") != original_settings["word_timestamps"]:
+                    errors.append({
+                        "param": "word_timestamps",
+                        "reason": "修改此参数会导致前后SRT格式不一致",
+                        "impact": "严重",
+                        "original": original_settings["word_timestamps"],
+                        "new": new_settings_obj.get("word_timestamps")
+                    })
+                    force_original["word_timestamps"] = original_settings["word_timestamps"]
+
+            # 2. device - 建议不修改（中等影响）
+            if "device" in original_settings:
+                if new_settings_obj.get("device") != original_settings["device"]:
+                    warnings.append({
+                        "param": "device",
+                        "level": "medium",
+                        "reason": "不同设备的精度可能有细微差异",
+                        "impact": "中等",
+                        "original": original_settings["device"],
+                        "new": new_settings_obj.get("device"),
+                        "suggestion": "建议保持原设备设置"
+                    })
+
+            # 3. model - 允许但需严重警告
+            if "model" in original_settings:
+                if new_settings_obj.get("model") != original_settings["model"]:
+                    warnings.append({
+                        "param": "model",
+                        "level": "high",
+                        "reason": "不同模型的输出格式和质量可能不同，混用会导致前后字幕质量不一致",
+                        "impact": "高",
+                        "original": original_settings["model"],
+                        "new": new_settings_obj.get("model"),
+                        "suggestion": "仅在确认用错模型时才修改"
+                    })
+
+            # compute_type 和 batch_size 可以自由修改，不需要警告
+
+            return {
+                "valid": len(errors) == 0,
+                "warnings": warnings,
+                "errors": errors,
+                "force_original": force_original,
+                "message": "参数校验完成" if len(errors) == 0 else "检测到不兼容的参数修改"
+            }
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"参数校验失败: {str(e)}")
 
     return router
