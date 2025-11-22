@@ -111,6 +111,11 @@ class ProjectConfig:
         self.LOG_FILE = self.LOG_DIR / "app.log"
         self.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+        # ========== SSE配置 ==========
+        self.SSE_HEARTBEAT_INTERVAL = 10  # 心跳间隔（秒）
+        self.SSE_MAX_QUEUE_SIZE = 1000     # 每个连接的消息队列大小
+        self.SSE_MAX_CONNECTIONS_PER_CHANNEL = 10  # 每个频道最大连接数
+
     def get_ffmpeg_command(self) -> str:
         """
         获取FFmpeg命令
