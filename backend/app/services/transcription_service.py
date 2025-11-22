@@ -58,6 +58,11 @@ class TranscriptionService:
         # 启动时清理无效映射
         self.job_index.cleanup_invalid_mappings()
 
+        # 集成SSE管理器（用于实时进度推送）
+        from services.sse_service import get_sse_manager
+        self.sse_manager = get_sse_manager()
+        self.logger.info("✅ SSE管理器已集成")
+
         # 记录CPU信息
         sys_info = self.cpu_manager.get_system_info()
         if sys_info.get('supported', False):
@@ -477,6 +482,61 @@ class TranscriptionService:
         if message:
             job.message = message
 
+        # 推送SSE进度更新（线程安全）
+        self._push_sse_progress(job)
+
+    def _push_sse_progress(self, job: JobState):
+        """
+        推送SSE进度更新（线程安全）
+
+        Args:
+            job: 任务状态对象
+        """
+        try:
+            channel_id = f"job:{job.job_id}"
+            self.sse_manager.broadcast_sync(
+                channel_id,
+                "progress",
+                {
+                    "job_id": job.job_id,
+                    "phase": job.phase,
+                    "percent": job.progress,
+                    "message": job.message,
+                    "status": job.status,
+                    "processed": job.processed,
+                    "total": job.total,
+                    "language": job.language or ""
+                }
+            )
+        except Exception as e:
+            # SSE推送失败不应影响转录流程
+            self.logger.debug(f"SSE推送失败（非致命）: {e}")
+
+    def _push_sse_signal(self, job: JobState, signal_code: str, message: str = ""):
+        """
+        推送SSE信号事件（用于关键节点通知）
+
+        Args:
+            job: 任务状态对象
+            signal_code: 信号代码（如 "job_complete", "job_failed", "job_canceled"）
+            message: 附加消息
+        """
+        try:
+            channel_id = f"job:{job.job_id}"
+            self.sse_manager.broadcast_sync(
+                channel_id,
+                "signal",
+                {
+                    "job_id": job.job_id,
+                    "code": signal_code,
+                    "message": message or job.message,
+                    "status": job.status,
+                    "progress": job.progress
+                }
+            )
+        except Exception as e:
+            self.logger.debug(f"SSE信号推送失败（非致命）: {e}")
+
     def _save_checkpoint(self, job_dir: Path, data: dict, job: JobState):
         """
         原子性保存检查点
@@ -763,25 +823,35 @@ class TranscriptionService:
             if job.canceled:
                 job.status = 'canceled'
                 job.message = '已取消'
+                # 推送取消信号
+                self._push_sse_signal(job, "job_canceled", "任务已取消")
             else:
                 job.status = 'finished'
                 job.message = '完成'
                 self.logger.info(f"✅ 任务完成: {job.job_id}")
+                # 推送完成信号
+                self._push_sse_signal(job, "job_complete", "转录完成")
 
         except Exception as e:
             if job.canceled and '取消' in str(e):
                 job.status = 'canceled'
                 job.message = '已取消'
                 self.logger.info(f"🛑 任务已取消: {job.job_id}")
+                # 推送取消信号
+                self._push_sse_signal(job, "job_canceled", "任务已取消")
             elif job.paused and '暂停' in str(e):
                 job.status = 'paused'
                 job.message = '已暂停'
                 self.logger.info(f"⏸️ 任务已暂停: {job.job_id}")
+                # 推送暂停信号
+                self._push_sse_signal(job, "job_paused", "任务已暂停")
             else:
                 job.status = 'failed'
                 job.message = f'失败: {e}'
                 job.error = str(e)
                 self.logger.error(f"❌ 任务失败: {job.job_id} - {e}", exc_info=True)
+                # 推送失败信号
+                self._push_sse_signal(job, "job_failed", f"任务失败: {e}")
 
         finally:
             # 恢复CPU亲和性设置

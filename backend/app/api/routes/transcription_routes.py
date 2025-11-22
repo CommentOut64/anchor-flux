@@ -4,14 +4,16 @@
 import os
 import uuid
 import shutil
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import json
+from sse_starlette.sse import EventSourceResponse
 
 from models.job_models import JobSettings, JobState
 from services.transcription_service import TranscriptionService
 from services.file_service import FileManagementService
+from services.sse_service import get_sse_manager
 
 router = APIRouter(prefix="/api", tags=["transcription"])
 
@@ -34,12 +36,54 @@ class UploadResponse(BaseModel):
 
 
 def create_transcription_router(
-    transcription_service: TranscriptionService, 
+    transcription_service: TranscriptionService,
     file_service: FileManagementService,
     output_dir: str
 ):
     """创建转录任务路由"""
-    
+
+    # 获取SSE管理器
+    sse_manager = get_sse_manager()
+
+    @router.get("/stream/{job_id}")
+    async def stream_job_progress(job_id: str, request: Request):
+        """
+        SSE流式端点 - 实时推送转录任务进度
+
+        频道ID格式: job:{job_id}
+        事件类型:
+        - progress: 进度更新 (包含 percent, phase, message, status等)
+        - signal: 关键节点信号 (job_complete, job_failed, job_canceled, job_paused)
+        - ping: 心跳
+        """
+        # 验证任务是否存在
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        channel_id = f"job:{job_id}"
+
+        # 定义初始状态回调 - 连接时立即发送当前状态
+        def get_initial_state():
+            current_job = transcription_service.get_job(job_id)
+            if current_job:
+                return {
+                    "job_id": current_job.job_id,
+                    "phase": current_job.phase,
+                    "percent": current_job.progress,
+                    "message": current_job.message,
+                    "status": current_job.status,
+                    "processed": current_job.processed,
+                    "total": current_job.total,
+                    "language": current_job.language or ""
+                }
+            return None
+
+        # 订阅SSE流
+        return EventSourceResponse(
+            sse_manager.subscribe(channel_id, request, initial_state_callback=get_initial_state)
+        )
+
     @router.post("/upload")
     async def upload_file(file: UploadFile = File(...)):
         """上传文件并自动创建转录任务"""
