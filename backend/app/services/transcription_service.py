@@ -14,6 +14,7 @@ from models.job_models import JobSettings, JobState
 from models.hardware_models import HardwareInfo, OptimizationConfig
 from services.hardware_service import get_hardware_detector, get_hardware_optimizer
 from services.cpu_affinity_service import CPUAffinityManager, CPUAffinityConfig
+from services.job_index_service import get_job_index_service
 from core.config import config  # 导入统一配置
 
 # 全局模型缓存 (按 (model, compute_type, device) 键)
@@ -51,6 +52,11 @@ class TranscriptionService:
         self.hardware_optimizer = get_hardware_optimizer()
         self._hardware_info: Optional[HardwareInfo] = None
         self._optimization_config: Optional[OptimizationConfig] = None
+
+        # 集成任务索引服务
+        self.job_index = get_job_index_service(jobs_root)
+        # 启动时清理无效映射
+        self.job_index.cleanup_invalid_mappings()
 
         # 记录CPU信息
         sys_info = self.cpu_manager.get_system_info()
@@ -155,6 +161,9 @@ class TranscriptionService:
         with self.lock:
             self.jobs[job_id] = job
 
+        # 添加文件路径到任务ID的映射
+        self.job_index.add_mapping(src_path, job_id)
+
         self.logger.info(f"✅ 任务已创建: {job_id} - {filename}")
         return job
 
@@ -171,22 +180,198 @@ class TranscriptionService:
         with self.lock:
             return self.jobs.get(job_id)
 
+    def scan_incomplete_jobs(self) -> List[Dict]:
+        """
+        扫描所有未完成的任务（有checkpoint.json的任务）
+
+        Returns:
+            List[Dict]: 未完成任务列表
+        """
+        incomplete_jobs = []
+
+        try:
+            # 遍历所有任务目录
+            for job_dir in self.jobs_root.iterdir():
+                if not job_dir.is_dir():
+                    continue
+
+                checkpoint_path = job_dir / "checkpoint.json"
+                if not checkpoint_path.exists():
+                    continue
+
+                try:
+                    # 加载检查点数据
+                    with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                        checkpoint_data = json.load(f)
+
+                    job_id = checkpoint_data.get('job_id') or job_dir.name
+                    total_segments = checkpoint_data.get('total_segments', 0)
+                    processed_indices = checkpoint_data.get('processed_indices', [])
+                    processed_count = len(processed_indices)
+
+                    # 计算进度
+                    if total_segments > 0:
+                        progress = (processed_count / total_segments) * 100
+                    else:
+                        progress = 0
+
+                    # 从索引中查找文件名
+                    file_path = self.job_index.get_file_path(job_id)
+                    filename = os.path.basename(file_path) if file_path else "未知文件"
+
+                    incomplete_jobs.append({
+                        'job_id': job_id,
+                        'filename': filename,
+                        'file_path': file_path,  # 添加文件路径
+                        'progress': round(progress, 2),
+                        'processed_segments': processed_count,
+                        'total_segments': total_segments,
+                        'phase': checkpoint_data.get('phase', 'unknown'),
+                        'dir': str(job_dir)
+                    })
+
+                except Exception as e:
+                    self.logger.warning(f"读取检查点失败 {checkpoint_path}: {e}")
+                    continue
+
+            self.logger.info(f"扫描到 {len(incomplete_jobs)} 个未完成任务")
+            return incomplete_jobs
+
+        except Exception as e:
+            self.logger.error(f"扫描未完成任务失败: {e}")
+            return []
+
+    def restore_job_from_checkpoint(self, job_id: str) -> Optional[JobState]:
+        """
+        从检查点恢复任务状态
+
+        Args:
+            job_id: 任务ID
+
+        Returns:
+            Optional[JobState]: 恢复的任务状态对象
+        """
+        job_dir = self.jobs_root / job_id
+        if not job_dir.exists():
+            return None
+
+        checkpoint = self._load_checkpoint(job_dir)
+        if not checkpoint:
+            return None
+
+        try:
+            # 查找原文件
+            filename = "unknown"
+            input_path = None
+
+            # 从目录中查找视频/音频文件
+            for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
+                matches = list(job_dir.glob(f"*{ext}"))
+                if matches:
+                    filename = matches[0].name
+                    input_path = str(matches[0])
+                    break
+
+            if not input_path:
+                self.logger.warning(f"无法找到任务 {job_id} 的输入文件")
+                return None
+
+            # 创建默认的CPU亲和性配置
+            from services.cpu_affinity_service import CPUAffinityConfig
+            default_cpu_config = CPUAffinityConfig(
+                enabled=True,
+                strategy="auto",
+                custom_cores=None,
+                exclude_cores=None
+            )
+
+            # 创建任务状态对象
+            job = JobState(
+                job_id=job_id,
+                filename=filename,
+                dir=str(job_dir),
+                input_path=input_path,
+                settings=JobSettings(cpu_affinity=default_cpu_config),  # 提供默认的cpu_affinity
+                status="paused",
+                phase=checkpoint.get('phase', 'pending'),
+                message=f"已暂停 ({len(checkpoint.get('processed_indices', []))}/{checkpoint.get('total_segments', 0)}段)",
+                total=checkpoint.get('total_segments', 0),
+                processed=len(checkpoint.get('processed_indices', [])),
+                progress=round((len(checkpoint.get('processed_indices', [])) / max(1, checkpoint.get('total_segments', 1))) * 100, 2)
+            )
+
+            with self.lock:
+                self.jobs[job_id] = job
+
+            self.logger.info(f"✅ 从检查点恢复任务: {job_id}")
+            return job
+
+        except Exception as e:
+            self.logger.error(f"从检查点恢复任务失败: {e}")
+            return None
+
+    def check_file_checkpoint(self, file_path: str) -> Optional[Dict]:
+        """
+        检查文件是否有可用的断点
+
+        Args:
+            file_path: 文件路径
+
+        Returns:
+            Optional[Dict]: 断点信息，无断点则返回None
+        """
+        # 从索引中查找任务ID
+        job_id = self.job_index.get_job_id(file_path)
+        if not job_id:
+            return None
+
+        # 检查任务目录和checkpoint是否存在
+        job_dir = self.jobs_root / job_id
+        if not job_dir.exists():
+            # 清理无效映射
+            self.job_index.remove_mapping(file_path)
+            return None
+
+        checkpoint = self._load_checkpoint(job_dir)
+        if not checkpoint:
+            return None
+
+        # 返回断点信息
+        total_segments = checkpoint.get('total_segments', 0)
+        processed_indices = checkpoint.get('processed_indices', [])
+        processed_count = len(processed_indices)
+
+        if total_segments > 0:
+            progress = (processed_count / total_segments) * 100
+        else:
+            progress = 0
+
+        return {
+            'job_id': job_id,
+            'progress': round(progress, 2),
+            'processed_segments': processed_count,
+            'total_segments': total_segments,
+            'phase': checkpoint.get('phase', 'unknown'),
+            'can_resume': True
+        }
+
     def start_job(self, job_id: str):
         """
-        启动转录任务
+        启动转录任务（支持从paused状态恢复）
 
         Args:
             job_id: 任务ID
         """
         job = self.get_job(job_id)
-        if not job or job.status not in ("uploaded", "failed"):
+        if not job or job.status not in ("uploaded", "failed", "paused"):
             self.logger.warning(f"任务无法启动: {job_id}, 状态: {job.status if job else 'not found'}")
             return
 
         job.canceled = False
+        job.paused = False  # 清除暂停标志
         job.error = None
         job.status = "processing"
-        job.message = "开始处理"
+        job.message = "开始处理" if job.status != "paused" else "恢复处理"
 
         # 在独立线程中执行转录
         threading.Thread(
@@ -198,12 +383,32 @@ class TranscriptionService:
 
         self.logger.info(f"🚀 任务已启动: {job_id}")
 
-    def cancel_job(self, job_id: str) -> bool:
+    def pause_job(self, job_id: str) -> bool:
+        """
+        暂停转录任务（保存断点）
+
+        Args:
+            job_id: 任务ID
+
+        Returns:
+            bool: 是否成功设置暂停标志
+        """
+        job = self.get_job(job_id)
+        if not job:
+            return False
+
+        job.paused = True
+        job.message = "暂停中..."
+        self.logger.info(f"⏸️ 任务暂停请求: {job_id}")
+        return True
+
+    def cancel_job(self, job_id: str, delete_data: bool = False) -> bool:
         """
         取消转录任务
 
         Args:
             job_id: 任务ID
+            delete_data: 是否删除任务数据
 
         Returns:
             bool: 是否成功设置取消标志
@@ -214,7 +419,27 @@ class TranscriptionService:
 
         job.canceled = True
         job.message = "取消中..."
-        self.logger.info(f"🛑 任务取消请求: {job_id}")
+        self.logger.info(f"🛑 任务取消请求: {job_id}, 删除数据: {delete_data}")
+
+        # 如果需要删除数据
+        if delete_data:
+            try:
+                job_dir = Path(job.dir)
+                # 移除文件路径映射
+                if job.input_path:
+                    self.job_index.remove_mapping(job.input_path)
+
+                if job_dir.exists():
+                    # 删除整个任务目录
+                    shutil.rmtree(job_dir)
+                    self.logger.info(f"🗑️ 已删除任务数据: {job_id}")
+                    # 从内存中移除任务
+                    with self.lock:
+                        if job_id in self.jobs:
+                            del self.jobs[job_id]
+            except Exception as e:
+                self.logger.error(f"删除任务数据失败: {e}")
+
         return True
 
     def _update_progress(
@@ -252,16 +477,62 @@ class TranscriptionService:
         if message:
             job.message = message
 
+    def _save_checkpoint(self, job_dir: Path, data: dict):
+        """
+        原子性保存检查点
+        使用"写临时文件 -> 重命名"策略，确保文件要么完整写入，要么保持原样
+
+        Args:
+            job_dir: 任务目录
+            data: 检查点数据
+        """
+        checkpoint_path = job_dir / "checkpoint.json"
+        temp_path = checkpoint_path.with_suffix(".tmp")
+
+        try:
+            # 1. 写入临时文件
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            # 2. 原子替换（Windows/Linux/macOS 均支持）
+            # 如果程序在这里崩溃，checkpoint.json 依然是旧版本，不会损坏
+            os.replace(temp_path, checkpoint_path)
+
+        except Exception as e:
+            self.logger.error(f"保存检查点失败: {e}")
+            # 保存失败不应中断主流程，仅记录日志
+
+    def _load_checkpoint(self, job_dir: Path) -> Optional[dict]:
+        """
+        加载检查点，如果文件损坏则返回 None
+
+        Args:
+            job_dir: 任务目录
+
+        Returns:
+            Optional[dict]: 检查点数据，不存在或损坏则返回 None
+        """
+        checkpoint_path = job_dir / "checkpoint.json"
+        if not checkpoint_path.exists():
+            return None
+
+        try:
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            self.logger.warning(f"检查点文件损坏，将重新开始任务: {checkpoint_path} - {e}")
+            return None
+
     def _run_pipeline(self, job: JobState):
         """
-        执行转录处理管道
+        执行转录处理管道（支持断点续传）
 
         Args:
             job: 任务状态对象
         """
         # 应用CPU亲和性设置
         cpu_applied = False
-        if job.settings.cpu_affinity.enabled:
+        if job.settings.cpu_affinity and job.settings.cpu_affinity.enabled:
             cpu_applied = self.cpu_manager.apply_cpu_affinity(
                 job.settings.cpu_affinity
             )
@@ -269,70 +540,168 @@ class TranscriptionService:
                 self.logger.info(f"📌 任务 {job.job_id} 已应用CPU亲和性设置")
 
         try:
-            # 检查取消标志
+            # 检查取消和暂停标志
             if job.canceled:
                 job.status = 'canceled'
                 job.message = '已取消'
+                return
+
+            if job.paused:
+                job.status = 'paused'
+                job.message = '已暂停'
+                self.logger.info(f"⏸️ 任务已暂停: {job.job_id}")
                 return
 
             job_dir = Path(job.dir)
             input_path = job_dir / job.filename
             audio_path = job_dir / 'audio.wav'
 
-            # ========== 阶段1: 提取音频 ==========
-            self._update_progress(job, 'extract', 0, '提取音频中')
+            # ==========================================
+            # 1. 尝试恢复状态（断点续传核心）
+            # ==========================================
+            checkpoint = self._load_checkpoint(job_dir)
+
+            # 初始化内存状态
+            processed_indices = set()
+            processed_results = []
+            current_segments = []
+
+            if checkpoint:
+                self.logger.info(f"🔄 发现检查点，从 {checkpoint.get('phase', 'unknown')} 阶段恢复")
+                # 恢复数据到内存
+                processed_indices = set(checkpoint.get('processed_indices', []))
+                processed_results = checkpoint.get('results', [])
+                current_segments = checkpoint.get('segments', [])
+                # 恢复任务基本信息
+                job.total = checkpoint.get('total_segments', 0)
+                job.processed = len(processed_indices)
+                self.logger.info(f"📊 已处理 {job.processed}/{job.total} 段")
+
+            # ==========================================
+            # 2. 阶段1: 提取音频
+            # ==========================================
+            # 只有当音频文件不存在，或者从头开始时，才执行提取
+            if not audio_path.exists() or (checkpoint is None):
+                self._update_progress(job, 'extract', 0, '提取音频中')
+                if job.canceled:
+                    raise RuntimeError('任务已取消')
+
+                if not self._extract_audio(str(input_path), str(audio_path)):
+                    raise RuntimeError('FFmpeg 提取音频失败')
+
+                self._update_progress(job, 'extract', 1, '音频提取完成')
+            else:
+                self.logger.info("✅ 跳过音频提取，使用已有文件")
+
             if job.canceled:
                 raise RuntimeError('任务已取消')
 
-            if not self._extract_audio(str(input_path), str(audio_path)):
-                raise RuntimeError('FFmpeg 提取音频失败')
+            # ==========================================
+            # 3. 阶段2: 智能分段
+            # ==========================================
+            # 如果检查点里没有分段信息，说明上次没跑到分段完成
+            if not current_segments:
+                self._update_progress(job, 'split', 0, '音频分段中')
+                current_segments = self._split_audio(str(audio_path))
+                if job.canceled:
+                    raise RuntimeError('任务已取消')
 
-            self._update_progress(job, 'extract', 1, '音频提取完成')
-            if job.canceled:
-                raise RuntimeError('任务已取消')
+                job.segments = current_segments
+                job.total = len(current_segments)
+                self._update_progress(job, 'split', 1, f'分段完成 共{job.total}段')
 
-            # ========== 阶段2: 智能分段 ==========
-            self._update_progress(job, 'split', 0, '音频分段中')
-            segments = self._split_audio(str(audio_path))
-            if job.canceled:
-                raise RuntimeError('任务已取消')
+                # 【关键埋点1】分段完成后立即保存
+                checkpoint_data = {
+                    "job_id": job.job_id,
+                    "phase": "split",
+                    "total_segments": job.total,
+                    "processed_indices": [],
+                    "segments": current_segments,  # 保存分段结果
+                    "results": []
+                }
+                self._save_checkpoint(job_dir, checkpoint_data)
+                self.logger.info("💾 检查点已保存: 分段完成")
+            else:
+                self.logger.info(f"✅ 跳过分段，使用检查点数据（共{len(current_segments)}段）")
+                job.segments = current_segments  # 恢复到 job 对象
+                job.total = len(current_segments)
 
-            job.segments = segments
-            job.total = len(segments)
-            self._update_progress(job, 'split', 1, f'分段完成 共{job.total}段')
-
-            # ========== 阶段3: 转录处理 ==========
+            # ==========================================
+            # 4. 阶段3: 转录处理（核心循环）
+            # ==========================================
             self._update_progress(job, 'transcribe', 0, '加载模型中')
             if job.canceled:
                 raise RuntimeError('任务已取消')
 
             model = self._get_model(job.settings, job)
             align_cache = {}
-            processed_results = []
 
-            for idx, seg in enumerate(segments):
+            # 过滤出需要处理的段
+            todo_segments = [
+                seg for i, seg in enumerate(current_segments)
+                if i not in processed_indices
+            ]
+
+            self.logger.info(f"📝 剩余 {len(todo_segments)}/{len(current_segments)} 段需要转录")
+
+            for idx, seg in enumerate(current_segments):
+                # 如果已经在 processed_indices 里，直接跳过
+                if idx in processed_indices:
+                    self.logger.debug(f"⏭️ 跳过已处理段 {idx}")
+                    continue
+
+                # 检查取消和暂停标志
                 if job.canceled:
                     raise RuntimeError('任务已取消')
 
-                ratio = idx / max(1, len(segments))
+                if job.paused:
+                    raise RuntimeError('任务已暂停')
+
+                ratio = len(processed_indices) / max(1, len(current_segments))
                 self._update_progress(
                     job,
                     'transcribe',
                     ratio,
-                    f'转录 {idx+1}/{len(segments)}'
+                    f'转录 {len(processed_indices)+1}/{len(current_segments)}'
                 )
 
                 seg_result = self._transcribe_segment(seg, model, job, align_cache)
+
+                # --- 更新内存状态 ---
                 if seg_result:
                     processed_results.append(seg_result)
+                processed_indices.add(idx)
+                job.processed = len(processed_indices)
 
-                job.processed = idx + 1
+                # --- 更新进度条 ---
+                progress = len(processed_indices) / len(current_segments)
+                self._update_progress(
+                    job,
+                    'transcribe',
+                    progress,
+                    f'转录中 {len(processed_indices)}/{len(current_segments)}'
+                )
+
+                # 【关键埋点2】每处理一段保存一次
+                # 单机版每段保存开销很小，建议直接每段保存，体验最好
+                checkpoint_data = {
+                    "job_id": job.job_id,
+                    "phase": "transcribe",
+                    "total_segments": len(current_segments),
+                    "processed_indices": list(processed_indices),  # set转list
+                    "segments": current_segments,
+                    "results": processed_results
+                }
+                self._save_checkpoint(job_dir, checkpoint_data)
+                self.logger.debug(f"💾 检查点已保存: {len(processed_indices)}/{len(current_segments)}")
 
             self._update_progress(job, 'transcribe', 1, '转录完成 生成字幕中')
             if job.canceled:
                 raise RuntimeError('任务已取消')
 
-            # ========== 阶段4: 生成SRT ==========
+            # ==========================================
+            # 5. 阶段4: 生成SRT
+            # ==========================================
             base_name = os.path.splitext(job.filename)[0]
             srt_path = job_dir / f'{base_name}.srt'
             self._update_progress(job, 'srt', 0, '写入 SRT...')
@@ -344,6 +713,14 @@ class TranscriptionService:
             self._update_progress(job, 'srt', 1, '处理完成')
 
             job.srt_path = str(srt_path)
+
+            # 【清理】任务成功完成后，删除 checkpoint
+            try:
+                checkpoint_file = job_dir / "checkpoint.json"
+                checkpoint_file.unlink(missing_ok=True)
+                self.logger.info("🧹 检查点已清理")
+            except Exception as e:
+                self.logger.warning(f"清理检查点失败: {e}")
 
             if job.canceled:
                 job.status = 'canceled'
@@ -358,6 +735,10 @@ class TranscriptionService:
                 job.status = 'canceled'
                 job.message = '已取消'
                 self.logger.info(f"🛑 任务已取消: {job.job_id}")
+            elif job.paused and '暂停' in str(e):
+                job.status = 'paused'
+                job.message = '已暂停'
+                self.logger.info(f"⏸️ 任务已暂停: {job.job_id}")
             else:
                 job.status = 'failed'
                 job.message = f'失败: {e}'

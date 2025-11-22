@@ -80,8 +80,10 @@
 
       <!-- 操作按钮 -->
       <div class="action-buttons">
-        <el-button 
-          type="primary" 
+        <!-- 开始/恢复转录按钮 -->
+        <el-button
+          v-if="status !== 'paused'"
+          type="primary"
           size="large"
           :loading="starting"
           :disabled="processing || starting"
@@ -90,29 +92,59 @@
           <el-icon v-if="!starting"><VideoPlay /></el-icon>
           {{ starting ? "启动中..." : "开始转录" }}
         </el-button>
-        
-        <el-button 
+
+        <!-- 恢复任务按钮（仅在暂停时显示） -->
+        <el-button
+          v-if="status === 'paused'"
+          type="success"
+          size="large"
+          :loading="starting"
+          :disabled="starting"
+          @click="$emit('start-job')"
+        >
+          <el-icon v-if="!starting"><VideoPlay /></el-icon>
+          {{ starting ? "恢复中..." : "恢复任务" }}
+        </el-button>
+
+        <!-- 暂停任务按钮（处理中时显示） -->
+        <el-button
+          v-if="processing"
+          type="warning"
+          size="large"
+          :loading="pausing"
+          :disabled="pausing"
+          @click="$emit('pause-job')"
+        >
+          <el-icon v-if="!pausing"><VideoPause /></el-icon>
+          {{ pausing ? "暂停中..." : "暂停任务" }}
+        </el-button>
+
+        <!-- 取消任务按钮（有任务且未完成时显示） -->
+        <el-button
+          v-if="canRestart || processing || status === 'paused'"
           type="danger"
           size="large"
           :loading="canceling"
-          :disabled="!processing || canceling"
+          :disabled="canceling"
           @click="$emit('cancel-job')"
         >
-          <el-icon v-if="!canceling"><VideoPause /></el-icon>
+          <el-icon v-if="!canceling"><Delete /></el-icon>
           {{ canceling ? "取消中..." : "取消任务" }}
         </el-button>
-        
-        <el-button 
+
+        <!-- 重新转录按钮（任务失败或取消后显示） -->
+        <el-button
+          v-if="!processing && (status === 'failed' || status === 'canceled')"
           type="warning"
           size="large"
-          :disabled="processing || !canRestart"
           @click="$emit('restart-job')"
         >
           <el-icon><RefreshRight /></el-icon>
           重新转录
         </el-button>
-        
-        <el-button 
+
+        <!-- 重新选择文件按钮 -->
+        <el-button
           type="success"
           size="large"
           @click="$emit('reset-selection')"
@@ -138,13 +170,16 @@ const props = defineProps({
   starting: Boolean,
   processing: Boolean,
   canceling: Boolean,
-  canRestart: Boolean
+  pausing: Boolean,  // 新增：暂停中
+  canRestart: Boolean,
+  status: String  // 新增：任务状态
 })
 
 // 定义emits
 const emits = defineEmits([
   'start-job',
-  'cancel-job', 
+  'cancel-job',
+  'pause-job',  // 新增：暂停任务
   'restart-job',
   'reset-selection',
   'show-hardware'

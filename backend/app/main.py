@@ -36,6 +36,8 @@ from config.model_config import ModelPreloadConfig
 
 # 导入API路由
 from api.routes import model_routes
+from api.routes.transcription_routes import create_transcription_router
+from services.file_service import FileManagementService
 
 # 导入FFmpeg管理器
 from services.ffmpeg_manager import get_ffmpeg_manager
@@ -122,6 +124,15 @@ TEMP_DIR = str(config.TEMP_DIR)
 # 初始化转录服务
 transcription_service = get_transcription_service(JOBS_DIR)
 
+# 初始化文件管理服务
+file_service = FileManagementService(INPUT_DIR, OUTPUT_DIR)
+
+# 注册API路由
+app.include_router(model_routes.router)
+# 注册转录路由（包含暂停、恢复等新功能）
+transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
+app.include_router(transcription_router)
+
 # 初始化模型预加载管理器
 preload_config = ModelPreloadConfig.get_preload_config()
 
@@ -172,7 +183,7 @@ def is_video_or_audio_file(filename):
 
 @app.get("/api/files")
 async def list_files():
-    """获取输入目录中的所有媒体文件"""
+    """获取输入目录中的所有媒体文件（含断点信息）"""
     try:
         files = []
         if os.path.exists(INPUT_DIR):
@@ -180,15 +191,28 @@ async def list_files():
                 file_path = os.path.join(INPUT_DIR, filename)
                 if os.path.isfile(file_path) and is_video_or_audio_file(filename):
                     stat = os.stat(file_path)
-                    files.append(FileInfo(
+
+                    # 检查是否有断点
+                    checkpoint_info = transcription_service.check_file_checkpoint(file_path)
+
+                    file_info = FileInfo(
                         name=filename,
                         size=stat.st_size,
                         modified=datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
                         path=file_path
-                    ))
-        
+                    )
+
+                    # 添加断点信息
+                    file_dict = file_info.dict()
+                    if checkpoint_info:
+                        file_dict['checkpoint'] = checkpoint_info
+                    else:
+                        file_dict['checkpoint'] = None
+
+                    files.append(file_dict)
+
         # 按修改时间倒序排列
-        files.sort(key=lambda x: x.modified, reverse=True)
+        files.sort(key=lambda x: x['modified'], reverse=True)
         return {"files": files, "input_dir": INPUT_DIR}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取文件列表失败: {str(e)}")
@@ -308,13 +332,7 @@ async def start(job_id: str = Form(...), settings: str = Form(...)):
         logger.error(f"启动任务失败: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"启动任务失败: {str(e)}")
 
-@app.post("/api/cancel/{job_id}")
-async def cancel(job_id: str):
-    job = transcription_service.get_job(job_id)
-    if not job:
-        return {"error": "未找到"}
-    ok = transcription_service.cancel_job(job_id)
-    return {"job_id": job_id, "canceled": ok}
+# 取消任务端点已移至 transcription_routes.py，避免路由冲突
 
 @app.get("/api/status/{job_id}")
 async def status(job_id: str):

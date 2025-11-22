@@ -22,6 +22,14 @@
     <el-main class="main-content">
       <el-row :gutter="20" justify="center">
         <el-col :xs="24" :sm="20" :md="16" :lg="14" :xl="12">
+          <!-- 0. 未完成任务列表 -->
+          <IncompleteJobs
+            ref="incompleteJobsRef"
+            :current-job-id="jobId"
+            @restore-job="handleRestoreJob"
+            @delete-job="handleDeleteJob"
+          />
+
           <!-- 1. 文件选择区域 -->
           <FileSelector
             :show-upload="showUpload"
@@ -48,9 +56,12 @@
             :starting="starting"
             :processing="processing"
             :canceling="canceling"
+            :pausing="pausing"
             :can-restart="canRestart"
+            :status="status"
             @start-job="startJob"
-            @cancel-job="cancelJob"
+            @cancel-job="cancelJobConfirm"
+            @pause-job="pauseJob"
             @restart-job="restartJob"
             @reset-selection="resetSelection"
             @show-hardware="showHardwareDialog = true"
@@ -92,6 +103,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import FileSelector from "./components/file-management/FileSelector.vue";
 import TranscriptionSettings from "./components/transcription/TranscriptionSettings.vue";
 import ProgressDisplay from "./components/transcription/ProgressDisplay.vue";
+import IncompleteJobs from "./components/transcription/IncompleteJobs.vue";
 import HardwareDialog from "./components/hardware/HardwareDialog.vue";
 import ModelStatusButton from "./components/models/ModelStatusButton.vue";
 import ModelManager from "./components/models/ModelManager.vue";
@@ -138,11 +150,16 @@ const downloadUrl = ref("");
 const processing = ref(false);
 const starting = ref(false);
 const canceling = ref(false);
+const pausing = ref(false);  // 新增：暂停中状态
 const lastError = ref("");
 const phase = ref("");
 const language = ref("");
 const canRestart = ref(false);
 const pollTimer = ref(null);
+
+// 断点续传相关
+const resumeInfo = ref(null); // 存储恢复信息
+const incompleteJobsRef = ref(null); // 未完成任务组件引用
 
 const settings = reactive({
   model: "medium",
@@ -195,6 +212,9 @@ async function handleUpload(uploadFile) {
     showUpload.value = false;
 
     ElMessage.success("文件上传成功！转录任务已创建。");
+
+    // 检查是否有断点可以恢复
+    await checkResumeStatus();
 
     // 刷新文件列表
     loadFiles();
@@ -274,12 +294,36 @@ async function createJob() {
     statusText.value = "文件已准备就绪，可开始转录";
     canRestart.value = false;
 
+    // 检查是否有断点可以恢复
+    await checkResumeStatus();
+
     ElMessage.success("转录任务创建成功！");
   } catch (error) {
     console.error("创建任务失败:", error);
     ElMessage.error("创建任务失败：" + getErrorMessage(error));
   } finally {
     creating.value = false;
+  }
+}
+
+// 检查断点续传状态
+async function checkResumeStatus() {
+  if (!jobId.value) return;
+
+  try {
+    const data = await TranscriptionService.checkResume(jobId.value);
+    if (data.can_resume) {
+      resumeInfo.value = data;
+      ElMessage.info({
+        message: data.message || `检测到上次进度 (${data.progress}%)，将从断点继续`,
+        duration: 5000,
+      });
+    } else {
+      resumeInfo.value = null;
+    }
+  } catch (error) {
+    console.error("检查恢复状态失败:", error);
+    resumeInfo.value = null;
   }
 }
 
@@ -334,8 +378,20 @@ async function startJob() {
   lastError.value = "";
 
   try {
+    // 如果有恢复信息，显示提示
+    if (resumeInfo.value && resumeInfo.value.can_resume) {
+      ElMessage.info({
+        message: `🔄 从断点继续（已完成 ${resumeInfo.value.processed_segments}/${resumeInfo.value.total_segments} 段）`,
+        duration: 3000,
+      });
+    }
+
     await TranscriptionService.startJob(jobId.value, settings);
-    ElMessage.success("转录任务已启动！");
+    ElMessage.success(resumeInfo.value?.can_resume ? "继续转录任务！" : "转录任务已启动！");
+
+    // 清除恢复信息
+    resumeInfo.value = null;
+
     poll(); // 开始轮询状态
   } catch (e) {
     const errorMessage = "启动失败: " + (e?.message || e);
@@ -369,21 +425,97 @@ async function cancelJob() {
   }
 }
 
-async function restartJob() {
+// 暂停任务
+async function pauseJob() {
   if (!jobId.value) return;
 
   try {
-    await ElMessageBox.confirm("确定要重新转录当前文件吗？", "确认操作", {
+    pausing.value = true;
+    await TranscriptionService.pauseJob(jobId.value);
+    ElMessage.success("任务暂停请求已发送，正在保存断点...");
+  } catch (error) {
+    ElMessage.error("暂停任务失败");
+    console.error("暂停任务失败:", error);
+  } finally {
+    pausing.value = false;
+  }
+}
+
+// 取消任务确认（带删除选项）
+async function cancelJobConfirm() {
+  if (!jobId.value) return;
+
+  try {
+    await ElMessageBox.confirm(
+      "确定要取消当前任务吗？",
+      "取消任务",
+      {
+        confirmButtonText: "仅取消",
+        cancelButtonText: "返回",
+        distinguishCancelAndClose: true,
+        type: "warning"
+      }
+    );
+
+    // 询问是否删除数据
+    const deleteData = await ElMessageBox.confirm(
+      "是否同时删除任务数据？\n删除后无法恢复！",
+      "删除数据",
+      {
+        confirmButtonText: "删除数据",
+        cancelButtonText: "保留数据",
+        distinguishCancelAndClose: true,
+        type: "warning"
+      }
+    ).then(() => true).catch(() => false);
+
+    canceling.value = true;
+    await TranscriptionService.cancelJob(jobId.value, deleteData);
+
+    if (deleteData) {
+      ElMessage.success("任务已取消并删除数据");
+      // 重置状态
+      resetSelection();
+    } else {
+      ElMessage.success("任务已取消，数据已保留");
+    }
+
+    // 刷新未完成任务列表
+    if (incompleteJobsRef.value) {
+      incompleteJobsRef.value.refreshJobs();
+    }
+  } catch (error) {
+    if (error !== "cancel") {
+      ElMessage.error("取消任务失败");
+      console.error("取消任务失败:", error);
+    }
+  } finally {
+    canceling.value = false;
+  }
+}
+
+async function restartJob() {
+  if (!jobId.value) return;
+
+  // 先检查是否有断点
+  await checkResumeStatus();
+
+  const confirmMessage = resumeInfo.value?.can_resume
+    ? `检测到上次进度 (${resumeInfo.value.progress}%)，确定要继续转录吗？`
+    : "确定要重新转录当前文件吗？";
+
+  try {
+    await ElMessageBox.confirm(confirmMessage, "确认操作", {
       confirmButtonText: "确定",
       cancelButtonText: "取消",
-      type: "warning",
+      type: resumeInfo.value?.can_resume ? "info" : "warning",
     });
 
     // 重置转录相关状态
     status.value = "";
     progress.value = 0;
     phase.value = "";
-    statusText.value = "重新开始转录";
+    statusText.value = resumeInfo.value?.can_resume ? "继续转录" : "重新开始转录";
     downloadUrl.value = "";
     lastError.value = "";
     language.value = "";
@@ -427,11 +559,30 @@ async function poll() {
       downloadUrl.value = TranscriptionService.getDownloadUrl(jobId.value);
       canRestart.value = true;
       ElMessage.success("转录完成！可以下载字幕文件了。");
+
+      // 刷新未完成任务列表
+      if (incompleteJobsRef.value) {
+        incompleteJobsRef.value.refreshJobs();
+      }
     } else if (status.value === "failed" || status.value === "canceled") {
       processing.value = false;
       canRestart.value = true;
       if (status.value === "failed") {
         ElMessage.error("转录失败：" + (lastError.value || "未知错误"));
+      }
+
+      // 刷新未完成任务列表
+      if (incompleteJobsRef.value) {
+        incompleteJobsRef.value.refreshJobs();
+      }
+    } else if (status.value === "paused") {
+      processing.value = false;
+      canRestart.value = true;
+      ElMessage.info("任务已暂停，可随时恢复");
+
+      // 刷新未完成任务列表
+      if (incompleteJobsRef.value) {
+        incompleteJobsRef.value.refreshJobs();
       }
     } else {
       // 继续轮询
@@ -464,6 +615,45 @@ async function copyResultToSource() {
   } catch (error) {
     console.error("复制结果失败:", error);
     ElMessage.error("复制结果失败：" + getErrorMessage(error));
+  }
+}
+
+// 恢复任务
+async function handleRestoreJob(job) {
+  try {
+    // 调用恢复接口
+    const data = await TranscriptionService.restoreJob(job.job_id);
+
+    // 更新当前任务信息
+    jobId.value = data.job_id;
+    selectedFile.value = {
+      name: data.filename,
+      size: 0
+    };
+    status.value = data.status;
+    progress.value = data.progress || 0;
+    statusText.value = data.message || "已恢复";
+    phase.value = data.phase || "";
+    processing.value = false;
+    canRestart.value = true;
+
+    ElMessage.success(`任务已恢复：${data.filename} (${data.progress}%)`);
+
+    // 刷新未完成任务列表
+    if (incompleteJobsRef.value) {
+      incompleteJobsRef.value.refreshJobs();
+    }
+  } catch (error) {
+    console.error("恢复任务失败:", error);
+    ElMessage.error("恢复任务失败：" + getErrorMessage(error));
+  }
+}
+
+// 删除任务处理
+function handleDeleteJob(jobId) {
+  // 如果删除的是当前任务，重置状态
+  if (jobId === jobId.value) {
+    resetSelection();
   }
 }
 

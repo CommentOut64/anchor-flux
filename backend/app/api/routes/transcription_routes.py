@@ -124,14 +124,39 @@ def create_transcription_router(
             raise HTTPException(status_code=500, detail=f"启动任务失败: {str(e)}")
 
     @router.post("/cancel/{job_id}")
-    async def cancel_job(job_id: str):
+    async def cancel_job(job_id: str, delete_data: bool = False):
         """取消转录任务"""
         job = transcription_service.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="任务未找到")
-        
-        ok = transcription_service.cancel_job(job_id)
-        return {"job_id": job_id, "canceled": ok}
+
+        ok = transcription_service.cancel_job(job_id, delete_data=delete_data)
+        return {"job_id": job_id, "canceled": ok, "data_deleted": delete_data}
+
+    @router.post("/pause/{job_id}")
+    async def pause_job(job_id: str):
+        """暂停转录任务（保存断点）"""
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        ok = transcription_service.pause_job(job_id)
+        return {"job_id": job_id, "paused": ok}
+
+    @router.get("/incomplete-jobs")
+    async def get_incomplete_jobs():
+        """获取所有未完成的任务"""
+        jobs = transcription_service.scan_incomplete_jobs()
+        return {"jobs": jobs, "count": len(jobs)}
+
+    @router.post("/restore-job/{job_id}")
+    async def restore_job(job_id: str):
+        """从检查点恢复任务"""
+        job = transcription_service.restore_job_from_checkpoint(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="无法恢复任务，检查点不存在或已损坏")
+
+        return job.to_dict()
 
     @router.get("/status/{job_id}")
     async def get_job_status(job_id: str):
@@ -189,10 +214,10 @@ def create_transcription_router(
         job = transcription_service.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="任务未找到")
-        
+
         if not job.srt_path or not os.path.exists(job.srt_path):
             raise HTTPException(status_code=404, detail="字幕文件未生成")
-        
+
         try:
             # 获取原始文件目录
             if job.input_path:
@@ -200,14 +225,14 @@ def create_transcription_router(
             else:
                 # 如果没有input_path，使用input目录
                 source_dir = file_service.input_dir
-            
+
             # 生成目标路径
             srt_filename = os.path.basename(job.srt_path)
             target_path = os.path.join(source_dir, srt_filename)
-            
+
             # 复制文件
             shutil.copy2(job.srt_path, target_path)
-            
+
             return {
                 "success": True,
                 "message": f"字幕文件已复制到: {target_path}",
@@ -215,5 +240,50 @@ def create_transcription_router(
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"复制文件失败: {str(e)}")
-    
+
+    @router.get("/check-resume/{job_id}")
+    async def check_resume(job_id: str):
+        """检查任务是否可以断点续传"""
+        from pathlib import Path
+
+        job = transcription_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="任务未找到")
+
+        job_dir = Path(job.dir)
+        checkpoint_path = job_dir / "checkpoint.json"
+
+        if not checkpoint_path.exists():
+            return {
+                "can_resume": False,
+                "message": "无检查点"
+            }
+
+        try:
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            total_segments = data.get('total_segments', 0)
+            processed_indices = data.get('processed_indices', [])
+            processed_count = len(processed_indices)
+
+            if total_segments > 0:
+                progress = (processed_count / total_segments) * 100
+            else:
+                progress = 0
+
+            return {
+                "can_resume": True,
+                "progress": round(progress, 2),
+                "processed_segments": processed_count,
+                "total_segments": total_segments,
+                "phase": data.get('phase', 'unknown'),
+                "message": f"检测到上次进度 ({progress:.1f}%)，可从断点继续"
+            }
+        except Exception as e:
+            return {
+                "can_resume": False,
+                "message": f"检查点文件损坏: {str(e)}"
+            }
+
     return router

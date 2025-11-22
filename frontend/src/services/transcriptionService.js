@@ -54,8 +54,34 @@ export class TranscriptionService {
   /**
    * 取消转录任务
    */
-  static async cancelJob(jobId) {
-    const response = await apiClient.post(`/cancel/${jobId}`)
+  static async cancelJob(jobId, deleteData = false) {
+    const response = await apiClient.post(`/cancel/${jobId}`, null, {
+      params: { delete_data: deleteData }
+    })
+    return response.data
+  }
+
+  /**
+   * 暂停转录任务
+   */
+  static async pauseJob(jobId) {
+    const response = await apiClient.post(`/pause/${jobId}`)
+    return response.data
+  }
+
+  /**
+   * 获取未完成任务列表
+   */
+  static async getIncompleteJobs() {
+    const response = await apiClient.get('/incomplete-jobs')
+    return response.data
+  }
+
+  /**
+   * 恢复任务
+   */
+  static async restoreJob(jobId) {
+    const response = await apiClient.post(`/restore-job/${jobId}`)
     return response.data
   }
 
@@ -72,6 +98,14 @@ export class TranscriptionService {
    */
   static async copyResultToSource(jobId) {
     const response = await apiClient.post(`/copy-result/${jobId}`)
+    return response.data
+  }
+
+  /**
+   * 检查任务是否可以断点续传
+   */
+  static async checkResume(jobId) {
+    const response = await apiClient.get(`/check-resume/${jobId}`)
     return response.data
   }
 
