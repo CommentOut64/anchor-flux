@@ -9,10 +9,10 @@
             Video To SRT 转录工具
           </h1>
         </el-col>
-        <el-col :span="6" style="text-align: center">
-          <el-button type="primary" @click="showModelManager = true">
-            <el-icon><Files /></el-icon>
-            模型管理
+        <el-col :span="6" style="text-align: center; display: flex; gap: 0px; justify-content: flex-end;">
+          <el-button type="success" @click="showModelDownload = true">
+            <el-icon><Download /></el-icon>
+            模型下载
           </el-button>
         </el-col>
       </el-row>
@@ -76,8 +76,11 @@
     <!-- 硬件信息对话框 -->
     <HardwareDialog v-model="showHardwareDialog" />
 
-    <!-- 模型管理对话框 -->
-    <ModelManager v-model="showModelManager" />
+    <!-- 模型预加载对话框 -->
+    <ModelManager v-model="showModelPreload" />
+
+    <!-- 模型下载管理对话框 -->
+    <ModelDownloadManager v-model="showModelDownload" />
   </el-container>
 </template>
 
@@ -92,138 +95,11 @@ import ProgressDisplay from "./components/transcription/ProgressDisplay.vue";
 import HardwareDialog from "./components/hardware/HardwareDialog.vue";
 import ModelStatusButton from "./components/models/ModelStatusButton.vue";
 import ModelManager from "./components/models/ModelManager.vue";
+import ModelDownloadManager from "./components/models/ModelDownloadManager.vue";
 
 // 导入服务
 import { FileService } from "./services/fileService.js";
 import { TranscriptionService } from "./services/transcriptionService.js";
-
-// ========== 全局模型状态管理（SSE驱动） ==========
-// 创建全局响应式状态
-const globalModelState = reactive({
-  whisperModels: {},
-  alignModels: {},
-  sseConnected: false,
-  lastUpdate: 0
-});
-
-// 全局SSE连接
-let globalEventSource = null;
-
-// 建立全局SSE连接
-function connectGlobalSSE() {
-  if (globalEventSource) {
-    console.warn("[SSE] 连接已存在，跳过");
-    return;
-  }
-
-  console.log("[SSE] 建立全局SSE连接...");
-  globalEventSource = new EventSource("/api/models/events/progress");
-
-  // 连接打开
-  globalEventSource.onopen = () => {
-    console.log("[SSE] ✅ 全局连接已建立");
-    globalModelState.sseConnected = true;
-  };
-
-  // 初始状态
-  globalEventSource.addEventListener("initial_state", (e) => {
-    const data = JSON.parse(e.data);
-    console.log("[SSE] 收到初始状态:", data);
-
-    // 更新全局状态
-    if (data.whisper) {
-      for (const [modelId, state] of Object.entries(data.whisper)) {
-        globalModelState.whisperModels[modelId] = state;
-      }
-    }
-    if (data.align) {
-      for (const [lang, state] of Object.entries(data.align)) {
-        globalModelState.alignModels[lang] = state;
-      }
-    }
-    globalModelState.lastUpdate = Date.now();
-  });
-
-  // 监听进度更新
-  globalEventSource.addEventListener("model_progress", (e) => {
-    const data = JSON.parse(e.data);
-    console.log("[SSE] 模型进度更新:", data);
-    updateGlobalModelProgress(data.type, data.model_id, data.progress, data.status);
-  });
-
-  // 监听下载完成
-  globalEventSource.addEventListener("model_complete", (e) => {
-    const data = JSON.parse(e.data);
-    console.log("[SSE] 模型下载完成:", data);
-    updateGlobalModelProgress(data.type, data.model_id, 100, "ready");
-
-    ElMessage.success(`模型 ${data.model_id} 下载完成`);
-  });
-
-  // 监听下载失败
-  globalEventSource.addEventListener("model_error", (e) => {
-    const data = JSON.parse(e.data);
-    console.log("[SSE] 模型下载失败:", data);
-    updateGlobalModelProgress(data.type, data.model_id, 0, "error");
-
-    ElMessage.error(`模型 ${data.model_id} 下载失败: ${data.message || "未知错误"}`);
-  });
-
-  // 监听模型不完整
-  globalEventSource.addEventListener("model_incomplete", (e) => {
-    const data = JSON.parse(e.data);
-    console.log("[SSE] 模型不完整:", data);
-    updateGlobalModelProgress(data.type, data.model_id, 0, "incomplete");
-
-    // 弹窗提示用户
-    const modelName = data.type === "whisper" ? `Whisper模型 ${data.model_id}` : `对齐模型 ${data.model_id}`;
-    ElMessage.warning({
-      message: `${modelName} 文件不完整，请重新下载`,
-      duration: 5000,
-      showClose: true
-    });
-  });
-
-  // 监听心跳
-  globalEventSource.addEventListener("heartbeat", (e) => {
-    // console.log('[SSE] 收到心跳', JSON.parse(e.data))
-  });
-
-  // 监听连接错误
-  globalEventSource.onerror = (error) => {
-    console.error("[SSE] 连接错误:", error);
-    globalModelState.sseConnected = false;
-    // 浏览器会自动重连，无需手动处理
-  };
-}
-
-// 断开全局SSE连接
-function disconnectGlobalSSE() {
-  if (globalEventSource) {
-    globalEventSource.close();
-    globalEventSource = null;
-    globalModelState.sseConnected = false;
-    console.log("[SSE] 🔌 全局连接已断开");
-  }
-}
-
-// 更新全局模型进度
-function updateGlobalModelProgress(type, modelId, progress, status) {
-  const stateKey = type === "whisper" ? "whisperModels" : "alignModels";
-
-  if (!globalModelState[stateKey][modelId]) {
-    globalModelState[stateKey][modelId] = {};
-  }
-
-  globalModelState[stateKey][modelId].progress = progress;
-  globalModelState[stateKey][modelId].status = status;
-  globalModelState.lastUpdate = Date.now();
-
-  console.log(`[SSE] 更新全局状态: ${type}/${modelId} - ${progress}% (${status})`);
-}
-
-// 导出全局状态供其他组件使用
-window.globalModelState = globalModelState;
 
 // 安全获取错误消息的辅助函数
 const getErrorMessage = (error) => {
@@ -250,7 +126,8 @@ const showUpload = ref(false); // 默认使用本地input模式
 const showHardwareDialog = ref(false);
 
 // 模型管理对话框
-const showModelManager = ref(false);
+const showModelPreload = ref(false);  // 模型预加载管理
+const showModelDownload = ref(false); // 模型下载管理
 
 // 任务相关
 const jobId = ref("");
@@ -595,17 +472,11 @@ onUnmounted(() => {
   if (pollTimer.value) {
     clearTimeout(pollTimer.value);
   }
-
-  // 断开全局SSE连接
-  disconnectGlobalSSE();
 });
 
 onMounted(() => {
   // 页面加载时自动获取文件列表
   loadFiles();
-
-  // 建立全局SSE连接（在预加载之前）
-  connectGlobalSSE();
 
   // 页面加载完成后，启动模型预加载
   startInitialPreload();
