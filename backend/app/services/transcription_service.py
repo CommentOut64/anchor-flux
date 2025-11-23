@@ -2203,6 +2203,175 @@ class TranscriptionService:
             del audio
             gc.collect()
 
+    def _push_sse_align_progress(
+        self,
+        job: JobState,
+        current_batch: int,
+        total_batches: int,
+        aligned_count: int,
+        total_count: int
+    ):
+        """
+        推送对齐进度SSE事件（前端进度条实时更新）
+
+        事件类型: "align_progress"
+
+        Args:
+            job: 任务状态对象
+            current_batch: 当前批次号（1-based）
+            total_batches: 总批次数
+            aligned_count: 已对齐的segment数量
+            total_count: 总segment数量
+        """
+        try:
+            from services.sse_service import get_sse_manager
+            sse_manager = get_sse_manager()
+
+            channel_id = f"job:{job.job_id}"
+
+            # 计算百分比
+            batch_progress = (current_batch / total_batches) * 100 if total_batches > 0 else 0
+            segment_progress = (aligned_count / total_count) * 100 if total_count > 0 else 0
+
+            sse_manager.broadcast_sync(
+                channel_id,
+                "align_progress",  # 专用事件类型
+                {
+                    "job_id": job.job_id,
+                    "phase": "align",
+                    "batch": {
+                        "current": current_batch,
+                        "total": total_batches,
+                        "progress": round(batch_progress, 2)
+                    },
+                    "segments": {
+                        "aligned": aligned_count,
+                        "total": total_count,
+                        "progress": round(segment_progress, 2)
+                    },
+                    "message": f"aligning batch {current_batch}/{total_batches} ({aligned_count}/{total_count} segments)"
+                }
+            )
+
+        except Exception as e:
+            self.logger.debug(f"SSE align progress push failed (non-fatal): {e}")
+
+    def _align_all_results_batched(
+        self,
+        unaligned_results: List[Dict],
+        job: JobState,
+        audio_source,  # Union[np.ndarray, str]
+        processing_mode: ProcessingMode
+    ) -> List[Dict]:
+        """
+        分批对齐（支持实时SSE进度推送）
+
+        批次对齐的优势：
+        1. 避免一次性对齐所有内容导致的长时间卡顿
+        2. 支持前端进度条实时更新
+        3. 内存使用更可控
+
+        Args:
+            unaligned_results: 所有未对齐的转录结果
+            job: 任务状态对象
+            audio_source: 音频来源（内存模式传数组，硬盘模式传路径）
+            processing_mode: 当前处理模式
+
+        Returns:
+            List[Dict]: 对齐后的结果
+        """
+        self.logger.info(f"starting batched alignment: {len(unaligned_results)} segments")
+
+        # 1. 合并所有segments
+        all_segments = []
+        for result in unaligned_results:
+            all_segments.extend(result['segments'])
+
+        if not all_segments:
+            self.logger.warning("no segments to align")
+            return []
+
+        # 2. 加载音频（根据模式）
+        if processing_mode == ProcessingMode.MEMORY:
+            audio_array = audio_source  # 直接使用内存数组
+            self.logger.info("align phase: reusing audio array from memory")
+        else:
+            # 硬盘模式：需要加载完整音频
+            self.logger.info("align phase: loading complete audio from disk...")
+            audio_array = whisperx.load_audio(audio_source)
+
+        try:
+            # 3. 获取对齐模型
+            lang = job.language or unaligned_results[0].get('language', 'zh')
+            align_model, metadata = self._get_align_model(lang, job.settings.device, job)
+
+            # 4. 分批对齐
+            BATCH_SIZE = 50  # 每批50条segment
+            total_segments = len(all_segments)
+            total_batches = math.ceil(total_segments / BATCH_SIZE)
+            aligned_segments = []
+
+            self.logger.info(f"alignment config: total {total_segments} segments, {BATCH_SIZE} per batch, {total_batches} batches")
+
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * BATCH_SIZE
+                end_idx = min(start_idx + BATCH_SIZE, total_segments)
+                batch = all_segments[start_idx:end_idx]
+
+                # 计算进度
+                progress = batch_idx / total_batches
+
+                # 更新任务进度
+                self._update_progress(
+                    job,
+                    'align',
+                    progress,
+                    f'aligning batch {batch_idx + 1}/{total_batches}'
+                )
+
+                # 推送对齐进度SSE（专用事件）
+                self._push_sse_align_progress(
+                    job,
+                    batch_idx + 1,
+                    total_batches,
+                    len(aligned_segments),
+                    total_segments
+                )
+
+                # 执行对齐
+                try:
+                    aligned_batch = whisperx.align(
+                        batch,
+                        align_model,
+                        metadata,
+                        audio_array,
+                        job.settings.device
+                    )
+                    aligned_segments.extend(aligned_batch.get('segments', []))
+                    self.logger.debug(f"batch {batch_idx + 1}/{total_batches} completed")
+
+                except Exception as e:
+                    self.logger.error(f"batch {batch_idx + 1} alignment failed: {e}")
+                    # 继续处理其他批次，不中断整体流程
+                    continue
+
+            # 5. 完成
+            self._update_progress(job, 'align', 1, 'alignment complete')
+            self._push_sse_align_progress(job, total_batches, total_batches, total_segments, total_segments)
+
+            self.logger.info(f"batched alignment complete: {len(aligned_segments)} segments")
+
+            return [{
+                'segments': aligned_segments,
+                'word_segments': []
+            }]
+
+        finally:
+            # 如果是硬盘模式，释放加载的音频
+            if processing_mode == ProcessingMode.DISK:
+                del audio_array
+                gc.collect()
+
     def _format_ts(self, sec: float) -> str:
         """
         格式化时间戳为SRT格式
