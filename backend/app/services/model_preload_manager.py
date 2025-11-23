@@ -203,6 +203,33 @@ class ModelPreloadManager:
             success_count = 0
             total_models = len(models_to_load)
 
+            # ===== 优先加载 Silero VAD 模型（内置，快速） =====
+            try:
+                self.logger.info("🎯 [预加载] 优先加载 Silero VAD 模型（内置）...")
+                with self._global_lock:
+                    self._preload_status.update({
+                        "current_model": "Silero VAD (内置)",
+                        "progress": 0.0
+                    })
+
+                # 检查 Silero VAD 是否存在
+                from pathlib import Path as PathlibPath
+                from silero_vad.utils_vad import OnnxWrapper
+
+                builtin_model_path = PathlibPath(__file__).parent.parent / "assets" / "silero" / "silero_vad.onnx"
+
+                if builtin_model_path.exists():
+                    # 预加载 Silero VAD（验证可用性）
+                    _ = OnnxWrapper(str(builtin_model_path), force_onnx_cpu=False)
+                    self.logger.info("✅ Silero VAD 模型预加载成功（内置模型）")
+                else:
+                    self.logger.warning(f"⚠️ Silero VAD 模型缺失: {builtin_model_path}")
+
+            except Exception as e:
+                self.logger.warning(f"⚠️ Silero VAD 预加载失败（非致命）: {e}")
+                # 不影响后续 Whisper 模型预加载
+
+            # ===== 预加载 Whisper 模型 =====
             for i, model_name in enumerate(models_to_load):
                 try:
                     # 更新当前进度

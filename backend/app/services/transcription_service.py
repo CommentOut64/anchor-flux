@@ -1293,12 +1293,12 @@ class TranscriptionService:
         vad_config: VADConfig
     ) -> List[Dict]:
         """
-        Silero VAD分段（默认方案，无需认证）
+        Silero VAD分段（使用内置ONNX模型，无需下载）
 
         优点：
-        - 无需HuggingFace Token
-        - 通过torch.hub自动下载
-        - 速度快，内存占用低
+        - 使用项目内置ONNX模型，无需网络下载
+        - 使用 onnxruntime 推理，跨平台兼容性好
+        - 速度快，内存占用低（~2MB）
 
         Args:
             audio_array: 音频数组
@@ -1308,19 +1308,28 @@ class TranscriptionService:
         Returns:
             List[Dict]: 分段元数据列表
         """
-        self.logger.info("加载Silero VAD模型...")
+        self.logger.info("加载Silero VAD模型（内置ONNX）...")
 
-        # 从torch.hub加载Silero VAD
-        model, utils = torch.hub.load(
-            repo_or_dir='snakers4/silero-vad',
-            model='silero_vad',
-            force_reload=False,
-            onnx=False
-        )
+        # 使用 silero-vad 库（基于 onnxruntime）
+        from silero_vad import get_speech_timestamps
+        from silero_vad.utils_vad import OnnxWrapper
+        from pathlib import Path as PathlibPath
 
-        (get_speech_timestamps, _, read_audio, _, _) = utils
+        # 使用项目内置的 ONNX 模型
+        builtin_model_path = PathlibPath(__file__).parent.parent / "assets" / "silero" / "silero_vad.onnx"
 
-        # 转换为torch tensor
+        if not builtin_model_path.exists():
+            raise FileNotFoundError(
+                f"内置Silero VAD模型不存在: {builtin_model_path}\n"
+                "请确保项目完整，或重新从源码仓库获取"
+            )
+
+        self.logger.info(f"使用内置模型: {builtin_model_path}")
+
+        # 加载ONNX模型（直接从本地路径）
+        model = OnnxWrapper(str(builtin_model_path), force_onnx_cpu=False)
+
+        # 转换为torch tensor（silero-vad 需要）
         audio_tensor = torch.from_numpy(audio_array)
 
         # 获取语音时间戳
@@ -1331,6 +1340,7 @@ class TranscriptionService:
             threshold=vad_config.onset,      # 检测阈值
             min_speech_duration_ms=250,       # 最小语音段长度
             min_silence_duration_ms=100,      # 最小静音长度
+            return_seconds=False  # 返回采样点而非秒数
         )
 
         self.logger.info(f"Silero VAD检测到 {len(speech_timestamps)} 个语音段")
