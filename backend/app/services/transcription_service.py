@@ -848,12 +848,58 @@ class TranscriptionService:
                 raise RuntimeError('任务已取消')
 
             # ==========================================
-            # 3. 阶段2: 智能分段
+            # 3. 阶段1.5: 智能模式决策（新增）
+            # ==========================================
+            processing_mode = None
+            audio_array = None  # 内存模式下的音频数组
+
+            # 从checkpoint恢复模式（如果存在）
+            if checkpoint and 'processing_mode' in checkpoint:
+                mode_value = checkpoint['processing_mode']
+                processing_mode = ProcessingMode(mode_value)
+                self.logger.info(f"🔄 从检查点恢复处理模式: {processing_mode.value}")
+
+            # 如果没有检查点或没有模式信息，进行智能决策
+            if processing_mode is None:
+                processing_mode = self._decide_processing_mode(str(audio_path), job)
+                self.logger.info(f"💡 智能选择处理模式: {processing_mode.value}")
+
+            # ==========================================
+            # 4. 阶段1.6: 音频加载（内存模式）
+            # ==========================================
+            if processing_mode == ProcessingMode.MEMORY:
+                # 内存模式：尝试加载完整音频到内存
+                try:
+                    audio_array = self._safe_load_audio(str(audio_path), job)
+                    self.logger.info("✅ 音频已加载到内存（内存模式）")
+                except RuntimeError as e:
+                    # 加载失败，降级到硬盘模式
+                    self.logger.warning(f"⚠️ 内存加载失败，降级到硬盘模式: {e}")
+                    processing_mode = ProcessingMode.DISK
+                    audio_array = None
+
+            # ==========================================
+            # 5. 阶段2: 智能分段（模式感知）
             # ==========================================
             # 如果检查点里没有分段信息，说明上次没跑到分段完成
             if not current_segments:
                 self._update_progress(job, 'split', 0, '音频分段中')
-                current_segments = self._split_audio(str(audio_path))
+
+                # 根据模式选择分段方法
+                if processing_mode == ProcessingMode.MEMORY and audio_array is not None:
+                    # 内存模式：VAD分段（不产生磁盘IO）
+                    self.logger.info("使用内存VAD分段（高性能模式）")
+                    from services.transcription_service import VADConfig
+                    current_segments = self._split_audio_in_memory(
+                        audio_array,
+                        sr=16000,
+                        vad_config=VADConfig()  # 使用默认Silero VAD
+                    )
+                else:
+                    # 硬盘模式：传统pydub分段
+                    self.logger.info("使用硬盘分段（稳定模式）")
+                    current_segments = self._split_audio_to_disk(str(audio_path))
+
                 if job.canceled:
                     raise RuntimeError('任务已取消')
 
@@ -861,24 +907,21 @@ class TranscriptionService:
                 job.total = len(current_segments)
                 self._update_progress(job, 'split', 1, f'分段完成 共{job.total}段')
 
-                # 【关键埋点1】分段完成后立即保存
-                checkpoint_data = {
-                    "job_id": job.job_id,
-                    "phase": "split",
-                    "total_segments": job.total,
-                    "processed_indices": [],
-                    "segments": current_segments,  # 保存分段结果
-                    "unaligned_results": []  # 使用新字段
-                }
-                self._save_checkpoint(job_dir, checkpoint_data, job)
-                self.logger.info("💾 检查点已保存: 分段完成")
+                # 【关键埋点1】分段完成后强制刷新checkpoint（使用新方法）
+                self._flush_checkpoint_after_split(
+                    job_dir,
+                    job,
+                    current_segments,
+                    processing_mode
+                )
+                self.logger.info("💾 检查点已强制刷新: 分段完成")
             else:
                 self.logger.info(f"✅ 跳过分段，使用检查点数据（共{len(current_segments)}段）")
                 job.segments = current_segments  # 恢复到 job 对象
                 job.total = len(current_segments)
 
             # ==========================================
-            # 4. 阶段3: 转录处理（核心循环 - 仅转录不对齐）
+            # 6. 阶段3: 转录处理（双模式统一循环）
             # ==========================================
             self._update_progress(job, 'transcribe', 0, '加载模型中')
             if job.canceled:
@@ -893,6 +936,7 @@ class TranscriptionService:
             ]
 
             self.logger.info(f"📝 剩余 {len(todo_segments)}/{len(current_segments)} 段需要转录")
+            self.logger.info(f"🎯 处理模式: {processing_mode.value}")
 
             for idx, seg in enumerate(current_segments):
                 # 如果已经在 processed_indices 里，直接跳过
@@ -907,6 +951,12 @@ class TranscriptionService:
                 if job.paused:
                     raise RuntimeError('任务已暂停')
 
+                # 【内存监控】定期检查内存状态（每10段检查一次）
+                if idx % 10 == 0 and processing_mode == ProcessingMode.MEMORY:
+                    if not self._check_memory_during_transcription(job):
+                        # 内存严重不足，任务已暂停
+                        raise RuntimeError('内存不足，任务已暂停')
+
                 ratio = len(processed_indices) / max(1, len(current_segments))
                 self._update_progress(
                     job,
@@ -915,11 +965,17 @@ class TranscriptionService:
                     f'转录 {len(processed_indices)+1}/{len(current_segments)}'
                 )
 
-                # 添加segment索引
-                seg['index'] = idx
+                # 确保segment有index字段
+                if 'index' not in seg:
+                    seg['index'] = idx
 
-                # 仅转录，不对齐
-                seg_result = self._transcribe_segment_unaligned(seg, model, job)
+                # 【统一入口】使用双模式转录（自动根据mode字段选择）
+                seg_result = self._transcribe_segment(
+                    seg,
+                    model,
+                    job,
+                    audio_array=audio_array  # 内存模式传数组，硬盘模式为None
+                )
 
                 # --- 更新内存状态 ---
                 if seg_result:
@@ -944,6 +1000,7 @@ class TranscriptionService:
                 checkpoint_data = {
                     "job_id": job.job_id,
                     "phase": "transcribe",
+                    "processing_mode": processing_mode.value,  # 保存模式信息
                     "total_segments": len(current_segments),
                     "processed_indices": list(processed_indices),  # set转list
                     "segments": current_segments,
@@ -957,14 +1014,26 @@ class TranscriptionService:
                 raise RuntimeError('任务已取消')
 
             # ==========================================
-            # 5. 阶段4: 统一对齐（新增阶段）
+            # 7. 阶段4: 批次对齐（使用批次对齐+SSE进度推送）
             # ==========================================
             self._update_progress(job, 'align', 0, '准备对齐...')
 
-            aligned_results = self._align_all_results(
+            # 根据处理模式选择音频源
+            if processing_mode == ProcessingMode.MEMORY and audio_array is not None:
+                # 内存模式：复用内存数组（避免重新加载）
+                audio_source = audio_array
+                self.logger.info("🚀 对齐阶段：复用内存音频数组")
+            else:
+                # 硬盘模式：传递音频文件路径
+                audio_source = str(audio_path)
+                self.logger.info("🚀 对齐阶段：从磁盘加载音频")
+
+            # 使用批次对齐方法（支持SSE进度推送）
+            aligned_results = self._align_all_results_batched(
                 unaligned_results,
                 job,
-                str(audio_path)
+                audio_source,
+                processing_mode
             )
 
             # 【流式输出】推送对齐完成事件
