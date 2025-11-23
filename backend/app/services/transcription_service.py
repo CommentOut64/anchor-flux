@@ -714,6 +714,54 @@ class TranscriptionService:
             self.logger.warning(f"检查点文件损坏，将重新开始任务: {checkpoint_path} - {e}")
             return None
 
+    def _flush_checkpoint_after_split(
+        self,
+        job_dir: Path,
+        job: JobState,
+        segments: List[Dict],
+        processing_mode: ProcessingMode
+    ):
+        """
+        分段完成后强制刷新checkpoint（确保断点续传一致性）
+
+        这是断点续传的关键节点！
+        只有分段元数据被持久化后，后续的转录索引才有意义。
+
+        Args:
+            job_dir: 任务目录
+            job: 任务状态对象
+            segments: 分段元数据列表
+            processing_mode: 当前处理模式
+        """
+        import time
+
+        checkpoint_data = {
+            "job_id": job.job_id,
+            "phase": "split_complete",  # 明确标记分段完成
+            "processing_mode": processing_mode.value,  # 记录模式
+            "total_segments": len(segments),
+            "processed_indices": [],
+            "segments": segments,
+            "unaligned_results": [],
+            "timestamp": time.time()  # 时间戳用于调试
+        }
+
+        # 强制同步写入（确保数据落盘）
+        self._save_checkpoint(job_dir, checkpoint_data, job)
+
+        # 验证写入成功
+        saved_checkpoint = self._load_checkpoint(job_dir)
+        if saved_checkpoint is None:
+            raise RuntimeError("checkpoint write verification failed: file not readable")
+
+        if saved_checkpoint.get('phase') != 'split_complete':
+            raise RuntimeError("checkpoint write verification failed: phase mismatch")
+
+        if len(saved_checkpoint.get('segments', [])) != len(segments):
+            raise RuntimeError("checkpoint write verification failed: segments count mismatch")
+
+        self.logger.info(f"checkpoint flushed and verified after split (mode: {processing_mode.value}, segments: {len(segments)})")
+
     def _run_pipeline(self, job: JobState):
         """
         执行转录处理管道（支持断点续传）
