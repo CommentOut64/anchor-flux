@@ -1476,17 +1476,24 @@ class TranscriptionService:
             self.logger.error(f"❌ 音频提取失败: {e}")
             return False
 
-    def _split_audio(self, audio_path: str) -> List[Dict]:
+    def _split_audio_to_disk(self, audio_path: str) -> List[Dict]:
         """
-        智能分段音频（基于静音检测）
+        硬盘分段模式（保留原有逻辑）
+
+        使用pydub进行静音检测，生成segment_N.wav文件。
+        适用于内存不足的场景。
 
         Args:
             audio_path: 音频文件路径
 
         Returns:
-            List[Dict]: 段信息列表，每项包含 file 和 start_ms
+            List[Dict]: 分段信息列表，与内存模式格式统一
+            [
+                {"index": 0, "file": "segment_0.wav", "start": 0.0, "end": 30.0, "start_ms": 0, "duration_ms": 30000, "mode": "disk"},
+                ...
+            ]
         """
-        self.logger.debug(f"开始音频分段: {audio_path}")
+        self.logger.info("开始硬盘分段（pydub静音检测）...")
 
         # 使用配置中的音频处理参数
         audio_config = config.get_audio_config()
@@ -1523,24 +1530,34 @@ class TranscriptionService:
                         if new_end - pos > MIN_SILENCE_LEN_MS:
                             end = new_end
                 except Exception as e:
-                    self.logger.warning(f"静音检测失败: {e}")
+                    self.logger.warning(f"silence detection failed: {e}")
 
-            # 导出分段
+            # 导出分段文件
             chunk = audio[pos:end]
             seg_file = os.path.join(os.path.dirname(audio_path), f'segment_{idx}.wav')
             chunk.export(seg_file, format='wav')
 
+            # 统一返回格式（与内存模式一致）
             segments.append({
+                'index': idx,                    # 新增：分段索引
                 'file': seg_file,
-                'start_ms': pos,
-                'duration_ms': end - pos
+                'start': pos / 1000.0,           # 新增：起始时间（秒）
+                'end': end / 1000.0,             # 新增：结束时间（秒）
+                'start_ms': pos,                 # 保留：兼容旧代码
+                'duration_ms': end - pos,        # 保留：兼容旧代码
+                'mode': 'disk'                   # 新增：模式标记
             })
 
             pos = end
             idx += 1
 
-        self.logger.debug(f"✅ 音频分段完成: 共{len(segments)}段")
+        self.logger.info(f"disk segmentation complete: {len(segments)} segments (with segment files)")
         return segments
+
+    # 兼容性别名：保留旧方法名（指向新方法）
+    def _split_audio(self, audio_path: str) -> List[Dict]:
+        """兼容性别名，指向 _split_audio_to_disk()"""
+        return self._split_audio_to_disk(audio_path)
 
     def _get_model(self, settings: JobSettings, job: Optional[JobState] = None):
         """
