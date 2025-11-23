@@ -58,6 +58,11 @@ class TranscriptionService:
         # 启动时清理无效映射
         self.job_index.cleanup_invalid_mappings()
 
+        # 集成SSE管理器（用于实时进度推送）
+        from services.sse_service import get_sse_manager
+        self.sse_manager = get_sse_manager()
+        self.logger.info("✅ SSE管理器已集成")
+
         # 记录CPU信息
         sys_info = self.cpu_manager.get_system_info()
         if sys_info.get('supported', False):
@@ -477,7 +482,142 @@ class TranscriptionService:
         if message:
             job.message = message
 
-    def _save_checkpoint(self, job_dir: Path, data: dict):
+        # 推送SSE进度更新（线程安全）
+        self._push_sse_progress(job)
+
+    def _push_sse_progress(self, job: JobState):
+        """
+        推送SSE进度更新（线程安全）
+
+        Args:
+            job: 任务状态对象
+        """
+        try:
+            # 动态获取SSE管理器（确保获取到已设置loop的实例）
+            from services.sse_service import get_sse_manager
+            sse_manager = get_sse_manager()
+
+            channel_id = f"job:{job.job_id}"
+
+            sse_manager.broadcast_sync(
+                channel_id,
+                "progress",
+                {
+                    "job_id": job.job_id,
+                    "phase": job.phase,
+                    "percent": job.progress,
+                    "message": job.message,
+                    "status": job.status,
+                    "processed": job.processed,
+                    "total": job.total,
+                    "language": job.language or ""
+                }
+            )
+        except Exception as e:
+            # SSE推送失败不应影响转录流程
+            self.logger.debug(f"SSE推送失败: {e}")
+
+    def _push_sse_signal(self, job: JobState, signal_code: str, message: str = ""):
+        """
+        推送SSE信号事件（用于关键节点通知）
+
+        Args:
+            job: 任务状态对象
+            signal_code: 信号代码（如 "job_complete", "job_failed", "job_canceled"）
+            message: 附加消息
+        """
+        try:
+            # 动态获取SSE管理器（确保获取到已设置loop的实例）
+            from services.sse_service import get_sse_manager
+            sse_manager = get_sse_manager()
+
+            channel_id = f"job:{job.job_id}"
+            sse_manager.broadcast_sync(
+                channel_id,
+                "signal",
+                {
+                    "job_id": job.job_id,
+                    "code": signal_code,
+                    "message": message or job.message,
+                    "status": job.status,
+                    "progress": job.progress
+                }
+            )
+        except Exception as e:
+            self.logger.debug(f"SSE信号推送失败（非致命）: {e}")
+
+    def _push_sse_segment(self, job: JobState, segment_result: dict, processed: int, total: int):
+        """
+        推送单个segment的转录结果（流式输出）
+
+        Args:
+            job: 任务状态对象
+            segment_result: 单个segment的转录结果（未对齐）
+            processed: 已处理的segment数量
+            total: 总segment数量
+        """
+        try:
+            # 动态获取SSE管理器
+            from services.sse_service import get_sse_manager
+            sse_manager = get_sse_manager()
+
+            channel_id = f"job:{job.job_id}"
+            sse_manager.broadcast_sync(
+                channel_id,
+                "segment",
+                {
+                    "segment_index": segment_result.get('segment_index', 0),
+                    "segments": segment_result.get('segments', []),
+                    "language": segment_result.get('language', job.language),
+                    "progress": {
+                        "processed": processed,
+                        "total": total,
+                        "percentage": round(processed / max(1, total) * 100, 2)
+                    }
+                }
+            )
+            self.logger.debug(f"📤 推送segment #{segment_result.get('segment_index', 0)} 转录结果")
+        except Exception as e:
+            # SSE推送失败不应影响转录流程
+            self.logger.debug(f"SSE segment推送失败（非致命）: {e}")
+
+    def _push_sse_aligned(self, job: JobState, aligned_results: List[Dict]):
+        """
+        推送对齐完成事件（流式输出）
+
+        Args:
+            job: 任务状态对象
+            aligned_results: 对齐后的结果列表
+        """
+        try:
+            # 动态获取SSE管理器
+            from services.sse_service import get_sse_manager
+            sse_manager = get_sse_manager()
+
+            channel_id = f"job:{job.job_id}"
+
+            # 提取对齐后的segments
+            segments = []
+            word_segments = []
+            if aligned_results and len(aligned_results) > 0:
+                segments = aligned_results[0].get('segments', [])
+                word_segments = aligned_results[0].get('word_segments', [])
+
+            sse_manager.broadcast_sync(
+                channel_id,
+                "aligned",
+                {
+                    "segments": segments,
+                    "word_segments": word_segments,
+                    "message": "对齐完成"
+                }
+            )
+            self.logger.info(f"📤 推送对齐完成事件，共 {len(segments)} 条字幕")
+        except Exception as e:
+            # SSE推送失败不应影响转录流程
+            self.logger.debug(f"SSE aligned推送失败（非致命）: {e}")
+
+    def _save_checkpoint(self, job_dir: Path, data: dict, job: JobState):
         """
         原子性保存检查点
         使用"写临时文件 -> 重命名"策略，确保文件要么完整写入，要么保持原样
@@ -485,7 +625,17 @@ class TranscriptionService:
         Args:
             job_dir: 任务目录
             data: 检查点数据
+            job: 任务状态对象（用于获取settings）
         """
+        # 添加原始设置到checkpoint（用于校验参数兼容性）
+        data["original_settings"] = {
+            "model": job.settings.model,
+            "device": job.settings.device,
+            "word_timestamps": job.settings.word_timestamps,
+            "compute_type": job.settings.compute_type,
+            "batch_size": job.settings.batch_size
+        }
+
         checkpoint_path = job_dir / "checkpoint.json"
         temp_path = checkpoint_path.with_suffix(".tmp")
 
@@ -563,14 +713,26 @@ class TranscriptionService:
 
             # 初始化内存状态
             processed_indices = set()
-            processed_results = []
+            unaligned_results = []  # 未对齐的转录结果
             current_segments = []
 
             if checkpoint:
                 self.logger.info(f"🔄 发现检查点，从 {checkpoint.get('phase', 'unknown')} 阶段恢复")
                 # 恢复数据到内存
                 processed_indices = set(checkpoint.get('processed_indices', []))
-                processed_results = checkpoint.get('results', [])
+
+                # 【兼容性处理】支持旧格式checkpoint
+                if 'unaligned_results' in checkpoint:
+                    # 新格式：unaligned_results字段
+                    unaligned_results = checkpoint.get('unaligned_results', [])
+                    self.logger.info("✅ 检测到新格式checkpoint（未对齐结果）")
+                elif 'results' in checkpoint:
+                    # 旧格式：results字段（已对齐）
+                    self.logger.warning("⚠️ 检测到旧版checkpoint格式，将直接使用已对齐结果")
+                    # 将旧格式转换为新格式（跳过对齐阶段）
+                    # 这种情况下我们直接使用results作为最终结果
+                    pass
+
                 current_segments = checkpoint.get('segments', [])
                 # 恢复任务基本信息
                 job.total = checkpoint.get('total_segments', 0)
@@ -617,9 +779,9 @@ class TranscriptionService:
                     "total_segments": job.total,
                     "processed_indices": [],
                     "segments": current_segments,  # 保存分段结果
-                    "results": []
+                    "unaligned_results": []  # 使用新字段
                 }
-                self._save_checkpoint(job_dir, checkpoint_data)
+                self._save_checkpoint(job_dir, checkpoint_data, job)
                 self.logger.info("💾 检查点已保存: 分段完成")
             else:
                 self.logger.info(f"✅ 跳过分段，使用检查点数据（共{len(current_segments)}段）")
@@ -627,14 +789,13 @@ class TranscriptionService:
                 job.total = len(current_segments)
 
             # ==========================================
-            # 4. 阶段3: 转录处理（核心循环）
+            # 4. 阶段3: 转录处理（核心循环 - 仅转录不对齐）
             # ==========================================
             self._update_progress(job, 'transcribe', 0, '加载模型中')
             if job.canceled:
                 raise RuntimeError('任务已取消')
 
             model = self._get_model(job.settings, job)
-            align_cache = {}
 
             # 过滤出需要处理的段
             todo_segments = [
@@ -665,11 +826,15 @@ class TranscriptionService:
                     f'转录 {len(processed_indices)+1}/{len(current_segments)}'
                 )
 
-                seg_result = self._transcribe_segment(seg, model, job, align_cache)
+                # 添加segment索引
+                seg['index'] = idx
+
+                # 仅转录，不对齐
+                seg_result = self._transcribe_segment_unaligned(seg, model, job)
 
                 # --- 更新内存状态 ---
                 if seg_result:
-                    processed_results.append(seg_result)
+                    unaligned_results.append(seg_result)
                 processed_indices.add(idx)
                 job.processed = len(processed_indices)
 
@@ -682,31 +847,51 @@ class TranscriptionService:
                     f'转录中 {len(processed_indices)}/{len(current_segments)}'
                 )
 
-                # 【关键埋点2】每处理一段保存一次
-                # 单机版每段保存开销很小，建议直接每段保存，体验最好
+                # 【流式输出】立即推送单个segment的转录结果
+                if seg_result:
+                    self._push_sse_segment(job, seg_result, len(processed_indices), len(current_segments))
+
+                # 【关键埋点2】每处理一段保存一次（保存未对齐结果）
                 checkpoint_data = {
                     "job_id": job.job_id,
                     "phase": "transcribe",
                     "total_segments": len(current_segments),
                     "processed_indices": list(processed_indices),  # set转list
                     "segments": current_segments,
-                    "results": processed_results
+                    "unaligned_results": unaligned_results  # 保存未对齐结果
                 }
-                self._save_checkpoint(job_dir, checkpoint_data)
+                self._save_checkpoint(job_dir, checkpoint_data, job)
                 self.logger.debug(f"💾 检查点已保存: {len(processed_indices)}/{len(current_segments)}")
 
-            self._update_progress(job, 'transcribe', 1, '转录完成 生成字幕中')
+            self._update_progress(job, 'transcribe', 1, '转录完成')
             if job.canceled:
                 raise RuntimeError('任务已取消')
 
             # ==========================================
-            # 5. 阶段4: 生成SRT
+            # 5. 阶段4: 统一对齐（新增阶段）
+            # ==========================================
+            self._update_progress(job, 'align', 0, '准备对齐...')
+
+            aligned_results = self._align_all_results(
+                unaligned_results,
+                job,
+                str(audio_path)
+            )
+
+            # 【流式输出】推送对齐完成事件
+            self._push_sse_aligned(job, aligned_results)
+
+            if job.canceled:
+                raise RuntimeError('任务已取消')
+
+            # ==========================================
+            # 6. 阶段5: 生成SRT
             # ==========================================
             base_name = os.path.splitext(job.filename)[0]
             srt_path = job_dir / f'{base_name}.srt'
             self._update_progress(job, 'srt', 0, '写入 SRT...')
             self._generate_srt(
-                processed_results,
+                aligned_results,
                 str(srt_path),
                 job.settings.word_timestamps
             )
@@ -725,25 +910,35 @@ class TranscriptionService:
             if job.canceled:
                 job.status = 'canceled'
                 job.message = '已取消'
+                # 推送取消信号
+                self._push_sse_signal(job, "job_canceled", "任务已取消")
             else:
                 job.status = 'finished'
                 job.message = '完成'
                 self.logger.info(f"✅ 任务完成: {job.job_id}")
+                # 推送完成信号
+                self._push_sse_signal(job, "job_complete", "转录完成")
 
         except Exception as e:
             if job.canceled and '取消' in str(e):
                 job.status = 'canceled'
                 job.message = '已取消'
                 self.logger.info(f"🛑 任务已取消: {job.job_id}")
+                # 推送取消信号
+                self._push_sse_signal(job, "job_canceled", "任务已取消")
             elif job.paused and '暂停' in str(e):
                 job.status = 'paused'
                 job.message = '已暂停'
                 self.logger.info(f"⏸️ 任务已暂停: {job.job_id}")
+                # 推送暂停信号
+                self._push_sse_signal(job, "job_paused", "任务已暂停")
             else:
                 job.status = 'failed'
                 job.message = f'失败: {e}'
                 job.error = str(e)
                 self.logger.error(f"❌ 任务失败: {job.job_id} - {e}", exc_info=True)
+                # 推送失败信号
+                self._push_sse_signal(job, "job_failed", f"任务失败: {e}")
 
         finally:
             # 恢复CPU亲和性设置
@@ -1159,6 +1354,128 @@ class TranscriptionService:
                 if job:
                     job.message = "对齐模型下载并加载完成"
                 return am, meta
+
+    def _transcribe_segment_unaligned(
+        self,
+        seg: Dict,
+        model,
+        job: JobState
+    ) -> Optional[Dict]:
+        """
+        转录单个音频段（仅转录，不对齐）
+
+        Args:
+            seg: 段信息 {file, start_ms, duration_ms, index}
+            model: Whisper模型
+            job: 任务状态
+
+        Returns:
+            Dict: 未对齐的转录结果
+            {
+                "segment_index": 0,
+                "language": "zh",
+                "segments": [{"id": 0, "start": 10.5, "end": 15.2, "text": "..."}]
+            }
+        """
+        audio = whisperx.load_audio(seg['file'])
+
+        try:
+            # 仅进行Transcription，不进行Alignment
+            rs = model.transcribe(
+                audio,
+                batch_size=job.settings.batch_size,
+                verbose=False,
+                language=job.language
+            )
+
+            if not rs or 'segments' not in rs:
+                return None
+
+            # 检测语言（首次）
+            if not job.language and 'language' in rs:
+                job.language = rs['language']
+                self.logger.info(f"🌐 检测到语言: {job.language}")
+
+            # 时间偏移校正（针对粗略时间戳）
+            start_offset = seg['start_ms'] / 1000.0
+            adjusted_segments = []
+
+            for idx, s in enumerate(rs['segments']):
+                adjusted_segments.append({
+                    'id': idx,
+                    'start': s.get('start', 0) + start_offset,
+                    'end': s.get('end', 0) + start_offset,
+                    'text': s.get('text', '').strip()
+                })
+
+            return {
+                'segment_index': seg.get('index', 0),  # 需要在调用时传入
+                'language': rs.get('language', job.language),
+                'segments': adjusted_segments
+            }
+
+        finally:
+            del audio
+            gc.collect()
+
+    def _align_all_results(
+        self,
+        unaligned_results: List[Dict],
+        job: JobState,
+        audio_path: str
+    ) -> List[Dict]:
+        """
+        对所有未对齐的转录结果进行统一对齐
+
+        Args:
+            unaligned_results: 所有未对齐的转录结果
+            job: 任务状态
+            audio_path: 完整音频文件路径
+
+        Returns:
+            List[Dict]: 对齐后的结果
+        """
+        self.logger.info(f"🔧 开始统一对齐 {len(unaligned_results)} 个分段的转录结果")
+
+        # 1. 合并所有segments
+        all_segments = []
+        for result in unaligned_results:
+            all_segments.extend(result['segments'])
+
+        if not all_segments:
+            self.logger.warning("没有可对齐的内容")
+            return []
+
+        # 2. 加载完整音频
+        audio = whisperx.load_audio(audio_path)
+
+        try:
+            # 3. 获取对齐模型
+            lang = job.language or unaligned_results[0].get('language', 'zh')
+            align_model, metadata = self._get_align_model(lang, job.settings.device, job)
+
+            # 4. 执行对齐（一次性处理所有segments）
+            self._update_progress(job, 'align', 0, '正在对齐时间轴...')
+
+            aligned = whisperx.align(
+                all_segments,
+                align_model,
+                metadata,
+                audio,
+                job.settings.device
+            )
+
+            self._update_progress(job, 'align', 1, '对齐完成')
+
+            # 5. 返回对齐后的结果
+            return [{
+                'segments': aligned.get('segments', []),
+                'word_segments': aligned.get('word_segments', [])
+            }]
+
+        finally:
+            del audio
+            gc.collect()
 
     def _transcribe_segment(
         self,

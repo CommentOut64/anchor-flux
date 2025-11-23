@@ -81,11 +81,12 @@ class ProjectConfig:
         # ========== 进度权重配置 ==========
         self.PHASE_WEIGHTS = {
             "extract": 5,      # 音频提取占5%
-            "split": 10,       # 音频分段占10%
-            "transcribe": 80,  # 转录处理占80%（主要耗时）
-            "srt": 5           # SRT生成占5%
+            "split": 5,        # 音频分段占5%（从10降到5）
+            "transcribe": 70,  # 转录处理占70%（从80降到70，因为分离了对齐）
+            "align": 10,       # 对齐处理占10%（新增阶段）
+            "srt": 10          # SRT生成占10% （已调整为10）
         }
-        self.TOTAL_WEIGHT = sum(self.PHASE_WEIGHTS.values())
+        self.TOTAL_WEIGHT = sum(self.PHASE_WEIGHTS.values())  # 计算总和，保证为100
 
         # ========== 模型配置 ==========
         self.DEFAULT_MODEL = "medium"
@@ -109,6 +110,11 @@ class ProjectConfig:
         self.LOG_DIR = self.BASE_DIR / "logs"
         self.LOG_FILE = self.LOG_DIR / "app.log"
         self.LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+        # ========== SSE配置 ==========
+        self.SSE_HEARTBEAT_INTERVAL = 10  # 心跳间隔（秒）
+        self.SSE_MAX_QUEUE_SIZE = 1000     # 每个连接的消息队列大小
+        self.SSE_MAX_CONNECTIONS_PER_CHANNEL = 10  # 每个频道最大连接数
 
     def get_ffmpeg_command(self) -> str:
         """

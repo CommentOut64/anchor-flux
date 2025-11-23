@@ -69,11 +69,15 @@ async def startup_event():
         # 1. 设置SSE事件循环引用（必须在模型管理器初始化之前！）
         logger.info("步骤 1/3: 设置SSE事件循环...")
         try:
-            from api.routes.model_routes import set_event_loop
-            if set_event_loop():
-                logger.info("✅ SSE事件循环已设置")
-            else:
-                logger.warning("⚠️ SSE事件循环设置失败，将使用备用机制")
+            import asyncio
+            current_loop = asyncio.get_running_loop()
+
+            # 设置统一SSE管理器的事件循环（用于转录进度和模型下载）
+            from services.sse_service import get_sse_manager
+            sse_manager = get_sse_manager()
+            sse_manager.set_event_loop(current_loop)
+            logger.info("✅ 统一SSE管理器事件循环已设置")
+
         except Exception as e:
             logger.warning(f"设置SSE事件循环异常: {e}")
 

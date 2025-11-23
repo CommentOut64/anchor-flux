@@ -12,6 +12,7 @@ import logging
 
 from models.model_models import ModelInfo, AlignModelInfo
 from services.model_manager_service import get_model_manager
+from services.sse_service import get_sse_manager  # 导入统一SSE管理器
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 logger = logging.getLogger(__name__)
@@ -152,47 +153,28 @@ async def get_download_progress():
         raise HTTPException(status_code=500, detail=f"获取进度失败: {str(e)}")
 
 
-# ========== SSE 实时进度推送端点 ==========
+# ========== SSE相关 - 使用统一管理器 ==========
 
-# 存储活动的 SSE 连接队列（改用 asyncio.Queue）
-# 增大队列容量，避免频繁更新时队列溢出
-sse_queues: List[asyncio.Queue] = []
-
-# 获取当前事件循环的引用（在应用启动时设置）
-_event_loop = None
-
-def set_event_loop():
-    """设置事件循环引用（在应用启动时调用）"""
-    global _event_loop
-    try:
-        _event_loop = asyncio.get_running_loop()
-        logger.info("✅ SSE事件循环已设置")
-        return True
-    except RuntimeError as e:
-        logger.warning(f"⚠️ 无法获取事件循环: {e}")
-        return False
-
-def get_event_loop():
-    """获取事件循环引用（线程安全，支持延迟获取）"""
-    global _event_loop
-    if _event_loop is None or _event_loop.is_closed():
-        try:
-            _event_loop = asyncio.get_running_loop()
-            logger.debug("🔄 延迟获取事件循环成功")
-        except RuntimeError:
-            logger.debug("⚠️ 当前线程没有运行中的事件循环")
-            return None
-    return _event_loop
+# 获取统一SSE管理器实例
+sse_manager = get_sse_manager()
 
 def progress_callback(model_type: str, model_id: str, progress: float, status: str, message: str = ""):
     """
-    进度回调函数，用于推送到所有 SSE 连接（线程安全，优化队列溢出处理）
+    进度回调函数，推送到SSE频道 "models"（线程安全）
 
-    关键优化：
-    1. 检查队列容量，避免 QueueFull 异常
-    2. 队列满时跳过更新，而不是抛出异常
-    3. 降低日志级别，避免日志洪水
+    使用统一SSE管理器，替代原来的 sse_queues 方案
     """
+    # 确定事件类型（根据状态）
+    if status == 'ready':
+        event_type = 'model_complete'
+    elif status == 'error':
+        event_type = 'model_error'
+    elif status == 'incomplete':
+        event_type = 'model_incomplete'
+    else:
+        event_type = 'model_progress'
+
+    # 构造数据（保持与前端兼容的格式）
     event_data = {
         "type": model_type,
         "model_id": model_id,
@@ -202,138 +184,57 @@ def progress_callback(model_type: str, model_id: str, progress: float, status: s
         "timestamp": time.time()
     }
 
-    # 获取事件循环
-    loop = get_event_loop()
-    if loop is None:
-        # 只在第一次失败时警告，避免日志洪水
-        if not hasattr(progress_callback, '_warned'):
-            logger.warning(f"⚠️ 事件循环未设置，无法推送SSE消息")
-            progress_callback._warned = True
-        return
-
-    # 使用 call_soon_threadsafe 从下载线程向主事件循环注入消息
-    success_count = 0
-    skipped_count = 0
-
-    for q in sse_queues[:]:  # 使用切片复制列表
-        try:
-            # 关键优化：检查队列容量，避免 QueueFull 异常
-            current_size = q.qsize()
-            max_size = q.maxsize
-
-            # 如果队列使用率超过90%，跳过此次更新（保留紧急容量）
-            if current_size >= max_size * 0.9:
-                skipped_count += 1
-                # 只记录 debug 级别，避免日志洪水
-                if skipped_count == 1:  # 只记录第一次跳过
-                    logger.debug(f"队列接近满({current_size}/{max_size})，跳过更新: {model_type}/{model_id}")
-                continue
-
-            # 线程安全地将消息放入队列
-            loop.call_soon_threadsafe(q.put_nowait, event_data)
-            success_count += 1
-
-        except Exception as e:
-            # 降低日志级别，避免日志洪水
-            logger.debug(f"推送SSE消息失败: {e}")
-
-    # 只在成功推送或有跳过时记录 debug 日志
-    if success_count > 0:
-        logger.debug(f"SSE消息已推送到 {success_count} 个连接: {model_type}/{model_id} - {status} ({progress:.1f}%)")
-    if skipped_count > 0 and skipped_count % 10 == 0:  # 每10次跳过才记录一次
-        logger.debug(f"已跳过 {skipped_count} 次更新（队列繁忙）")
+    # 使用统一管理器的线程安全广播
+    try:
+        sse_manager.broadcast_sync("models", event_type, event_data)
+    except Exception as e:
+        logger.debug(f"SSE推送失败（非致命）: {e}")
 
 # 注册进度回调
 model_manager.register_progress_callback(progress_callback)
 
+
 @router.get("/events/progress")
 async def stream_all_progress(request: Request):
     """
-    SSE端点：实时推送所有模型下载进度（改进版 - 非阻塞 asyncio.Queue）
+    SSE端点：实时推送所有模型下载进度（使用统一SSE管理器）
+
+    频道: "models"
 
     事件类型：
+    - initial_state: 初始状态（所有模型）
     - model_progress: 下载进度更新
     - model_complete: 下载完成
     - model_error: 下载失败
     - model_incomplete: 模型不完整
-    - heartbeat: 心跳（每15秒）
+    - ping: 心跳
 
     Returns:
         StreamingResponse: SSE事件流
     """
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        """SSE事件生成器（非阻塞实现，优化队列大小）"""
-        # 创建此连接的专用 asyncio.Queue（增大容量到1000，避免频繁溢出）
-        event_queue = asyncio.Queue(maxsize=1000)
-        sse_queues.append(event_queue)
-
-        heartbeat_counter = 0
-
-        try:
-            logger.info(f"✅ SSE连接已建立（当前连接数: {len(sse_queues)}）")
-
-            # 首次发送所有模型状态
-            initial_state = {
-                "whisper": {
-                    m.model_id: {
-                        "status": m.status,
-                        "progress": m.download_progress
-                    }
-                    for m in model_manager.list_whisper_models()
-                },
-                "align": {
-                    m.language: {
-                        "status": m.status,
-                        "progress": m.download_progress
-                    }
-                    for m in model_manager.list_align_models()
+    # 定义初始状态回调 - 返回所有模型的当前状态
+    def get_initial_state():
+        return {
+            "whisper": {
+                m.model_id: {
+                    "status": m.status,
+                    "progress": m.download_progress
                 }
+                for m in model_manager.list_whisper_models()
+            },
+            "align": {
+                m.language: {
+                    "status": m.status,
+                    "progress": m.download_progress
+                }
+                for m in model_manager.list_align_models()
             }
+        }
 
-            yield f"event: initial_state\ndata: {json.dumps(initial_state)}\n\n"
-
-            while True:
-                # 检查客户端是否断开
-                if await request.is_disconnected():
-                    logger.info("⚠️ 客户端已断开连接")
-                    break
-
-                try:
-                    # 非阻塞等待消息，超时后发送心跳
-                    event_data = await asyncio.wait_for(event_queue.get(), timeout=15)
-
-                    # 根据状态发送不同类型的事件
-                    if event_data['status'] == 'ready':
-                        event_type = 'model_complete'
-                    elif event_data['status'] == 'error':
-                        event_type = 'model_error'
-                    elif event_data['status'] == 'incomplete':
-                        event_type = 'model_incomplete'
-                    else:
-                        event_type = 'model_progress'
-
-                    yield f"event: {event_type}\ndata: {json.dumps(event_data)}\n\n"
-
-                except asyncio.TimeoutError:
-                    # 超时，发送心跳
-                    heartbeat_counter += 1
-                    yield f"event: heartbeat\ndata: {json.dumps({'count': heartbeat_counter})}\n\n"
-
-        except asyncio.CancelledError:
-            logger.info("⚠️ SSE连接被客户端取消")
-        except Exception as e:
-            logger.error(f"❌ SSE错误: {e}")
-        finally:
-            # 清理：移除此连接的队列
-            try:
-                sse_queues.remove(event_queue)
-                logger.info(f"🔌 SSE连接已断开（剩余连接数: {len(sse_queues)}）")
-            except ValueError:
-                pass
-
+    # 使用统一SSE管理器订阅 "models" 频道
     return StreamingResponse(
-        event_generator(),
+        sse_manager.subscribe("models", request, initial_state_callback=get_initial_state),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -347,6 +248,8 @@ async def stream_all_progress(request: Request):
 async def stream_single_progress(model_type: str, model_id: str):
     """
     SSE端点：推送单个模型的下载进度
+
+    ⚠️ 已过时：建议使用 /events/progress 并在前端过滤，更高效
 
     Args:
         model_type: 模型类型 (whisper 或 align)

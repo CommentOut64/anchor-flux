@@ -155,7 +155,8 @@ const lastError = ref("");
 const phase = ref("");
 const language = ref("");
 const canRestart = ref(false);
-const pollTimer = ref(null);
+const pollTimer = ref(null); // 后备轮询机制
+let sseConnection = null; // SSE连接实例
 
 // 断点续传相关
 const resumeInfo = ref(null); // 存储恢复信息
@@ -358,6 +359,9 @@ function resetSelection() {
         pollTimer.value = null;
       }
 
+      // 断开SSE连接
+      disconnectSSE();
+
       // 刷新文件列表
       loadFiles();
       ElMessage.success("已重置，可以重新选择文件");
@@ -392,7 +396,7 @@ async function startJob() {
     // 清除恢复信息
     resumeInfo.value = null;
 
-    poll(); // 开始轮询状态
+    connectSSE(); // 连接SSE实时监听进度（替代轮询）
   } catch (e) {
     const errorMessage = "启动失败: " + (e?.message || e);
     statusText.value = errorMessage;
@@ -535,6 +539,180 @@ async function restartJob() {
   }
 }
 
+// ========== SSE实时进度推送（替代轮询） ==========
+/**
+ * 连接SSE流监听任务进度
+ */
+function connectSSE() {
+  if (!jobId.value) return;
+
+  // 关闭已有连接
+  disconnectSSE();
+
+  const url = `/api/stream/${jobId.value}`;
+  console.log(`[SSE] 连接到: ${url}`);
+
+  sseConnection = new EventSource(url);
+
+  // 监听连接打开
+  sseConnection.onopen = (e) => {
+    console.log('[SSE] ✅ 连接已打开', e);
+  };
+
+  // 监听所有消息（调试用）
+  sseConnection.onmessage = (e) => {
+    console.log('[SSE] onmessage收到原始消息:', e.type, e.data);
+  };
+
+  // 监听错误
+  sseConnection.onerror = (err) => {
+    console.error('[SSE] ❌ 连接错误:', err);
+    console.error('[SSE] readyState:', sseConnection?.readyState);
+  };
+
+  // 进度更新事件
+  sseConnection.addEventListener('progress', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      console.log(`[SSE] ✅ 进度更新事件:`, data);
+
+      // 更新界面状态
+      status.value = data.status;
+      progress.value = data.percent || 0;
+      statusText.value = data.message || "";
+      phase.value = data.phase || "";
+      language.value = data.language || "";
+    } catch (err) {
+      console.error('[SSE] 解析进度数据失败:', err);
+    }
+  });
+
+  // 信号事件（任务完成/失败/取消/暂停）
+  sseConnection.addEventListener('signal', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      console.log(`[SSE] 信号事件:`, data);
+
+      const signalCode = data.code;
+
+      switch (signalCode) {
+        case 'job_complete':
+          // 更新状态
+          status.value = 'finished';
+          processing.value = false;
+          downloadUrl.value = TranscriptionService.getDownloadUrl(jobId.value);
+          canRestart.value = true;
+          ElMessage.success("转录完成！可以下载字幕文件了。");
+          disconnectSSE(); // 任务完成,关闭SSE连接
+
+          // 刷新未完成任务列表
+          if (incompleteJobsRef.value) {
+            incompleteJobsRef.value.refreshJobs();
+          }
+          break;
+
+        case 'job_failed':
+          // 更新状态
+          status.value = 'failed';
+          processing.value = false;
+          canRestart.value = true;
+          lastError.value = data.message || "未知错误";
+          ElMessage.error("转录失败：" + lastError.value);
+          disconnectSSE(); // 任务失败,关闭SSE连接
+
+          // 刷新未完成任务列表
+          if (incompleteJobsRef.value) {
+            incompleteJobsRef.value.refreshJobs();
+          }
+          break;
+
+        case 'job_canceled':
+          // 更新状态
+          status.value = 'canceled';
+          processing.value = false;
+          canRestart.value = true;
+          ElMessage.info("任务已取消");
+          disconnectSSE(); // 任务取消,关闭SSE连接
+
+          // 刷新未完成任务列表
+          if (incompleteJobsRef.value) {
+            incompleteJobsRef.value.refreshJobs();
+          }
+          break;
+
+        case 'job_paused':
+          // 更新状态
+          status.value = 'paused';
+          processing.value = false;
+          canRestart.value = true;
+          ElMessage.info("任务已暂停，可随时恢复");
+          disconnectSSE(); // 任务暂停,关闭SSE连接
+
+          // 刷新未完成任务列表
+          if (incompleteJobsRef.value) {
+            incompleteJobsRef.value.refreshJobs();
+          }
+          break;
+
+        default:
+          console.warn('[SSE] 未知信号:', signalCode);
+      }
+    } catch (err) {
+      console.error('[SSE] 解析信号数据失败:', err);
+    }
+  });
+
+  // 心跳事件
+  sseConnection.addEventListener('ping', (e) => {
+    console.log('[SSE] 心跳');
+  });
+
+  // 连接错误
+  sseConnection.onerror = (err) => {
+    console.error('[SSE] 连接错误:', err);
+
+    // SSE连接失败,回退到轮询机制
+    if (sseConnection.readyState === EventSource.CLOSED) {
+      console.warn('[SSE] 连接关闭,启动后备轮询');
+      disconnectSSE();
+
+      // 如果任务还在处理中,启动轮询
+      if (processing.value) {
+        pollTimer.value = setTimeout(poll, 1500);
+      }
+    }
+  };
+
+  // 初始状态事件（连接时服务器推送）
+  sseConnection.addEventListener('initial_state', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      console.log('[SSE] 初始状态:', data);
+
+      // 更新界面状态
+      status.value = data.status;
+      progress.value = data.percent || 0;
+      statusText.value = data.message || "";
+      phase.value = data.phase || "";
+      language.value = data.language || "";
+    } catch (err) {
+      console.error('[SSE] 解析初始状态失败:', err);
+    }
+  });
+}
+
+/**
+ * 断开SSE连接
+ */
+function disconnectSSE() {
+  if (sseConnection) {
+    console.log('[SSE] 断开连接');
+    sseConnection.close();
+    sseConnection = null;
+  }
+}
+
+// ========== 后备轮询机制（SSE失败时使用） ==========
 async function poll() {
   clearTimeout(pollTimer.value);
   if (!jobId.value) return;
@@ -657,11 +835,12 @@ function handleDeleteJob(jobId) {
   }
 }
 
-// 组件卸载时清理定时器
+// 组件卸载时清理定时器和SSE连接
 onUnmounted(() => {
   if (pollTimer.value) {
     clearTimeout(pollTimer.value);
   }
+  disconnectSSE(); // 清理SSE连接
 });
 
 onMounted(() => {
