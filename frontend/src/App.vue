@@ -597,6 +597,8 @@ function connectSSE() {
 
       switch (signalCode) {
         case 'job_complete':
+          // 更新状态
+          status.value = 'finished';
           processing.value = false;
           downloadUrl.value = TranscriptionService.getDownloadUrl(jobId.value);
           canRestart.value = true;
@@ -610,6 +612,8 @@ function connectSSE() {
           break;
 
         case 'job_failed':
+          // 更新状态
+          status.value = 'failed';
           processing.value = false;
           canRestart.value = true;
           lastError.value = data.message || "未知错误";
@@ -623,6 +627,8 @@ function connectSSE() {
           break;
 
         case 'job_canceled':
+          // 更新状态
+          status.value = 'canceled';
           processing.value = false;
           canRestart.value = true;
           ElMessage.info("任务已取消");
@@ -635,6 +641,8 @@ function connectSSE() {
           break;
 
         case 'job_paused':
+          // 更新状态
+          status.value = 'paused';
           processing.value = false;
           canRestart.value = true;
           ElMessage.info("任务已暂停，可随时恢复");
