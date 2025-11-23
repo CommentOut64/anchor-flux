@@ -554,11 +554,27 @@ function connectSSE() {
 
   sseConnection = new EventSource(url);
 
+  // 监听连接打开
+  sseConnection.onopen = (e) => {
+    console.log('[SSE] ✅ 连接已打开', e);
+  };
+
+  // 监听所有消息（调试用）
+  sseConnection.onmessage = (e) => {
+    console.log('[SSE] onmessage收到原始消息:', e.type, e.data);
+  };
+
+  // 监听错误
+  sseConnection.onerror = (err) => {
+    console.error('[SSE] ❌ 连接错误:', err);
+    console.error('[SSE] readyState:', sseConnection?.readyState);
+  };
+
   // 进度更新事件
   sseConnection.addEventListener('progress', (e) => {
     try {
       const data = JSON.parse(e.data);
-      console.log(`[SSE] 进度更新:`, data);
+      console.log(`[SSE] ✅ 进度更新事件:`, data);
 
       // 更新界面状态
       status.value = data.status;

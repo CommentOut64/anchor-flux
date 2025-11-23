@@ -493,8 +493,14 @@ class TranscriptionService:
             job: 任务状态对象
         """
         try:
+            # 动态获取SSE管理器（确保获取到已设置loop的实例）
+            from services.sse_service import get_sse_manager
+            sse_manager = get_sse_manager()
+
             channel_id = f"job:{job.job_id}"
-            self.sse_manager.broadcast_sync(
+            self.logger.info(f"📤 准备推送SSE进度: {channel_id}, progress={job.progress}%")
+
+            sse_manager.broadcast_sync(
                 channel_id,
                 "progress",
                 {
@@ -510,7 +516,7 @@ class TranscriptionService:
             )
         except Exception as e:
             # SSE推送失败不应影响转录流程
-            self.logger.debug(f"SSE推送失败（非致命）: {e}")
+            self.logger.warning(f"SSE推送失败: {e}")
 
     def _push_sse_signal(self, job: JobState, signal_code: str, message: str = ""):
         """
@@ -522,8 +528,12 @@ class TranscriptionService:
             message: 附加消息
         """
         try:
+            # 动态获取SSE管理器（确保获取到已设置loop的实例）
+            from services.sse_service import get_sse_manager
+            sse_manager = get_sse_manager()
+
             channel_id = f"job:{job.job_id}"
-            self.sse_manager.broadcast_sync(
+            sse_manager.broadcast_sync(
                 channel_id,
                 "signal",
                 {

@@ -47,6 +47,9 @@ class SSEManager:
         self.total_connections = 0
         self.total_messages_sent = 0
 
+        # 主事件循环引用（在应用启动时设置）
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+
         logger.info(f"✅ SSE管理器已初始化 (心跳: {heartbeat_interval}s, 队列: {max_queue_size})")
 
     async def subscribe(
@@ -109,7 +112,10 @@ class SSEManager:
                     )
 
                     # 发送事件
-                    yield self._format_sse(message["event"], message["data"])
+                    logger.info(f"📨 subscribe取到消息，准备yield: {channel_id}/{message['event']}")
+                    formatted = self._format_sse(message["event"], message["data"])
+                    logger.info(f"📨 yield消息: {formatted[:100]}...")
+                    yield formatted
                     self.total_messages_sent += 1
 
                 except asyncio.TimeoutError:
@@ -143,8 +149,10 @@ class SSEManager:
             event: 事件类型（如 "progress", "fragment", "signal"）
             data: 事件数据（字典）
         """
+        logger.info(f"📥 broadcast被调用: {channel_id}/{event}, 连接数: {len(self.connections.get(channel_id, []))}")
+
         if channel_id not in self.connections:
-            logger.debug(f"频道无连接，跳过广播: {channel_id}")
+            logger.warning(f"频道无连接，跳过广播: {channel_id}")
             return
 
         message = {
@@ -161,22 +169,33 @@ class SSEManager:
                 if queue.qsize() >= self.max_queue_size * 0.95:
                     # 队列接近满，跳过此次更新
                     failed_count += 1
-                    logger.debug(f"队列已满，跳过更新: {channel_id}")
+                    logger.warning(f"队列已满，跳过更新: {channel_id}")
                     continue
 
                 # 非阻塞放入队列
                 queue.put_nowait(message)
                 success_count += 1
+                logger.info(f"✅ 消息已放入队列: {channel_id}/{event}, 队列大小: {queue.qsize()}")
 
             except asyncio.QueueFull:
                 failed_count += 1
-                logger.debug(f"队列满，放入失败: {channel_id}")
+                logger.warning(f"队列满，放入失败: {channel_id}")
             except Exception as e:
                 failed_count += 1
                 logger.error(f"广播失败: {channel_id} - {e}")
 
         if success_count > 0:
-            logger.debug(f"📤 广播消息: {channel_id} - {event} (成功: {success_count}, 失败: {failed_count})")
+            logger.info(f"📤 广播完成: {channel_id} - {event} (成功: {success_count}, 失败: {failed_count})")
+
+    def set_event_loop(self, loop: asyncio.AbstractEventLoop):
+        """
+        设置主事件循环引用（在应用启动时调用）
+
+        Args:
+            loop: uvicorn/FastAPI 的主事件循环
+        """
+        self.loop = loop
+        logger.info("✅ SSE管理器已绑定主事件循环")
 
     def broadcast_sync(self, channel_id: str, event: str, data: dict):
         """
@@ -189,27 +208,45 @@ class SSEManager:
             event: 事件类型
             data: 事件数据
 
-        注意：此方法会尝试获取当前事件循环，如果失败则静默忽略
+        注意：此方法依赖于在应用启动时设置的主事件循环
         """
-        try:
-            # 尝试获取运行中的事件循环
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # 当前线程没有运行中的事件循环，尝试获取全局循环
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_closed():
-                    logger.debug("事件循环已关闭，无法推送SSE消息")
-                    return
-            except Exception:
-                logger.debug("无法获取事件循环，跳过SSE推送")
-                return
+        # 优先使用预先保存的主事件循环
+        loop = self.loop
 
-        # 使用 call_soon_threadsafe 从后台线程安全地调度协程
-        asyncio.run_coroutine_threadsafe(
-            self.broadcast(channel_id, event, data),
-            loop
-        )
+        if loop is None:
+            logger.warning(f"SSE主事件循环未设置，跳过推送: {channel_id}/{event}")
+            # 回退：尝试获取事件循环（可能不可靠）
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_closed():
+                        logger.warning("事件循环已关闭，无法推送SSE消息")
+                        return
+                except Exception:
+                    logger.warning("无法获取事件循环，跳过SSE推送")
+                    return
+
+        if loop is None or loop.is_closed():
+            logger.warning("事件循环不可用，跳过SSE推送")
+            return
+
+        # 检查频道是否有连接
+        if channel_id not in self.connections or not self.connections[channel_id]:
+            logger.info(f"频道无活跃连接，跳过推送: {channel_id}")
+            return
+
+        # 使用 run_coroutine_threadsafe 从后台线程安全地调度协程
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.broadcast(channel_id, event, data),
+                loop
+            )
+            # 记录成功调度
+            logger.info(f"📤 SSE消息已调度: {channel_id}/{event}")
+        except Exception as e:
+            logger.warning(f"SSE推送调度失败: {e}")
 
     def _format_sse(self, event: str, data: dict) -> str:
         """

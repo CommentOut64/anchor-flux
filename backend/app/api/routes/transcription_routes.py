@@ -5,10 +5,9 @@ import os
 import uuid
 import shutil
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import json
-from sse_starlette.sse import EventSourceResponse
 
 from models.job_models import JobSettings, JobState
 from services.transcription_service import TranscriptionService
@@ -80,8 +79,14 @@ def create_transcription_router(
             return None
 
         # 订阅SSE流
-        return EventSourceResponse(
-            sse_manager.subscribe(channel_id, request, initial_state_callback=get_initial_state)
+        return StreamingResponse(
+            sse_manager.subscribe(channel_id, request, initial_state_callback=get_initial_state),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
         )
 
     @router.post("/upload")
