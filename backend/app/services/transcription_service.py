@@ -498,7 +498,6 @@ class TranscriptionService:
             sse_manager = get_sse_manager()
 
             channel_id = f"job:{job.job_id}"
-            self.logger.info(f"📤 准备推送SSE进度: {channel_id}, progress={job.progress}%")
 
             sse_manager.broadcast_sync(
                 channel_id,
@@ -516,7 +515,7 @@ class TranscriptionService:
             )
         except Exception as e:
             # SSE推送失败不应影响转录流程
-            self.logger.warning(f"SSE推送失败: {e}")
+            self.logger.debug(f"SSE推送失败: {e}")
 
     def _push_sse_signal(self, job: JobState, signal_code: str, message: str = ""):
         """

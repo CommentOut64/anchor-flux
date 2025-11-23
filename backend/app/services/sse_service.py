@@ -112,9 +112,7 @@ class SSEManager:
                     )
 
                     # 发送事件
-                    logger.info(f"📨 subscribe取到消息，准备yield: {channel_id}/{message['event']}")
                     formatted = self._format_sse(message["event"], message["data"])
-                    logger.info(f"📨 yield消息: {formatted[:100]}...")
                     yield formatted
                     self.total_messages_sent += 1
 
@@ -149,10 +147,8 @@ class SSEManager:
             event: 事件类型（如 "progress", "fragment", "signal"）
             data: 事件数据（字典）
         """
-        logger.info(f"📥 broadcast被调用: {channel_id}/{event}, 连接数: {len(self.connections.get(channel_id, []))}")
-
         if channel_id not in self.connections:
-            logger.warning(f"频道无连接，跳过广播: {channel_id}")
+            logger.debug(f"频道无连接，跳过广播: {channel_id}")
             return
 
         message = {
@@ -169,23 +165,22 @@ class SSEManager:
                 if queue.qsize() >= self.max_queue_size * 0.95:
                     # 队列接近满，跳过此次更新
                     failed_count += 1
-                    logger.warning(f"队列已满，跳过更新: {channel_id}")
+                    logger.debug(f"队列已满，跳过更新: {channel_id}")
                     continue
 
                 # 非阻塞放入队列
                 queue.put_nowait(message)
                 success_count += 1
-                logger.info(f"✅ 消息已放入队列: {channel_id}/{event}, 队列大小: {queue.qsize()}")
 
             except asyncio.QueueFull:
                 failed_count += 1
-                logger.warning(f"队列满，放入失败: {channel_id}")
+                logger.debug(f"队列满，放入失败: {channel_id}")
             except Exception as e:
                 failed_count += 1
                 logger.error(f"广播失败: {channel_id} - {e}")
 
         if success_count > 0:
-            logger.info(f"📤 广播完成: {channel_id} - {event} (成功: {success_count}, 失败: {failed_count})")
+            logger.debug(f"📤 广播完成: {channel_id} - {event} (成功: {success_count}, 失败: {failed_count})")
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         """
@@ -234,7 +229,7 @@ class SSEManager:
 
         # 检查频道是否有连接
         if channel_id not in self.connections or not self.connections[channel_id]:
-            logger.info(f"频道无活跃连接，跳过推送: {channel_id}")
+            logger.debug(f"频道无活跃连接，跳过推送: {channel_id}")
             return
 
         # 使用 run_coroutine_threadsafe 从后台线程安全地调度协程
@@ -243,8 +238,6 @@ class SSEManager:
                 self.broadcast(channel_id, event, data),
                 loop
             )
-            # 记录成功调度
-            logger.info(f"📤 SSE消息已调度: {channel_id}/{event}")
         except Exception as e:
             logger.warning(f"SSE推送调度失败: {e}")
 
