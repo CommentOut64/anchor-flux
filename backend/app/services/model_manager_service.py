@@ -133,6 +133,7 @@ class ModelManagerService:
         # 模型状态跟踪
         self.whisper_models: Dict[str, ModelInfo] = {}
         self.align_models: Dict[str, AlignModelInfo] = {}
+        self.silero_vad_status: Dict[str, any] = {}  # 添加 Silero VAD 状态
 
         # 下载队列和锁 - 确保一次只下载一个模型（改进版）
         self.download_lock = threading.Lock()
@@ -145,7 +146,7 @@ class ModelManagerService:
         # 初始化模型信息
         print("🔍 开始快速扫描本地模型...")
         self._init_model_info()
-        print(f"✅ 模型扫描完成: Whisper={len([m for m in self.whisper_models.values() if m.status == 'ready'])}/{len(self.whisper_models)}, Align={len([m for m in self.align_models.values() if m.status == 'ready'])}/{len(self.align_models)}")
+        print(f"✅ 模型扫描完成: Whisper={len([m for m in self.whisper_models.values() if m.status == 'ready'])}/{len(self.whisper_models)}, Align={len([m for m in self.align_models.values() if m.status == 'ready'])}/{len(self.align_models)}, Silero VAD={self.silero_vad_status.get('status', 'unknown')}")
 
         # 启动后台验证任务
         print("🔧 启动后台验证线程...")
@@ -156,6 +157,9 @@ class ModelManagerService:
         """快速扫描本地已有模型（不进行完整性验证，留给后台任务）"""
         self.logger.info("🔍 快速扫描本地模型...")
         print("🔍 快速扫描本地模型...")
+
+        # 先检查内置 Silero VAD 模型
+        self._check_silero_vad()
 
         # 初始化Whisper模型信息（仅检查目录是否存在）
         for model_id, info in self.WHISPER_MODELS.items():
@@ -212,6 +216,36 @@ class ModelManagerService:
                     local_path=None
                 )
                 print(f"   ⚪ 对齐模型 {lang} ({name}): 未下载")
+
+    def _check_silero_vad(self):
+        """
+        检查内置 Silero VAD 模型是否存在
+
+        Silero VAD 是项目内置模型，无需下载
+        """
+        from pathlib import Path as PathlibPath
+
+        # backend/app/assets/silero/silero_vad.onnx
+        builtin_model_path = PathlibPath(__file__).parent.parent / "assets" / "silero" / "silero_vad.onnx"
+
+        if builtin_model_path.exists():
+            file_size_mb = builtin_model_path.stat().st_size / (1024 * 1024)
+            self.silero_vad_status = {
+                "status": "ready",
+                "path": str(builtin_model_path),
+                "size_mb": round(file_size_mb, 2),
+                "type": "built-in"  # 内置模型
+            }
+            print(f"   ✅ Silero VAD: 已内置 (大小: {file_size_mb:.2f}MB)")
+            self.logger.info(f"✅ Silero VAD 模型已内置: {builtin_model_path}")
+        else:
+            self.silero_vad_status = {
+                "status": "missing",
+                "path": str(builtin_model_path),
+                "error": "内置模型文件缺失，请重新从源码仓库获取"
+            }
+            print(f"   ❌ Silero VAD: 缺失（预期路径: {builtin_model_path}）")
+            self.logger.warning(f"⚠️ Silero VAD 模型缺失: {builtin_model_path}")
 
     def _get_latest_snapshot(self, model_dir: Path) -> Optional[Path]:
         """

@@ -5,10 +5,51 @@
 import os, subprocess, uuid, threading, json, math, gc, logging
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+from enum import Enum
+from dataclasses import dataclass, field
 from pydub import AudioSegment, silence
 import whisperx
 import torch
 import shutil
+import psutil
+import numpy as np
+
+
+class ProcessingMode(Enum):
+    """
+    处理模式枚举
+    用于智能决策使用内存模式还是硬盘模式进行音频处理
+    """
+    MEMORY = "memory"  # 内存模式（默认，高性能）
+    DISK = "disk"      # 硬盘模式（降级，稳定性优先）
+
+
+class VADMethod(Enum):
+    """
+    VAD模型选择枚举
+    用于选择语音活动检测（Voice Activity Detection）模型
+    """
+    SILERO = "silero"      # 默认，无需认证，速度快
+    PYANNOTE = "pyannote"  # 可选，需要HF Token，精度更高
+
+
+@dataclass
+class VADConfig:
+    """
+    VAD配置数据类
+    用于配置语音活动检测的参数
+    """
+    method: VADMethod = VADMethod.SILERO  # 默认使用Silero
+    hf_token: Optional[str] = None         # Pyannote需要的HF Token
+    onset: float = 0.5                     # 语音开始阈值
+    offset: float = 0.363                  # 语音结束阈值
+    chunk_size: int = 30                   # 最大段长（秒）
+
+    def validate(self) -> bool:
+        """验证配置有效性"""
+        if self.method == VADMethod.PYANNOTE and not self.hf_token:
+            return False  # Pyannote需要Token
+        return True
 
 from models.job_models import JobSettings, JobState
 from models.hardware_models import HardwareInfo, OptimizationConfig
@@ -673,6 +714,54 @@ class TranscriptionService:
             self.logger.warning(f"检查点文件损坏，将重新开始任务: {checkpoint_path} - {e}")
             return None
 
+    def _flush_checkpoint_after_split(
+        self,
+        job_dir: Path,
+        job: JobState,
+        segments: List[Dict],
+        processing_mode: ProcessingMode
+    ):
+        """
+        分段完成后强制刷新checkpoint（确保断点续传一致性）
+
+        这是断点续传的关键节点！
+        只有分段元数据被持久化后，后续的转录索引才有意义。
+
+        Args:
+            job_dir: 任务目录
+            job: 任务状态对象
+            segments: 分段元数据列表
+            processing_mode: 当前处理模式
+        """
+        import time
+
+        checkpoint_data = {
+            "job_id": job.job_id,
+            "phase": "split_complete",  # 明确标记分段完成
+            "processing_mode": processing_mode.value,  # 记录模式
+            "total_segments": len(segments),
+            "processed_indices": [],
+            "segments": segments,
+            "unaligned_results": [],
+            "timestamp": time.time()  # 时间戳用于调试
+        }
+
+        # 强制同步写入（确保数据落盘）
+        self._save_checkpoint(job_dir, checkpoint_data, job)
+
+        # 验证写入成功
+        saved_checkpoint = self._load_checkpoint(job_dir)
+        if saved_checkpoint is None:
+            raise RuntimeError("checkpoint write verification failed: file not readable")
+
+        if saved_checkpoint.get('phase') != 'split_complete':
+            raise RuntimeError("checkpoint write verification failed: phase mismatch")
+
+        if len(saved_checkpoint.get('segments', [])) != len(segments):
+            raise RuntimeError("checkpoint write verification failed: segments count mismatch")
+
+        self.logger.info(f"checkpoint flushed and verified after split (mode: {processing_mode.value}, segments: {len(segments)})")
+
     def _run_pipeline(self, job: JobState):
         """
         执行转录处理管道（支持断点续传）
@@ -759,12 +848,58 @@ class TranscriptionService:
                 raise RuntimeError('任务已取消')
 
             # ==========================================
-            # 3. 阶段2: 智能分段
+            # 3. 阶段1.5: 智能模式决策（新增）
+            # ==========================================
+            processing_mode = None
+            audio_array = None  # 内存模式下的音频数组
+
+            # 从checkpoint恢复模式（如果存在）
+            if checkpoint and 'processing_mode' in checkpoint:
+                mode_value = checkpoint['processing_mode']
+                processing_mode = ProcessingMode(mode_value)
+                self.logger.info(f"🔄 从检查点恢复处理模式: {processing_mode.value}")
+
+            # 如果没有检查点或没有模式信息，进行智能决策
+            if processing_mode is None:
+                processing_mode = self._decide_processing_mode(str(audio_path), job)
+                self.logger.info(f"💡 智能选择处理模式: {processing_mode.value}")
+
+            # ==========================================
+            # 4. 阶段1.6: 音频加载（内存模式）
+            # ==========================================
+            if processing_mode == ProcessingMode.MEMORY:
+                # 内存模式：尝试加载完整音频到内存
+                try:
+                    audio_array = self._safe_load_audio(str(audio_path), job)
+                    self.logger.info("✅ 音频已加载到内存（内存模式）")
+                except RuntimeError as e:
+                    # 加载失败，降级到硬盘模式
+                    self.logger.warning(f"⚠️ 内存加载失败，降级到硬盘模式: {e}")
+                    processing_mode = ProcessingMode.DISK
+                    audio_array = None
+
+            # ==========================================
+            # 5. 阶段2: 智能分段（模式感知）
             # ==========================================
             # 如果检查点里没有分段信息，说明上次没跑到分段完成
             if not current_segments:
                 self._update_progress(job, 'split', 0, '音频分段中')
-                current_segments = self._split_audio(str(audio_path))
+
+                # 根据模式选择分段方法
+                if processing_mode == ProcessingMode.MEMORY and audio_array is not None:
+                    # 内存模式：VAD分段（不产生磁盘IO）
+                    self.logger.info("使用内存VAD分段（高性能模式）")
+                    from services.transcription_service import VADConfig
+                    current_segments = self._split_audio_in_memory(
+                        audio_array,
+                        sr=16000,
+                        vad_config=VADConfig()  # 使用默认Silero VAD
+                    )
+                else:
+                    # 硬盘模式：传统pydub分段
+                    self.logger.info("使用硬盘分段（稳定模式）")
+                    current_segments = self._split_audio_to_disk(str(audio_path))
+
                 if job.canceled:
                     raise RuntimeError('任务已取消')
 
@@ -772,24 +907,21 @@ class TranscriptionService:
                 job.total = len(current_segments)
                 self._update_progress(job, 'split', 1, f'分段完成 共{job.total}段')
 
-                # 【关键埋点1】分段完成后立即保存
-                checkpoint_data = {
-                    "job_id": job.job_id,
-                    "phase": "split",
-                    "total_segments": job.total,
-                    "processed_indices": [],
-                    "segments": current_segments,  # 保存分段结果
-                    "unaligned_results": []  # 使用新字段
-                }
-                self._save_checkpoint(job_dir, checkpoint_data, job)
-                self.logger.info("💾 检查点已保存: 分段完成")
+                # 【关键埋点1】分段完成后强制刷新checkpoint（使用新方法）
+                self._flush_checkpoint_after_split(
+                    job_dir,
+                    job,
+                    current_segments,
+                    processing_mode
+                )
+                self.logger.info("💾 检查点已强制刷新: 分段完成")
             else:
                 self.logger.info(f"✅ 跳过分段，使用检查点数据（共{len(current_segments)}段）")
                 job.segments = current_segments  # 恢复到 job 对象
                 job.total = len(current_segments)
 
             # ==========================================
-            # 4. 阶段3: 转录处理（核心循环 - 仅转录不对齐）
+            # 6. 阶段3: 转录处理（双模式统一循环）
             # ==========================================
             self._update_progress(job, 'transcribe', 0, '加载模型中')
             if job.canceled:
@@ -804,6 +936,7 @@ class TranscriptionService:
             ]
 
             self.logger.info(f"📝 剩余 {len(todo_segments)}/{len(current_segments)} 段需要转录")
+            self.logger.info(f"🎯 处理模式: {processing_mode.value}")
 
             for idx, seg in enumerate(current_segments):
                 # 如果已经在 processed_indices 里，直接跳过
@@ -818,6 +951,12 @@ class TranscriptionService:
                 if job.paused:
                     raise RuntimeError('任务已暂停')
 
+                # 【内存监控】定期检查内存状态（每10段检查一次）
+                if idx % 10 == 0 and processing_mode == ProcessingMode.MEMORY:
+                    if not self._check_memory_during_transcription(job):
+                        # 内存严重不足，任务已暂停
+                        raise RuntimeError('内存不足，任务已暂停')
+
                 ratio = len(processed_indices) / max(1, len(current_segments))
                 self._update_progress(
                     job,
@@ -826,11 +965,17 @@ class TranscriptionService:
                     f'转录 {len(processed_indices)+1}/{len(current_segments)}'
                 )
 
-                # 添加segment索引
-                seg['index'] = idx
+                # 确保segment有index字段
+                if 'index' not in seg:
+                    seg['index'] = idx
 
-                # 仅转录，不对齐
-                seg_result = self._transcribe_segment_unaligned(seg, model, job)
+                # 【统一入口】使用双模式转录（自动根据mode字段选择）
+                seg_result = self._transcribe_segment(
+                    seg,
+                    model,
+                    job,
+                    audio_array=audio_array  # 内存模式传数组，硬盘模式为None
+                )
 
                 # --- 更新内存状态 ---
                 if seg_result:
@@ -855,6 +1000,7 @@ class TranscriptionService:
                 checkpoint_data = {
                     "job_id": job.job_id,
                     "phase": "transcribe",
+                    "processing_mode": processing_mode.value,  # 保存模式信息
                     "total_segments": len(current_segments),
                     "processed_indices": list(processed_indices),  # set转list
                     "segments": current_segments,
@@ -868,14 +1014,26 @@ class TranscriptionService:
                 raise RuntimeError('任务已取消')
 
             # ==========================================
-            # 5. 阶段4: 统一对齐（新增阶段）
+            # 7. 阶段4: 批次对齐（使用批次对齐+SSE进度推送）
             # ==========================================
             self._update_progress(job, 'align', 0, '准备对齐...')
 
-            aligned_results = self._align_all_results(
+            # 根据处理模式选择音频源
+            if processing_mode == ProcessingMode.MEMORY and audio_array is not None:
+                # 内存模式：复用内存数组（避免重新加载）
+                audio_source = audio_array
+                self.logger.info("🚀 对齐阶段：复用内存音频数组")
+            else:
+                # 硬盘模式：传递音频文件路径
+                audio_source = str(audio_path)
+                self.logger.info("🚀 对齐阶段：从磁盘加载音频")
+
+            # 使用批次对齐方法（支持SSE进度推送）
+            aligned_results = self._align_all_results_batched(
                 unaligned_results,
                 job,
-                str(audio_path)
+                audio_source,
+                processing_mode
             )
 
             # 【流式输出】推送对齐完成事件
@@ -954,6 +1112,446 @@ class TranscriptionService:
 
     # ========== 核心处理方法 ==========
 
+    def _get_audio_duration(self, audio_path: str) -> float:
+        """
+        获取音频时长（秒）
+
+        Args:
+            audio_path: 音频文件路径
+
+        Returns:
+            float: 音频时长（秒）
+        """
+        try:
+            # 方法1: 使用pydub（精确但较慢）
+            audio = AudioSegment.from_wav(audio_path)
+            duration = len(audio) / 1000.0
+            self.logger.debug(f"音频时长（pydub）: {duration:.1f}秒")
+            return duration
+        except Exception as e:
+            self.logger.warning(f"pydub获取时长失败，使用文件大小估算: {e}")
+            # 方法2: 根据文件大小估算（16kHz, 16bit, mono ≈ 32KB/秒）
+            try:
+                file_size = os.path.getsize(audio_path)
+                duration = file_size / 32000
+                self.logger.debug(f"音频时长（估算）: {duration:.1f}秒")
+                return duration
+            except Exception as e2:
+                self.logger.error(f"获取音频时长失败: {e2}")
+                return 0.0
+
+    def _decide_processing_mode(self, audio_path: str, job: JobState) -> ProcessingMode:
+        """
+        智能决策处理模式（内存模式 vs 硬盘模式）
+
+        决策逻辑：
+        1. 估算音频内存需求
+        2. 检测系统可用内存
+        3. 预留安全余量（模型、转录中间变量等）
+        4. 决定使用哪种模式
+
+        Args:
+            audio_path: 音频文件路径
+            job: 任务状态对象
+
+        Returns:
+            ProcessingMode: 处理模式
+        """
+        # 获取音频时长（秒）
+        audio_duration_sec = self._get_audio_duration(audio_path)
+
+        # 估算音频内存需求 (16kHz, float32)
+        # 公式: duration * 16000 * 4 bytes
+        estimated_audio_mb = (audio_duration_sec * 16000 * 4) / (1024 * 1024)
+
+        # 预留额外内存（模型加载、VAD处理、转录中间变量等）
+        # 保守估计：音频内存的2倍 + 500MB基础开销
+        total_estimated_mb = estimated_audio_mb * 2 + 500
+
+        # 获取系统可用内存
+        mem_info = psutil.virtual_memory()
+        available_mb = mem_info.available / (1024 * 1024)
+        total_mb = mem_info.total / (1024 * 1024)
+
+        # 安全阈值：至少保留系统总内存的20%或2GB（取较大值）
+        safety_reserve_mb = max(total_mb * 0.2, 2048)
+        usable_mb = available_mb - safety_reserve_mb
+
+        self.logger.info(f"📊 内存评估:")
+        self.logger.info(f"   音频时长: {audio_duration_sec/60:.1f}分钟")
+        self.logger.info(f"   预估需求: {total_estimated_mb:.0f}MB")
+        self.logger.info(f"   可用内存: {available_mb:.0f}MB")
+        self.logger.info(f"   安全余量: {safety_reserve_mb:.0f}MB")
+        self.logger.info(f"   可用于处理: {usable_mb:.0f}MB")
+
+        # 决策
+        if usable_mb >= total_estimated_mb:
+            self.logger.info("✅ 选择【内存模式】- 内存充足，使用高性能模式")
+            job.message = "内存充足，使用高性能模式"
+            return ProcessingMode.MEMORY
+        else:
+            self.logger.warning(f"⚠️ 选择【硬盘模式】- 内存不足（需要{total_estimated_mb:.0f}MB，可用{usable_mb:.0f}MB）")
+            job.message = "内存受限，使用稳定模式"
+            return ProcessingMode.DISK
+
+    def _safe_load_audio(self, audio_path: str, job: JobState) -> np.ndarray:
+        """
+        安全加载音频到内存（带异常处理）
+
+        用于内存模式下将完整音频一次性加载到内存中。
+        包含加载验证和详细的异常处理，加载失败时抛出RuntimeError触发降级。
+
+        Args:
+            audio_path: 音频文件路径
+            job: 任务状态对象（用于更新状态消息）
+
+        Returns:
+            np.ndarray: 音频数组（float32, 16kHz采样率）
+
+        Raises:
+            RuntimeError: 音频加载失败时抛出，调用方可据此触发硬盘模式降级
+        """
+        try:
+            self.logger.info(f"加载音频到内存: {audio_path}")
+            audio_array = whisperx.load_audio(audio_path)
+
+            # 验证加载结果
+            if audio_array is None or len(audio_array) == 0:
+                raise ValueError("音频数组为空")
+
+            # 记录加载信息
+            duration_sec = len(audio_array) / 16000
+            memory_mb = audio_array.nbytes / (1024 * 1024)
+            self.logger.info(f"音频加载成功:")
+            self.logger.info(f"   时长: {duration_sec/60:.1f}分钟")
+            self.logger.info(f"   内存占用: {memory_mb:.1f}MB")
+            self.logger.info(f"   采样点数: {len(audio_array):,}")
+
+            return audio_array
+
+        except MemoryError as e:
+            self.logger.error(f"内存不足，无法加载音频: {e}")
+            job.message = "内存不足，自动切换到硬盘模式"
+            raise RuntimeError(f"内存不足: {e}")
+
+        except Exception as e:
+            self.logger.error(f"音频加载失败: {e}")
+            job.message = f"音频加载失败: {e}"
+            raise RuntimeError(f"音频加载失败（可能文件损坏）: {e}")
+
+    def _split_audio_in_memory(
+        self,
+        audio_array: np.ndarray,
+        sr: int = 16000,
+        vad_config: Optional[VADConfig] = None
+    ) -> List[Dict]:
+        """
+        内存VAD分段（不产生磁盘IO）
+
+        默认使用Silero VAD（无需认证），可通过配置切换到Pyannote VAD。
+        当VAD模型加载失败时，自动降级到基于能量的简易分段。
+
+        Args:
+            audio_array: 完整音频数组 (np.ndarray, float32, 16kHz)
+            sr: 采样率（默认16000Hz）
+            vad_config: VAD配置（可选，默认使用Silero）
+
+        Returns:
+            List[Dict]: 分段元数据列表
+            [
+                {"index": 0, "start": 0.0, "end": 30.5, "mode": "memory"},
+                {"index": 1, "start": 30.5, "end": 58.2, "mode": "memory"},
+                ...
+            ]
+        """
+        # 使用默认配置
+        if vad_config is None:
+            vad_config = VADConfig()
+
+        self.logger.info(f"开始内存VAD分段 (模型: {vad_config.method.value})...")
+
+        try:
+            # 根据配置选择VAD模型
+            if vad_config.method == VADMethod.SILERO:
+                segments = self._vad_silero(audio_array, sr, vad_config)
+            else:
+                segments = self._vad_pyannote(audio_array, sr, vad_config)
+
+            self.logger.info(f"VAD分段完成: {len(segments)}段 (模型: {vad_config.method.value})")
+            return segments
+
+        except Exception as e:
+            self.logger.error(f"VAD分段失败: {e}")
+            # 降级到简易能量检测
+            self.logger.warning("尝试降级到能量检测分段...")
+            return self._energy_based_split(audio_array, sr, vad_config.chunk_size)
+
+    def _vad_silero(
+        self,
+        audio_array: np.ndarray,
+        sr: int,
+        vad_config: VADConfig
+    ) -> List[Dict]:
+        """
+        Silero VAD分段（使用内置ONNX模型，无需下载）
+
+        优点：
+        - 使用项目内置ONNX模型，无需网络下载
+        - 使用 onnxruntime 推理，跨平台兼容性好
+        - 速度快，内存占用低（~2MB）
+
+        Args:
+            audio_array: 音频数组
+            sr: 采样率
+            vad_config: VAD配置
+
+        Returns:
+            List[Dict]: 分段元数据列表
+        """
+        self.logger.info("加载Silero VAD模型（内置ONNX）...")
+
+        # 使用 silero-vad 库（基于 onnxruntime）
+        from silero_vad import get_speech_timestamps
+        from silero_vad.utils_vad import OnnxWrapper
+        from pathlib import Path as PathlibPath
+
+        # 使用项目内置的 ONNX 模型
+        builtin_model_path = PathlibPath(__file__).parent.parent / "assets" / "silero" / "silero_vad.onnx"
+
+        if not builtin_model_path.exists():
+            raise FileNotFoundError(
+                f"内置Silero VAD模型不存在: {builtin_model_path}\n"
+                "请确保项目完整，或重新从源码仓库获取"
+            )
+
+        self.logger.info(f"使用内置模型: {builtin_model_path}")
+
+        # 加载ONNX模型（直接从本地路径）
+        model = OnnxWrapper(str(builtin_model_path), force_onnx_cpu=False)
+
+        # 转换为torch tensor（silero-vad 需要）
+        audio_tensor = torch.from_numpy(audio_array)
+
+        # 获取语音时间戳
+        speech_timestamps = get_speech_timestamps(
+            audio_tensor,
+            model,
+            sampling_rate=sr,
+            threshold=vad_config.onset,      # 检测阈值
+            min_speech_duration_ms=250,       # 最小语音段长度
+            min_silence_duration_ms=100,      # 最小静音长度
+            return_seconds=False  # 返回采样点而非秒数
+        )
+
+        self.logger.info(f"Silero VAD检测到 {len(speech_timestamps)} 个语音段")
+
+        # 合并分段（确保每段不超过chunk_size秒）
+        segments_metadata = []
+        current_start = None
+        current_end = None
+
+        for ts in speech_timestamps:
+            start_sec = ts['start'] / sr
+            end_sec = ts['end'] / sr
+
+            if current_start is None:
+                current_start = start_sec
+                current_end = end_sec
+            elif (end_sec - current_start) <= vad_config.chunk_size:
+                # 可以合并
+                current_end = end_sec
+            else:
+                # 保存当前段，开始新段
+                segments_metadata.append({
+                    "index": len(segments_metadata),
+                    "start": current_start,
+                    "end": current_end,
+                    "mode": "memory"
+                })
+                current_start = start_sec
+                current_end = end_sec
+
+        # 保存最后一段
+        if current_start is not None:
+            segments_metadata.append({
+                "index": len(segments_metadata),
+                "start": current_start,
+                "end": current_end,
+                "mode": "memory"
+            })
+
+        # 如果没有检测到任何语音段，按固定时长分段
+        if len(segments_metadata) == 0:
+            self.logger.warning("VAD未检测到语音，使用固定时长分段")
+            return self._energy_based_split(audio_array, sr, vad_config.chunk_size)
+
+        return segments_metadata
+
+    def _vad_pyannote(
+        self,
+        audio_array: np.ndarray,
+        sr: int,
+        vad_config: VADConfig
+    ) -> List[Dict]:
+        """
+        Pyannote VAD分段（高精度方案，需要HF Token）
+
+        优点：
+        - 精度更高
+        - 支持更复杂的语音活动检测
+
+        注意：
+        - 需要HuggingFace Token
+        - 首次使用需要接受模型使用协议
+
+        Args:
+            audio_array: 音频数组
+            sr: 采样率
+            vad_config: VAD配置
+
+        Returns:
+            List[Dict]: 分段元数据列表
+
+        Raises:
+            ValueError: 未配置HF Token时抛出
+        """
+        if not vad_config.hf_token:
+            raise ValueError("Pyannote VAD需要HuggingFace Token，请在设置中配置")
+
+        self.logger.info("加载Pyannote VAD模型（需要HF Token）...")
+
+        try:
+            from pyannote.audio import Pipeline
+        except ImportError:
+            raise RuntimeError("Pyannote未安装，请使用Silero VAD或安装pyannote-audio")
+
+        # 初始化Pyannote VAD Pipeline
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/voice-activity-detection",
+            use_auth_token=vad_config.hf_token
+        )
+
+        # 准备输入（Pyannote需要特定格式）
+        # 创建临时文件用于Pyannote处理
+        import tempfile
+        import soundfile as sf
+
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            temp_path = f.name
+            sf.write(temp_path, audio_array, sr)
+
+        try:
+            # 执行VAD
+            vad_result = pipeline(temp_path)
+
+            # 合并分段
+            segments_metadata = []
+            current_start = None
+            current_end = None
+
+            for speech in vad_result.get_timeline().support():
+                start_sec = speech.start
+                end_sec = speech.end
+
+                if current_start is None:
+                    current_start = start_sec
+                    current_end = end_sec
+                elif (end_sec - current_start) <= vad_config.chunk_size:
+                    current_end = end_sec
+                else:
+                    segments_metadata.append({
+                        "index": len(segments_metadata),
+                        "start": current_start,
+                        "end": current_end,
+                        "mode": "memory"
+                    })
+                    current_start = start_sec
+                    current_end = end_sec
+
+            # 保存最后一段
+            if current_start is not None:
+                segments_metadata.append({
+                    "index": len(segments_metadata),
+                    "start": current_start,
+                    "end": current_end,
+                    "mode": "memory"
+                })
+
+            return segments_metadata
+
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def _energy_based_split(
+        self,
+        audio_array: np.ndarray,
+        sr: int,
+        chunk_size: int = 30
+    ) -> List[Dict]:
+        """
+        基于能量的简易分段（降级方案）
+
+        当VAD模型加载失败时使用，按固定时长分段。
+        会尝试在静音处分割以避免切断语音。
+
+        Args:
+            audio_array: 音频数组
+            sr: 采样率
+            chunk_size: 每段最大长度（秒）
+
+        Returns:
+            List[Dict]: 分段元数据列表
+        """
+        self.logger.warning("使用能量检测降级分段（固定时长）")
+
+        total_duration = len(audio_array) / sr
+        segments_metadata = []
+        pos = 0.0
+
+        while pos < total_duration:
+            # 计算理想结束位置
+            ideal_end = min(pos + chunk_size, total_duration)
+
+            # 尝试在静音处分割（在理想结束点前后1秒范围内寻找）
+            if ideal_end < total_duration:
+                search_start = max(pos, ideal_end - 1.0)
+                search_end = min(total_duration, ideal_end + 1.0)
+
+                # 计算搜索范围内的能量
+                start_sample = int(search_start * sr)
+                end_sample = int(search_end * sr)
+                search_audio = audio_array[start_sample:end_sample]
+
+                if len(search_audio) > 0:
+                    # 计算短时能量（每100ms一个窗口）
+                    window_size = int(0.1 * sr)
+                    energies = []
+                    for i in range(0, len(search_audio) - window_size, window_size):
+                        window = search_audio[i:i + window_size]
+                        energy = np.sum(window ** 2)
+                        energies.append((i, energy))
+
+                    if energies:
+                        # 找到能量最低的点
+                        min_energy_idx = min(energies, key=lambda x: x[1])[0]
+                        actual_end = search_start + (min_energy_idx / sr)
+                        # 确保分段至少有1秒
+                        if actual_end - pos >= 1.0:
+                            ideal_end = actual_end
+
+            segments_metadata.append({
+                "index": len(segments_metadata),
+                "start": pos,
+                "end": ideal_end,
+                "mode": "memory"
+            })
+            pos = ideal_end
+
+        self.logger.info(f"能量检测分段完成: {len(segments_metadata)}段")
+        return segments_metadata
+
     def _extract_audio(self, input_file: str, audio_out: str) -> bool:
         """
         使用FFmpeg提取音频
@@ -1005,17 +1603,24 @@ class TranscriptionService:
             self.logger.error(f"❌ 音频提取失败: {e}")
             return False
 
-    def _split_audio(self, audio_path: str) -> List[Dict]:
+    def _split_audio_to_disk(self, audio_path: str) -> List[Dict]:
         """
-        智能分段音频（基于静音检测）
+        硬盘分段模式（保留原有逻辑）
+
+        使用pydub进行静音检测，生成segment_N.wav文件。
+        适用于内存不足的场景。
 
         Args:
             audio_path: 音频文件路径
 
         Returns:
-            List[Dict]: 段信息列表，每项包含 file 和 start_ms
+            List[Dict]: 分段信息列表，与内存模式格式统一
+            [
+                {"index": 0, "file": "segment_0.wav", "start": 0.0, "end": 30.0, "start_ms": 0, "duration_ms": 30000, "mode": "disk"},
+                ...
+            ]
         """
-        self.logger.debug(f"开始音频分段: {audio_path}")
+        self.logger.info("开始硬盘分段（pydub静音检测）...")
 
         # 使用配置中的音频处理参数
         audio_config = config.get_audio_config()
@@ -1052,24 +1657,34 @@ class TranscriptionService:
                         if new_end - pos > MIN_SILENCE_LEN_MS:
                             end = new_end
                 except Exception as e:
-                    self.logger.warning(f"静音检测失败: {e}")
+                    self.logger.warning(f"silence detection failed: {e}")
 
-            # 导出分段
+            # 导出分段文件
             chunk = audio[pos:end]
             seg_file = os.path.join(os.path.dirname(audio_path), f'segment_{idx}.wav')
             chunk.export(seg_file, format='wav')
 
+            # 统一返回格式（与内存模式一致）
             segments.append({
+                'index': idx,                    # 新增：分段索引
                 'file': seg_file,
-                'start_ms': pos,
-                'duration_ms': end - pos
+                'start': pos / 1000.0,           # 新增：起始时间（秒）
+                'end': end / 1000.0,             # 新增：结束时间（秒）
+                'start_ms': pos,                 # 保留：兼容旧代码
+                'duration_ms': end - pos,        # 保留：兼容旧代码
+                'mode': 'disk'                   # 新增：模式标记
             })
 
             pos = end
             idx += 1
 
-        self.logger.debug(f"✅ 音频分段完成: 共{len(segments)}段")
+        self.logger.info(f"disk segmentation complete: {len(segments)} segments (with segment files)")
         return segments
+
+    # 兼容性别名：保留旧方法名（指向新方法）
+    def _split_audio(self, audio_path: str) -> List[Dict]:
+        """兼容性别名，指向 _split_audio_to_disk()"""
+        return self._split_audio_to_disk(audio_path)
 
     def _get_model(self, settings: JobSettings, job: Optional[JobState] = None):
         """
@@ -1418,6 +2033,196 @@ class TranscriptionService:
             del audio
             gc.collect()
 
+    def _transcribe_segment_in_memory(
+        self,
+        audio_array: np.ndarray,
+        seg_meta: Dict,
+        model,
+        job: JobState
+    ) -> Optional[Dict]:
+        """
+        从内存切片转录（Zero-copy，高性能）
+
+        内存模式下使用，直接从完整音频数组中切片，无需磁盘IO。
+
+        Args:
+            audio_array: 完整音频数组
+            seg_meta: 分段元数据 {"index": 0, "start": 0.0, "end": 30.5, "mode": "memory"}
+            model: Whisper模型
+            job: 任务状态
+
+        Returns:
+            Dict: 未对齐的转录结果
+        """
+        sr = 16000
+        start_sample = int(seg_meta['start'] * sr)
+        end_sample = int(seg_meta['end'] * sr)
+
+        # Zero-copy切片（numpy view，不复制数据）
+        audio_slice = audio_array[start_sample:end_sample]
+
+        try:
+            # Whisper转录
+            rs = model.transcribe(
+                audio_slice,
+                batch_size=job.settings.batch_size,
+                verbose=False,
+                language=job.language
+            )
+
+            if not rs or 'segments' not in rs:
+                return None
+
+            # 检测语言（首次）
+            if not job.language and 'language' in rs:
+                job.language = rs['language']
+                self.logger.info(f"detected language: {job.language}")
+
+            # 时间偏移校正
+            start_offset = seg_meta['start']
+            adjusted_segments = []
+
+            for idx, s in enumerate(rs['segments']):
+                adjusted_segments.append({
+                    'id': idx,
+                    'start': s.get('start', 0) + start_offset,
+                    'end': s.get('end', 0) + start_offset,
+                    'text': s.get('text', '').strip()
+                })
+
+            return {
+                'segment_index': seg_meta['index'],
+                'language': rs.get('language', job.language),
+                'segments': adjusted_segments
+            }
+
+        finally:
+            # 注意：audio_slice是view，不需要单独释放
+            gc.collect()
+
+    def _transcribe_segment_from_disk(
+        self,
+        seg: Dict,
+        model,
+        job: JobState
+    ) -> Optional[Dict]:
+        """
+        从文件加载转录（硬盘模式）
+
+        硬盘模式下使用，从segment文件加载音频进行转录。
+
+        Args:
+            seg: 分段信息 {"index": 0, "file": "segment_0.wav", "start": 0.0, "end": 30.0, "mode": "disk"}
+            model: Whisper模型
+            job: 任务状态
+
+        Returns:
+            Dict: 未对齐的转录结果
+        """
+        audio = whisperx.load_audio(seg['file'])
+
+        try:
+            rs = model.transcribe(
+                audio,
+                batch_size=job.settings.batch_size,
+                verbose=False,
+                language=job.language
+            )
+
+            if not rs or 'segments' not in rs:
+                return None
+
+            # 检测语言（首次）
+            if not job.language and 'language' in rs:
+                job.language = rs['language']
+                self.logger.info(f"detected language: {job.language}")
+
+            # 时间偏移校正（使用start字段，秒为单位）
+            start_offset = seg.get('start', seg.get('start_ms', 0) / 1000.0)
+            adjusted_segments = []
+
+            for idx, s in enumerate(rs['segments']):
+                adjusted_segments.append({
+                    'id': idx,
+                    'start': s.get('start', 0) + start_offset,
+                    'end': s.get('end', 0) + start_offset,
+                    'text': s.get('text', '').strip()
+                })
+
+            return {
+                'segment_index': seg['index'],
+                'language': rs.get('language', job.language),
+                'segments': adjusted_segments
+            }
+
+        finally:
+            del audio
+            gc.collect()
+
+    def _transcribe_segment(
+        self,
+        seg_meta: Dict,
+        model,
+        job: JobState,
+        audio_array: Optional[np.ndarray] = None
+    ) -> Optional[Dict]:
+        """
+        统一转录入口（根据模式自动选择）
+
+        Args:
+            seg_meta: 分段元数据
+            model: Whisper模型
+            job: 任务状态
+            audio_array: 音频数组（内存模式时必须提供）
+
+        Returns:
+            Dict: 未对齐的转录结果
+        """
+        mode = seg_meta.get('mode', 'disk')
+
+        if mode == 'memory':
+            if audio_array is None:
+                raise ValueError("memory mode requires audio_array parameter")
+            return self._transcribe_segment_in_memory(audio_array, seg_meta, model, job)
+        else:
+            return self._transcribe_segment_from_disk(seg_meta, model, job)
+
+    def _check_memory_during_transcription(self, job: JobState) -> bool:
+        """
+        转录过程中检查内存状态
+
+        如果内存严重不足，暂停任务并警告用户。
+
+        Args:
+            job: 任务状态对象
+
+        Returns:
+            bool: True=继续处理，False=需要暂停
+        """
+        mem_info = psutil.virtual_memory()
+        available_mb = mem_info.available / (1024 * 1024)
+        percent_used = mem_info.percent
+
+        # 危险阈值：可用内存<500MB 或 使用率>95%
+        if available_mb < 500 or percent_used > 95:
+            self.logger.error(f"memory critically low! available: {available_mb:.0f}MB, usage: {percent_used}%")
+            job.status = 'paused'
+            job.message = f"memory insufficient (available {available_mb:.0f}MB), please close other programs"
+            job.paused = True
+
+            # 推送警告SSE
+            self._push_sse_signal(job, "memory_warning",
+                f"memory critically low (available {available_mb:.0f}MB), task paused")
+
+            return False
+
+        # 警告阈值：可用内存<1GB 或 使用率>90%
+        if available_mb < 1024 or percent_used > 90:
+            self.logger.warning(f"memory tight: available {available_mb:.0f}MB, usage {percent_used}%")
+            # 不暂停，但记录警告
+
+        return True
+
     def _align_all_results(
         self,
         unaligned_results: List[Dict],
@@ -1477,88 +2282,174 @@ class TranscriptionService:
             del audio
             gc.collect()
 
-    def _transcribe_segment(
+    def _push_sse_align_progress(
         self,
-        seg: Dict,
-        model,
         job: JobState,
-        align_cache: Dict
+        current_batch: int,
+        total_batches: int,
+        aligned_count: int,
+        total_count: int
     ):
         """
-        转录单个音频段
+        推送对齐进度SSE事件（前端进度条实时更新）
+
+        事件类型: "align_progress"
 
         Args:
-            seg: 段信息 {file, start_ms, duration_ms}
-            model: Whisper模型
-            job: 任务状态
-            align_cache: 对齐模型缓存
+            job: 任务状态对象
+            current_batch: 当前批次号（1-based）
+            total_batches: 总批次数
+            aligned_count: 已对齐的segment数量
+            total_count: 总segment数量
+        """
+        try:
+            from services.sse_service import get_sse_manager
+            sse_manager = get_sse_manager()
+
+            channel_id = f"job:{job.job_id}"
+
+            # 计算百分比
+            batch_progress = (current_batch / total_batches) * 100 if total_batches > 0 else 0
+            segment_progress = (aligned_count / total_count) * 100 if total_count > 0 else 0
+
+            sse_manager.broadcast_sync(
+                channel_id,
+                "align_progress",  # 专用事件类型
+                {
+                    "job_id": job.job_id,
+                    "phase": "align",
+                    "batch": {
+                        "current": current_batch,
+                        "total": total_batches,
+                        "progress": round(batch_progress, 2)
+                    },
+                    "segments": {
+                        "aligned": aligned_count,
+                        "total": total_count,
+                        "progress": round(segment_progress, 2)
+                    },
+                    "message": f"aligning batch {current_batch}/{total_batches} ({aligned_count}/{total_count} segments)"
+                }
+            )
+
+        except Exception as e:
+            self.logger.debug(f"SSE align progress push failed (non-fatal): {e}")
+
+    def _align_all_results_batched(
+        self,
+        unaligned_results: List[Dict],
+        job: JobState,
+        audio_source,  # Union[np.ndarray, str]
+        processing_mode: ProcessingMode
+    ) -> List[Dict]:
+        """
+        分批对齐（支持实时SSE进度推送）
+
+        批次对齐的优势：
+        1. 避免一次性对齐所有内容导致的长时间卡顿
+        2. 支持前端进度条实时更新
+        3. 内存使用更可控
+
+        Args:
+            unaligned_results: 所有未对齐的转录结果
+            job: 任务状态对象
+            audio_source: 音频来源（内存模式传数组，硬盘模式传路径）
+            processing_mode: 当前处理模式
 
         Returns:
-            Dict: 转录结果（包含segments和word_segments）
+            List[Dict]: 对齐后的结果
         """
-        audio = whisperx.load_audio(seg['file'])
+        self.logger.info(f"starting batched alignment: {len(unaligned_results)} segments")
+
+        # 1. 合并所有segments
+        all_segments = []
+        for result in unaligned_results:
+            all_segments.extend(result['segments'])
+
+        if not all_segments:
+            self.logger.warning("no segments to align")
+            return []
+
+        # 2. 加载音频（根据模式）
+        if processing_mode == ProcessingMode.MEMORY:
+            audio_array = audio_source  # 直接使用内存数组
+            self.logger.info("align phase: reusing audio array from memory")
+        else:
+            # 硬盘模式：需要加载完整音频
+            self.logger.info("align phase: loading complete audio from disk...")
+            audio_array = whisperx.load_audio(audio_source)
 
         try:
-            # Whisper转录
-            rs = model.transcribe(
-                audio,
-                batch_size=job.settings.batch_size,
-                verbose=False,
-                language=job.language
-            )
+            # 3. 获取对齐模型
+            lang = job.language or unaligned_results[0].get('language', 'zh')
+            align_model, metadata = self._get_align_model(lang, job.settings.device, job)
 
-            if not rs or 'segments' not in rs:
-                return None
+            # 4. 分批对齐
+            BATCH_SIZE = 50  # 每批50条segment
+            total_segments = len(all_segments)
+            total_batches = math.ceil(total_segments / BATCH_SIZE)
+            aligned_segments = []
 
-            # 检测语言
-            if not job.language and 'language' in rs:
-                job.language = rs['language']
-                self.logger.info(f"🌐 检测到语言: {job.language}")
+            self.logger.info(f"alignment config: total {total_segments} segments, {BATCH_SIZE} per batch, {total_batches} batches")
 
-            lang = job.language or rs.get('language')
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * BATCH_SIZE
+                end_idx = min(start_idx + BATCH_SIZE, total_segments)
+                batch = all_segments[start_idx:end_idx]
 
-            # 加载对齐模型
-            if lang not in align_cache:
-                am, meta = self._get_align_model(lang, job.settings.device, job)
-                align_cache[lang] = (am, meta)
+                # 计算进度
+                progress = batch_idx / total_batches
 
-            am, meta = align_cache[lang]
+                # 更新任务进度
+                self._update_progress(
+                    job,
+                    'align',
+                    progress,
+                    f'aligning batch {batch_idx + 1}/{total_batches}'
+                )
 
-            # 词级对齐
-            aligned = whisperx.align(
-                rs['segments'],
-                am,
-                meta,
-                audio,
-                job.settings.device
-            )
+                # 推送对齐进度SSE（专用事件）
+                self._push_sse_align_progress(
+                    job,
+                    batch_idx + 1,
+                    total_batches,
+                    len(aligned_segments),
+                    total_segments
+                )
 
-            # 时间偏移校正（重要！）
-            start_offset = seg['start_ms'] / 1000.0
-            final = {'segments': []}
+                # 执行对齐
+                try:
+                    aligned_batch = whisperx.align(
+                        batch,
+                        align_model,
+                        metadata,
+                        audio_array,
+                        job.settings.device
+                    )
+                    aligned_segments.extend(aligned_batch.get('segments', []))
+                    self.logger.debug(f"batch {batch_idx + 1}/{total_batches} completed")
 
-            if 'segments' in aligned:
-                for s in aligned['segments']:
-                    if 'start' in s:
-                        s['start'] += start_offset
-                    if 'end' in s:
-                        s['end'] += start_offset
-                    final['segments'].append(s)
+                except Exception as e:
+                    self.logger.error(f"batch {batch_idx + 1} alignment failed: {e}")
+                    # 继续处理其他批次，不中断整体流程
+                    continue
 
-            if 'word_segments' in aligned:
-                final['word_segments'] = []
-                for w in aligned['word_segments']:
-                    if 'start' in w:
-                        w['start'] += start_offset
-                    if 'end' in w:
-                        w['end'] += start_offset
-                    final['word_segments'].append(w)
+            # 5. 完成
+            self._update_progress(job, 'align', 1, 'alignment complete')
+            self._push_sse_align_progress(job, total_batches, total_batches, total_segments, total_segments)
 
-            return final
+            self.logger.info(f"batched alignment complete: {len(aligned_segments)} segments")
+
+            return [{
+                'segments': aligned_segments,
+                'word_segments': []
+            }]
 
         finally:
-            del audio
-            gc.collect()
+            # 如果是硬盘模式，释放加载的音频
+            if processing_mode == ProcessingMode.DISK:
+                del audio_array
+                gc.collect()
 
     def _format_ts(self, sec: float) -> str:
         """

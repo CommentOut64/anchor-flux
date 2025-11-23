@@ -81,10 +81,10 @@ class ProjectConfig:
         # ========== 进度权重配置 ==========
         self.PHASE_WEIGHTS = {
             "extract": 5,      # 音频提取占5%
-            "split": 5,        # 音频分段占5%（从10降到5）
-            "transcribe": 70,  # 转录处理占70%（从80降到70，因为分离了对齐）
-            "align": 10,       # 对齐处理占10%（新增阶段）
-            "srt": 10          # SRT生成占10% （已调整为10）
+            "split": 5,        # 音频分段占5%
+            "transcribe": 60,  # 转录处理占60%（降低，因对齐权重增加）
+            "align": 20,       # 对齐处理占20%（增加，因为是批次对齐）
+            "srt": 10          # SRT生成占10%
         }
         self.TOTAL_WEIGHT = sum(self.PHASE_WEIGHTS.values())  # 计算总和，保证为100
 
