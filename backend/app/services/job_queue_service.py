@@ -1,13 +1,16 @@
 """
-任务队列管理服务 - V2.2
-核心功能: 串行执行，防止并发OOM
+任务队列管理服务 - V2.3
+核心功能: 串行执行，防止并发OOM，队列持久化
 """
 import threading
 import time
 import logging
 import gc
+import json
+import os
 from collections import deque
 from typing import Dict, Optional
+from pathlib import Path
 import torch
 
 from models.job_models import JobState
@@ -46,6 +49,13 @@ class JobQueueService:
         self.stop_event = threading.Event()
         self.lock = threading.Lock()  # 保护queue和running_job_id
 
+        # 持久化文件路径
+        from core.config import config
+        self.queue_file = Path(config.JOBS_DIR) / "queue_state.json"
+
+        # 启动时恢复队列
+        self._load_state()
+
         # 启动Worker线程
         self.worker_thread = threading.Thread(
             target=self._worker_loop,
@@ -53,7 +63,7 @@ class JobQueueService:
             name="JobQueueWorker"
         )
         self.worker_thread.start()
-        logger.info("✅ 任务队列Worker线程已启动")
+        logger.info("任务队列Worker线程已启动")
 
     def add_job(self, job: JobState):
         """
@@ -68,7 +78,10 @@ class JobQueueService:
             job.status = "queued"
             job.message = f"排队中 (位置: {len(self.queue)})"
 
-        logger.info(f"📥 任务已加入队列: {job.job_id} (队列长度: {len(self.queue)})")
+        logger.info(f"任务已加入队列: {job.job_id} (队列长度: {len(self.queue)})")
+
+        # 保存队列状态
+        self._save_state()
 
     def get_job(self, job_id: str) -> Optional[JobState]:
         """获取任务状态"""
@@ -93,14 +106,16 @@ class JobQueueService:
                 # 正在执行的任务：设置暂停标志（pipeline会自己检测并保存checkpoint）
                 job.paused = True
                 job.message = "暂停中..."
-                logger.info(f"⏸️ 设置暂停标志: {job_id}")
+                logger.info(f"设置暂停标志: {job_id}")
             elif job_id in self.queue:
                 # 还在排队的任务：直接从队列移除
                 self.queue.remove(job_id)
                 job.status = "paused"
                 job.message = "已暂停（未开始）"
-                logger.info(f"⏸️ 从队列移除: {job_id}")
+                logger.info(f"从队列移除: {job_id}")
 
+        # 保存队列状态
+        self._save_state()
         return True
 
     def cancel_job(self, job_id: str, delete_data: bool = False) -> bool:
@@ -132,9 +147,13 @@ class JobQueueService:
         # 如果需要删除数据，调用transcription_service的清理逻辑
         if delete_data:
             # 这里复用原有的清理逻辑
-            return self.transcription_service.cancel_job(job_id, delete_data=True)
+            result = self.transcription_service.cancel_job(job_id, delete_data=True)
+        else:
+            result = True
 
-        return True
+        # 保存队列状态
+        self._save_state()
+        return result
 
     def _worker_loop(self):
         """
@@ -213,7 +232,7 @@ class JobQueueService:
                     with self.lock:
                         self.running_job_id = None
 
-                    # 🔥 资源大清洗
+                    # 资源大清洗
                     self._cleanup_resources()
 
                     # 推送任务结束信号
@@ -226,6 +245,9 @@ class JobQueueService:
                             "status": job.status
                         }
                     )
+
+                    # 保存队列状态
+                    self._save_state()
 
             except Exception as e:
                 logger.error(f"Worker循环异常: {e}", exc_info=True)
@@ -272,7 +294,97 @@ class JobQueueService:
         # 4. 等待资源释放
         time.sleep(1)
 
-        logger.info("✅ 资源清理完成")
+        logger.info("资源清理完成")
+
+    def _save_state(self):
+        """
+        持久化队列状态到磁盘
+
+        格式:
+        {
+          "queue": ["job_id1", "job_id2"],
+          "running": "job_id3",
+          "timestamp": 1234567890.0
+        }
+        """
+        with self.lock:
+            state = {
+                "queue": list(self.queue),
+                "running": self.running_job_id,
+                "timestamp": time.time()
+            }
+
+        try:
+            # 确保目录存在
+            self.queue_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # 原子写入（临时文件 + rename）
+            temp_path = self.queue_file.with_suffix(".tmp")
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, indent=2)
+
+            # 原子替换
+            temp_path.replace(self.queue_file)
+            logger.debug("队列状态已保存")
+        except Exception as e:
+            logger.error(f"保存队列状态失败: {e}")
+
+    def _load_state(self):
+        """
+        启动时恢复队列状态
+
+        恢复逻辑:
+        1. 读取queue_state.json
+        2. 如果有running任务，检查checkpoint是否存在
+        3. 恢复running任务为paused，放队列头部
+        4. 恢复队列中的其他任务
+        """
+        if not self.queue_file.exists():
+            logger.info("无队列状态文件，从空队列启动")
+            return
+
+        try:
+            with open(self.queue_file, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+
+            logger.info(f"加载队列状态: {state}")
+
+            # 1. 恢复running任务（如果有）
+            running_id = state.get("running")
+            if running_id:
+                # 尝试从checkpoint恢复
+                job = self.transcription_service.restore_job_from_checkpoint(running_id)
+                if job:
+                    # 安全起见，改为paused，不自动开始
+                    job.status = "paused"
+                    job.message = "程序重启，任务已暂停"
+                    self.jobs[running_id] = job
+                    self.queue.appendleft(running_id)  # 放队头
+                    logger.info(f"恢复中断任务到队头: {running_id}")
+                else:
+                    logger.warning(f"无法恢复running任务: {running_id}")
+
+            # 2. 恢复队列中的任务
+            for job_id in state.get("queue", []):
+                # 避免重复（running任务已经加入队列了）
+                if job_id == running_id:
+                    continue
+
+                # 尝试恢复任务
+                job = self.transcription_service.restore_job_from_checkpoint(job_id)
+                if job:
+                    self.jobs[job_id] = job
+                    job.status = "queued"
+                    job.message = f"排队中 (位置: {len(self.queue) + 1})"
+                    self.queue.append(job_id)
+                    logger.info(f"恢复排队任务: {job_id}")
+                else:
+                    logger.warning(f"跳过无效任务: {job_id}")
+
+            logger.info(f"队列恢复完成: {len(self.queue)}个任务")
+
+        except Exception as e:
+            logger.error(f"恢复队列状态失败: {e}")
 
     def shutdown(self):
         """停止Worker线程"""
