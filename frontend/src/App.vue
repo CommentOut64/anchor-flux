@@ -10,6 +10,15 @@
           </h1>
         </el-col>
         <el-col :span="6" style="text-align: center; display: flex; gap: 0px; justify-content: flex-end;">
+          <!-- 测试模式切换按钮 -->
+          <el-button
+            type="warning"
+            @click="testMode = !testMode"
+            style="margin-right: 10px;"
+          >
+            <el-icon><Setting /></el-icon>
+            {{ testMode ? '退出测试' : '队列测试' }}
+          </el-button>
           <el-button type="success" @click="showModelDownload = true">
             <el-icon><Download /></el-icon>
             模型下载
@@ -20,7 +29,15 @@
 
     <!-- 主要内容区域 -->
     <el-main class="main-content">
-      <el-row :gutter="20" justify="center">
+      <!-- 测试模式：显示任务队列测试组件 -->
+      <el-row v-if="testMode" :gutter="20" justify="center">
+        <el-col :span="24" :lg="20" :xl="18">
+          <TaskQueueTest />
+        </el-col>
+      </el-row>
+
+      <!-- 正常模式：显示原有界面 -->
+      <el-row v-else :gutter="20" justify="center">
         <el-col :xs="24" :sm="20" :md="16" :lg="14" :xl="12">
           <!-- 0. 未完成任务列表 -->
           <IncompleteJobs
@@ -108,6 +125,7 @@ import HardwareDialog from "./components/hardware/HardwareDialog.vue";
 import ModelStatusButton from "./components/models/ModelStatusButton.vue";
 import ModelManager from "./components/models/ModelManager.vue";
 import ModelDownloadManager from "./components/models/ModelDownloadManager.vue";
+import TaskQueueTest from "./components/test/TaskQueueTest.vue"; // 测试组件
 
 // 导入服务
 import { FileService } from "./services/fileService.js";
@@ -133,6 +151,9 @@ const inputDirPath = ref("input/");
 const uploading = ref(false);
 const uploadProgress = ref(0);
 const showUpload = ref(false); // 默认使用本地input模式
+
+// 测试模式
+const testMode = ref(false); // 添加测试模式开关
 
 // 硬件信息对话框
 const showHardwareDialog = ref(false);
