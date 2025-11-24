@@ -49,15 +49,15 @@ class ProjectConfig:
             # 使用国内镜像源（HF-Mirror 公益镜像）
             self.HF_ENDPOINT = 'https://hf-mirror.com'
             os.environ['HF_ENDPOINT'] = self.HF_ENDPOINT
-            print(f"🌐 HuggingFace 镜像源: {self.HF_ENDPOINT}")
-            print("💡 提示：如需使用官方源，请设置环境变量 USE_HF_MIRROR=false")
+            print(f"HuggingFace 镜像源: {self.HF_ENDPOINT}")
+            print("提示：如需使用官方源，请设置环境变量 USE_HF_MIRROR=false")
         else:
             # 使用官方源
             self.HF_ENDPOINT = 'https://huggingface.co'
             if 'HF_ENDPOINT' in os.environ:
                 del os.environ['HF_ENDPOINT']
-            print(f"🌐 使用 HuggingFace 官方源: {self.HF_ENDPOINT}")
-            print("💡 提示：如遇访问问题，可设置环境变量 USE_HF_MIRROR=true 使用镜像源")
+            print(f"使用 HuggingFace 官方源: {self.HF_ENDPOINT}")
+            print("提示：如遇访问问题，可设置环境变量 USE_HF_MIRROR=true 使用镜像源")
 
         # 确保目录存在
         for dir_path in [

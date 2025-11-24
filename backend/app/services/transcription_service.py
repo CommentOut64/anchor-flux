@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from enum import Enum
 from dataclasses import dataclass, field
+from collections import OrderedDict  # 新增导入
 from pydub import AudioSegment, silence
 import whisperx
 import torch
@@ -60,7 +61,11 @@ from core.config import config  # 导入统一配置
 
 # 全局模型缓存 (按 (model, compute_type, device) 键)
 _model_cache: Dict[Tuple[str, str, str], object] = {}
-_align_model_cache: Dict[str, Tuple[object, object]] = {}
+
+# 对齐模型缓存（改为OrderedDict，支持LRU）
+_align_model_cache: OrderedDict[str, Tuple[object, object]] = OrderedDict()
+_MAX_ALIGN_MODELS = 3  # 最多缓存3种语言的对齐模型
+
 _model_lock = threading.Lock()
 _align_lock = threading.Lock()
 
@@ -403,31 +408,33 @@ class TranscriptionService:
 
     def start_job(self, job_id: str):
         """
-        启动转录任务（支持从paused状态恢复）
+        启动转录任务（V2.2: 废弃，由队列服务调用_run_pipeline）
+
+        注意: 此方法保留是为了向后兼容，但不再自动创建线程
 
         Args:
             job_id: 任务ID
         """
+        # 🔥 关键改动: 不再自动创建线程，由队列服务统一管理
+        # 原有代码:
+        # threading.Thread(target=self._run_pipeline, args=(job,), daemon=True).start()
+
+        # 新逻辑: 只更新状态，实际执行由队列服务控制
         job = self.get_job(job_id)
-        if not job or job.status not in ("uploaded", "failed", "paused"):
-            self.logger.warning(f"任务无法启动: {job_id}, 状态: {job.status if job else 'not found'}")
+        if not job:
+            self.logger.warning(f"任务未找到: {job_id}")
+            return
+
+        if job.status not in ("uploaded", "failed", "paused", "created"):
+            self.logger.warning(f"任务无法启动: {job_id}, 状态: {job.status}")
             return
 
         job.canceled = False
-        job.paused = False  # 清除暂停标志
+        job.paused = False
         job.error = None
-        job.status = "processing"
-        job.message = "开始处理" if job.status != "paused" else "恢复处理"
+        # 状态由队列服务设置，这里不改
 
-        # 在独立线程中执行转录
-        threading.Thread(
-            target=self._run_pipeline,
-            args=(job,),
-            daemon=True,
-            name=f"Transcription-{job_id[:8]}"
-        ).start()
-
-        self.logger.info(f"🚀 任务已启动: {job_id}")
+        self.logger.warning(f"⚠️ start_job已废弃，请使用队列服务: {job_id}")
 
     def pause_job(self, job_id: str) -> bool:
         """
@@ -1835,9 +1842,12 @@ class TranscriptionService:
 
     def _get_align_model(self, lang: str, device: str, job: Optional[JobState] = None):
         """
-        获取对齐模型（带缓存）
+        获取对齐模型（带LRU缓存）
 
-        集成模型管理器：如果模型不存在或不完整，会自动触发下载并等待完成
+        策略:
+        - 缓存命中：移到末尾（标记为最近使用）
+        - 缓存已满：删除最久未使用的模型
+        - 最多缓存3种语言
 
         Args:
             lang: 语言代码
@@ -1847,27 +1857,51 @@ class TranscriptionService:
         Returns:
             Tuple[model, metadata]: 对齐模型和元数据
         """
+        global _align_model_cache, _MAX_ALIGN_MODELS
+
         with _align_lock:
-            # 检查本地缓存
+            # 1. 检查缓存命中
             if lang in _align_model_cache:
-                self.logger.debug(f"✅ 命中对齐模型缓存: {lang}")
+                # 命中：移到末尾（最近使用）
+                _align_model_cache.move_to_end(lang)
+                self.logger.debug(f"✅ 命中对齐模型缓存: {lang} (缓存: {list(_align_model_cache.keys())})")
                 if job:
                     job.message = "使用缓存的对齐模型"
                 return _align_model_cache[lang]
 
-            # 尝试使用模型预加载管理器（优先从LRU缓存获取）
-            try:
-                from services.model_preload_manager import get_model_manager as get_preload_manager
-                preload_mgr = get_preload_manager()
-                if preload_mgr:
-                    self.logger.debug("✅ 尝试从预加载管理器获取对齐模型")
-                    if job:
-                        job.message = "加载对齐模型"
-                    am, meta = preload_mgr.get_align_model(lang, device)
+            # 2. 缓存未命中，检查是否需要淘汰
+            if len(_align_model_cache) >= _MAX_ALIGN_MODELS:
+                # 缓存已满，删除最久未使用的（队首）
+                oldest_lang, (oldest_model, _) = _align_model_cache.popitem(last=False)
+                self.logger.info(f"🗑️ 淘汰最久未用的对齐模型: {oldest_lang} (为 {lang} 腾出空间)")
+
+                # 显式删除模型对象
+                try:
+                    del oldest_model
+                except:
+                    pass
+
+        # 3. 加载新模型（保留原有的下载和加载逻辑）
+        self.logger.info(f"🔍 加载对齐模型: {lang}")
+        if job:
+            job.message = f"加载对齐模型 {lang}"
+
+        # 尝试使用模型预加载管理器（优先从LRU缓存获取）
+        try:
+            from services.model_preload_manager import get_model_manager as get_preload_manager
+            preload_mgr = get_preload_manager()
+            if preload_mgr:
+                self.logger.debug("✅ 尝试从预加载管理器获取对齐模型")
+                if job:
+                    job.message = "加载对齐模型"
+                am, meta = preload_mgr.get_align_model(lang, device)
+                # 4. 加入缓存（自动放在末尾，标记为最近使用）
+                with _align_lock:
                     _align_model_cache[lang] = (am, meta)
-                    return am, meta
-            except Exception as e:
-                self.logger.debug(f"预加载管理器获取失败，使用直接加载: {e}")
+                    self.logger.info(f"✅ 对齐模型已缓存: {lang} (当前缓存: {list(_align_model_cache.keys())})")
+                return am, meta
+        except Exception as e:
+            self.logger.debug(f"预加载管理器获取失败，使用直接加载: {e}")
 
             # 检查模型是否需要下载（使用模型管理服务）
             try:
@@ -1952,7 +1986,10 @@ class TranscriptionService:
                     device=device,
                     model_dir=str(config.HF_CACHE_DIR)  # 指定缓存路径
                 )
-                _align_model_cache[lang] = (am, meta)
+                # 加入缓存（自动放在末尾，标记为最近使用）
+                with _align_lock:
+                    _align_model_cache[lang] = (am, meta)
+                    self.logger.info(f"✅ 对齐模型已缓存: {lang} (当前缓存: {list(_align_model_cache.keys())})")
                 if job:
                     job.message = "对齐模型加载完成"
                 return am, meta
@@ -1965,7 +2002,10 @@ class TranscriptionService:
                     language_code=lang,
                     device=device
                 )
-                _align_model_cache[lang] = (am, meta)
+                # 加入缓存（自动放在末尾，标记为最近使用）
+                with _align_lock:
+                    _align_model_cache[lang] = (am, meta)
+                    self.logger.info(f"✅ 对齐模型已下载并缓存: {lang} (当前缓存: {list(_align_model_cache.keys())})")
                 if job:
                     job.message = "对齐模型下载并加载完成"
                 return am, meta
@@ -2534,6 +2574,34 @@ class TranscriptionService:
             f.write('\n'.join(lines))
 
         self.logger.info(f"✅ SRT文件已生成: {path}, 共{n-1}条字幕")
+
+    def clear_model_cache(self):
+        """
+        清空模型缓存（供队列服务调用）
+
+        策略:
+        - 总是清理 Whisper 模型（显存占用大，1-3GB）
+        - 保留对齐模型的 LRU 缓存（占用小，每个~200MB）
+        """
+        global _model_cache, _align_model_cache
+
+        # 1. 总是清理 Whisper 模型
+        with _model_lock:
+            for key in list(_model_cache.keys()):
+                try:
+                    del _model_cache[key]
+                except:
+                    pass
+            _model_cache.clear()
+            self.logger.info("🧹 Whisper模型缓存已清空")
+
+        # 2. 保留对齐模型（记录当前缓存状态）
+        with _align_lock:
+            cached_langs = list(_align_model_cache.keys())
+            if cached_langs:
+                self.logger.debug(f"🔄 保留对齐模型缓存 (LRU): {cached_langs}")
+            else:
+                self.logger.debug("🔄 对齐模型缓存为空")
 
 
 # 单例处理器

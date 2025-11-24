@@ -67,7 +67,7 @@ async def startup_event():
         logger.info("=" * 60)
 
         # 1. 设置SSE事件循环引用（必须在模型管理器初始化之前！）
-        logger.info("步骤 1/3: 设置SSE事件循环...")
+        logger.info("步骤 1/4: 设置SSE事件循环...")
         try:
             import asyncio
             current_loop = asyncio.get_running_loop()
@@ -82,7 +82,7 @@ async def startup_event():
             logger.warning(f"设置SSE事件循环异常: {e}")
 
         # 2. FFmpeg检测和自动下载
-        logger.info("步骤 2/3: 检测FFmpeg...")
+        logger.info("步骤 2/4: 检测FFmpeg...")
         ffmpeg_mgr = get_ffmpeg_manager()
         try:
             ffmpeg_path = ffmpeg_mgr.ensure_ffmpeg()
@@ -93,9 +93,18 @@ async def startup_event():
             logger.warning("转录功能可能无法使用，请手动安装FFmpeg")
 
         # 3. 初始化模型管理器（此时事件循环已设置，后台验证可以正常推送SSE）
-        logger.info("步骤 3/3: 初始化模型管理器...")
+        logger.info("步骤 3/4: 初始化模型管理器...")
         model_manager = initialize_model_manager(preload_config)
         logger.info("模型管理器初始化成功")
+
+        # 4. 初始化队列服务（新增）
+        logger.info("步骤 4/4: 初始化任务队列服务...")
+        from services.job_queue_service import get_queue_service
+        from services.transcription_service import get_transcription_service
+        from core.config import config
+        transcription_service = get_transcription_service(str(config.JOBS_DIR))
+        queue_service = get_queue_service(transcription_service)
+        logger.info("✅ 任务队列服务已启动")
 
         # 不在启动时预加载模型，等待前端就绪后通过API调用
         logger.info("后端服务已就绪，等待前端启动后进行模型预加载")
@@ -112,6 +121,16 @@ async def startup_event():
 async def shutdown_event():
     """应用关闭事件 - 清理资源"""
     try:
+        # 停止队列服务（新增）
+        from services.job_queue_service import get_queue_service
+        try:
+            queue_service = get_queue_service()
+            queue_service.shutdown()
+            logger.info("✅ 任务队列服务已停止")
+        except:
+            pass
+
+        # 清理模型缓存
         model_manager = get_model_manager()
         if model_manager:
             model_manager.clear_cache()
@@ -131,9 +150,8 @@ transcription_service = get_transcription_service(JOBS_DIR)
 # 初始化文件管理服务
 file_service = FileManagementService(INPUT_DIR, OUTPUT_DIR)
 
-# 注册API路由
-app.include_router(model_routes.router)
 # 注册转录路由（包含暂停、恢复等新功能）
+# 注意：model_routes已在第59行注册，这里不再重复注册
 transcription_router = create_transcription_router(transcription_service, file_service, OUTPUT_DIR)
 app.include_router(transcription_router)
 
@@ -236,190 +254,9 @@ async def delete_file(filename: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"删除文件失败: {str(e)}")
 
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    """上传文件并自动创建转录任务"""
-    try:
-        # 验证文件类型
-        if not is_video_or_audio_file(file.filename):
-            raise HTTPException(status_code=400, detail="不支持的文件格式")
-        
-        # 保存用户原始文件路径信息
-        original_filename = file.filename
-        
-        # 将文件保存到input目录
-        input_path = os.path.join(INPUT_DIR, original_filename)
-        
-        # 如果同名文件已存在，添加时间戳
-        counter = 1
-        base_name, ext = os.path.splitext(original_filename)
-        while os.path.exists(input_path):
-            new_filename = f"{base_name}_{counter}{ext}"
-            input_path = os.path.join(INPUT_DIR, new_filename)
-            original_filename = new_filename
-            counter += 1
-        
-        # 保存文件
-        with open(input_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # 创建转录任务
-        job_id = uuid.uuid4().hex
-        settings = JobSettings()
-        transcription_service.create_job(original_filename, input_path, settings, job_id=job_id)
-        
-        return {
-            "job_id": job_id, 
-            "filename": original_filename,
-            "original_name": file.filename,
-            "message": "文件上传成功，转录任务已创建"
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"上传文件失败: {str(e)}")
-
-@app.post("/api/create-job")
-async def create_job(filename: str = Form(...)):
-    """为指定文件创建转录任务（保留兼容性）"""
-    try:
-        input_path = os.path.join(INPUT_DIR, filename)
-        if not os.path.exists(input_path):
-            raise HTTPException(status_code=404, detail="文件不存在")
-        
-        if not is_video_or_audio_file(filename):
-            raise HTTPException(status_code=400, detail="不支持的文件格式")
-        
-        job_id = uuid.uuid4().hex
-        settings = JobSettings()
-        transcription_service.create_job(filename, input_path, settings, job_id=job_id)
-        
-        return {"job_id": job_id, "filename": filename}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"创建任务失败: {str(e)}")
-
-@app.post("/api/start")
-async def start(job_id: str = Form(...), settings: str = Form(...)):
-    try:
-        settings_obj = TranscribeSettings(**json.loads(settings))
-        job = transcription_service.get_job(job_id)
-        if not job:
-            return {"error": "无效 job_id"}
-        
-        # 创建CPU亲和性配置
-        cpu_config = CPUAffinityConfig(
-            enabled=settings_obj.cpu_affinity_enabled,
-            strategy=settings_obj.cpu_affinity_strategy,
-            custom_cores=settings_obj.cpu_affinity_custom_cores,
-            exclude_cores=settings_obj.cpu_affinity_exclude_cores
-        )
-        
-        # 覆盖设置
-        job.settings = JobSettings(
-            model=settings_obj.model,
-            compute_type=settings_obj.compute_type,
-            device=settings_obj.device,
-            batch_size=settings_obj.batch_size,
-            word_timestamps=settings_obj.word_timestamps,
-            cpu_affinity=cpu_config
-        )
-        
-        transcription_service.start_job(job_id)
-        return {"job_id": job_id, "started": True}
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON 解析失败: {str(e)}, 原始数据: {settings}")
-        raise HTTPException(status_code=400, detail=f"设置参数 JSON 格式无效: {str(e)}")
-    except Exception as e:
-        logger.error(f"启动任务失败: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"启动任务失败: {str(e)}")
-
-# 取消任务端点已移至 transcription_routes.py，避免路由冲突
-
-@app.get("/api/status/{job_id}")
-async def status(job_id: str):
-    job = transcription_service.get_job(job_id)
-    if not job:
-        return {"error": "未找到"}
-    return job.to_dict()
-
-@app.get("/api/download/{job_id}")
-async def download(job_id: str, copy_to_source: bool = False):
-    job = transcription_service.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="任务未找到")
-    
-    if job.srt_path and os.path.exists(job.srt_path):
-        filename = os.path.basename(job.srt_path)
-        
-        # 如果需要复制到源文件目录
-        if copy_to_source:
-            # 获取原始文件路径的目录
-            source_dir = os.path.dirname(job.input_path)
-            source_srt_path = os.path.join(source_dir, filename)
-            
-            try:
-                # 复制SRT文件到源文件目录
-                shutil.copy2(job.srt_path, source_srt_path)
-                print(f"SRT文件已复制到源目录: {source_srt_path}")
-            except Exception as e:
-                print(f"复制到源目录失败: {e}")
-        
-        # 同时复制到输出目录
-        output_path = os.path.join(OUTPUT_DIR, filename)
-        try:
-            if not os.path.exists(output_path):
-                shutil.copy2(job.srt_path, output_path)
-            
-            return FileResponse(
-                path=output_path, 
-                filename=filename, 
-                media_type='text/plain; charset=utf-8'
-            )
-        except Exception as e:
-            # 如果复制失败，直接返回原文件
-            return FileResponse(
-                path=job.srt_path, 
-                filename=filename, 
-                media_type='text/plain; charset=utf-8'
-            )
-    
-    raise HTTPException(status_code=404, detail="字幕文件未生成")
-
-@app.post("/api/copy-result/{job_id}")
-async def copy_result_to_source(job_id: str):
-    """将转录结果复制到源文件目录"""
-    job = transcription_service.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="任务未找到")
-    
-    if not job.srt_path or not os.path.exists(job.srt_path):
-        raise HTTPException(status_code=404, detail="字幕文件未生成")
-    
-    try:
-        # 获取原始文件目录
-        if hasattr(job, 'original_path') and job.original_path:
-            source_dir = os.path.dirname(job.original_path)
-        else:
-            # 如果没有original_path，使用input_path的同级目录
-            source_dir = os.path.dirname(job.input_path)
-        
-        # 生成目标路径
-        srt_filename = os.path.basename(job.srt_path)
-        target_path = os.path.join(source_dir, srt_filename)
-        
-        # 复制文件
-        shutil.copy2(job.srt_path, target_path)
-        
-        return {
-            "success": True,
-            "message": f"字幕文件已复制到: {target_path}",
-            "target_path": target_path
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"复制文件失败: {str(e)}")
+# 所有转录相关的路由已经在transcription_routes.py中定义，这里的重复定义已被删除
+# 原有的/api/upload, /api/create-job, /api/start(已注释), /api/status/{job_id},
+# /api/download/{job_id}, /api/copy-result/{job_id}等端点现在都由transcription_routes.py处理
 
 @app.get("/api/ping")
 async def ping():
