@@ -4,7 +4,8 @@
 import os
 import uuid
 import shutil
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request
+from typing import Optional
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request, Body
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import json
@@ -13,8 +14,7 @@ from models.job_models import JobSettings, JobState
 from services.transcription_service import TranscriptionService
 from services.file_service import FileManagementService
 from services.sse_service import get_sse_manager
-
-router = APIRouter(prefix="/api", tags=["transcription"])
+from services.job_queue_service import get_queue_service  # 新增导入
 
 
 class TranscribeSettings(BaseModel):
@@ -40,6 +40,9 @@ def create_transcription_router(
     output_dir: str
 ):
     """创建转录任务路由"""
+
+    # 创建路由器实例
+    router = APIRouter(prefix="/api", tags=["transcription"])
 
     # 获取SSE管理器
     sse_manager = get_sse_manager()
@@ -91,18 +94,18 @@ def create_transcription_router(
 
     @router.post("/upload")
     async def upload_file(file: UploadFile = File(...)):
-        """上传文件并自动创建转录任务"""
+        """上传文件并自动创建转录任务（V2.2: 加入队列）"""
         try:
             # 验证文件类型
             if not file_service.is_supported_file(file.filename):
                 raise HTTPException(status_code=400, detail="不支持的文件格式")
-            
+
             # 保存用户原始文件路径信息
             original_filename = file.filename
-            
+
             # 将文件保存到input目录
             input_path = file_service.get_input_file_path(original_filename)
-            
+
             # 如果同名文件已存在，添加时间戳
             counter = 1
             base_name, ext = os.path.splitext(original_filename)
@@ -111,22 +114,27 @@ def create_transcription_router(
                 input_path = file_service.get_input_file_path(new_filename)
                 original_filename = new_filename
                 counter += 1
-            
+
             # 保存文件
             with open(input_path, "wb") as buffer:
                 content = await file.read()
                 buffer.write(content)
-            
-            # 创建转录任务
+
+            # 创建任务
             job_id = uuid.uuid4().hex
             settings = JobSettings()
-            transcription_service.create_job(original_filename, input_path, settings, job_id=job_id)
-            
+            job = transcription_service.create_job(original_filename, input_path, settings, job_id=job_id)
+
+            # 🔥 新增: 加入队列（而非直接启动）
+            queue_service = get_queue_service()
+            queue_service.add_job(job)
+
             return {
-                "job_id": job_id, 
+                "job_id": job_id,
                 "filename": original_filename,
                 "original_name": file.filename,
-                "message": "文件上传成功，转录任务已创建"
+                "message": "文件上传成功，已加入转录队列",
+                "queue_position": len(queue_service.queue)  # 新增: 队列位置
             }
         except HTTPException:
             raise
@@ -156,20 +164,28 @@ def create_transcription_router(
 
     @router.post("/start")
     async def start_job(job_id: str = Form(...), settings: str = Form(...)):
-        """启动转录任务（支持断点续传参数校验）"""
+        """启动转录任务（V2.2: 加入队列而非直接启动）"""
         try:
             from pathlib import Path
 
             settings_obj = TranscribeSettings(**json.loads(settings))
-            job = transcription_service.get_job(job_id)
+
+            # 获取队列服务
+            queue_service = get_queue_service()
+            job = queue_service.get_job(job_id)
+
+            if not job:
+                # 如果队列服务中没有，尝试从transcription_service获取
+                job = transcription_service.get_job(job_id)
+
             if not job:
                 raise HTTPException(status_code=404, detail="无效 job_id")
 
             # 检查是否有checkpoint（断点续传场景）
-            job_dir = Path(job.dir)
-            checkpoint_path = job_dir / "checkpoint.json"
+            job_dir = Path(job.dir) if job.dir else None
+            checkpoint_path = job_dir / "checkpoint.json" if job_dir else None
 
-            if checkpoint_path.exists():
+            if checkpoint_path and checkpoint_path.exists():
                 # 有checkpoint，需要校验参数并强制覆盖禁止修改的参数
                 try:
                     with open(checkpoint_path, 'r', encoding='utf-8') as f:
@@ -191,8 +207,41 @@ def create_transcription_router(
 
             # 应用设置
             job.settings = JobSettings(**settings_obj.dict())
-            transcription_service.start_job(job_id)
-            return {"job_id": job_id, "started": True}
+
+            # 🔥 关键改动: 如果任务不在队列中，加入队列
+            with queue_service.lock:
+                if job.status == "paused" or job.status == "failed":
+                    # 恢复任务：重新加入队列
+                    job.canceled = False
+                    job.paused = False
+                    job.error = None
+                    queue_service.queue.append(job_id)
+                    job.status = "queued"
+                    job.message = f"已加入队列 (位置: {len(queue_service.queue)})"
+                    # 确保任务在jobs字典中
+                    queue_service.jobs[job_id] = job
+                elif job.status == "uploaded" or job.status == "created":
+                    # 新任务：加入队列
+                    queue_service.queue.append(job_id)
+                    job.status = "queued"
+                    job.message = f"已加入队列 (位置: {len(queue_service.queue)})"
+                    # 确保任务在jobs字典中
+                    queue_service.jobs[job_id] = job
+                elif job.status == "queued":
+                    # 任务已在队列中
+                    queue_position = list(queue_service.queue).index(job_id) + 1 if job_id in queue_service.queue else -1
+                    job.message = f"已在队列中 (位置: {queue_position})"
+
+            # 保存队列状态并推送 SSE 通知（修复：之前缺少这一步导致前端收不到状态更新）
+            queue_service._save_state()
+            queue_service._notify_queue_change()
+            queue_service._notify_job_status(job_id, job.status)
+
+            return {
+                "job_id": job_id,
+                "started": True,
+                "queue_position": len(queue_service.queue)
+            }
         except HTTPException:
             raise
         except Exception as e:
@@ -200,23 +249,158 @@ def create_transcription_router(
 
     @router.post("/cancel/{job_id}")
     async def cancel_job(job_id: str, delete_data: bool = False):
-        """取消转录任务"""
-        job = transcription_service.get_job(job_id)
-        if not job:
+        """取消转录任务（V2.2: 使用队列服务）"""
+        queue_service = get_queue_service()
+        ok = queue_service.cancel_job(job_id, delete_data=delete_data)
+        if not ok:
             raise HTTPException(status_code=404, detail="任务未找到")
-
-        ok = transcription_service.cancel_job(job_id, delete_data=delete_data)
         return {"job_id": job_id, "canceled": ok, "data_deleted": delete_data}
 
     @router.post("/pause/{job_id}")
     async def pause_job(job_id: str):
-        """暂停转录任务（保存断点）"""
-        job = transcription_service.get_job(job_id)
-        if not job:
+        """暂停转录任务（V2.2: 使用队列服务）"""
+        queue_service = get_queue_service()
+        ok = queue_service.pause_job(job_id)
+        if not ok:
             raise HTTPException(status_code=404, detail="任务未找到")
-
-        ok = transcription_service.pause_job(job_id)
         return {"job_id": job_id, "paused": ok}
+
+    @router.post("/prioritize/{job_id}")
+    async def prioritize_job(job_id: str, mode: Optional[str] = None):
+        """
+        将任务移到队列头部（插队）
+
+        Args:
+            job_id: 任务ID
+            mode: 插队模式
+                - "gentle": 温和插队，放到队列头部，等当前任务完成后执行
+                - "force": 强制插队，暂停当前任务A -> 执行B -> B完成后自动恢复A
+                - None: 使用默认模式（可通过 /api/queue-settings 配置）
+        """
+        queue_service = get_queue_service()
+        result = queue_service.prioritize_job(job_id, mode=mode)
+
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=400,
+                detail=result.get("error", "无法优先此任务")
+            )
+
+        return {
+            "job_id": job_id,
+            "prioritized": True,
+            "mode": result.get("mode"),
+            "interrupted_job_id": result.get("interrupted_job_id"),
+            "queue_position": 1
+        }
+
+    @router.get("/queue-settings")
+    async def get_queue_settings():
+        """
+        获取队列设置
+
+        返回:
+            - default_prioritize_mode: 默认插队模式 ("gentle" 或 "force")
+        """
+        queue_service = get_queue_service()
+        return queue_service.get_settings()
+
+    @router.post("/queue-settings")
+    async def update_queue_settings(
+        default_prioritize_mode: Optional[str] = Body(None, embed=True)
+    ):
+        """
+        更新队列设置
+
+        Args:
+            default_prioritize_mode: 默认插队模式
+                - "gentle": 温和插队（默认）
+                - "force": 强制插队
+        """
+        queue_service = get_queue_service()
+        try:
+            settings = queue_service.update_settings(
+                default_prioritize_mode=default_prioritize_mode
+            )
+            return {
+                "success": True,
+                "settings": settings
+            }
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @router.post("/reorder-queue")
+    async def reorder_queue(job_ids: list = Body(..., embed=True)):
+        """
+        重新排序队列
+
+        Args:
+            job_ids: 按新顺序排列的任务ID列表
+        """
+        queue_service = get_queue_service()
+        ok = queue_service.reorder_queue(job_ids)
+
+        if not ok:
+            raise HTTPException(status_code=400, detail="重排队列失败（任务ID不匹配）")
+
+        return {
+            "reordered": True,
+            "queue": job_ids
+        }
+
+    @router.get("/queue-status")
+    async def get_queue_status():
+        """获取队列状态摘要"""
+        queue_service = get_queue_service()
+        return queue_service.get_queue_status()
+
+    @router.get("/events/global")
+    async def stream_global_events(request: Request):
+        """
+        全局SSE流 - 推送所有任务的状态变化 (V3.0)
+
+        事件类型:
+        - initial_state: 连接时的初始状态
+        - queue_update: 队列顺序变化
+        - job_status: 任务状态变化
+        - job_progress: 任务进度更新
+
+        注意:
+        - initial_state只返回精简列表（避免数据膨胀）
+        - 详细信息由前端按需查询
+        """
+        queue_service = get_queue_service()
+
+        def get_initial_state():
+            """返回精简版任务列表"""
+            with queue_service.lock:
+                jobs_summary = []
+                for jid, job in queue_service.jobs.items():
+                    jobs_summary.append({
+                        "id": jid,
+                        "status": job.status,
+                        "progress": job.progress,
+                        "filename": job.filename,
+                        "message": job.message
+                    })
+
+                return {
+                    "queue": list(queue_service.queue),
+                    "running": queue_service.running_job_id,
+                    "interrupted": queue_service.interrupted_job_id,
+                    "jobs": jobs_summary
+                }
+
+        # 订阅SSE流，频道名为 "global"
+        return StreamingResponse(
+            sse_manager.subscribe("global", request, initial_state_callback=get_initial_state),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
 
     @router.get("/incomplete-jobs")
     async def get_incomplete_jobs():
@@ -235,11 +419,28 @@ def create_transcription_router(
 
     @router.get("/status/{job_id}")
     async def get_job_status(job_id: str):
-        """获取任务状态"""
-        job = transcription_service.get_job(job_id)
+        """获取任务状态（V2.2: 包含队列位置）"""
+        queue_service = get_queue_service()
+        job = queue_service.get_job(job_id)
         if not job:
-            raise HTTPException(status_code=404, detail="任务未找到")
-        return job.to_dict()
+            # 如果队列服务中没有，尝试从transcription_service获取
+            job = transcription_service.get_job(job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="任务未找到")
+
+        # 返回状态（新增queue_position字段）
+        result = job.to_dict()
+
+        # 计算队列位置
+        with queue_service.lock:
+            if job_id in queue_service.queue:
+                result["queue_position"] = list(queue_service.queue).index(job_id) + 1
+            elif job_id == queue_service.running_job_id:
+                result["queue_position"] = 0  # 0表示正在执行
+            else:
+                result["queue_position"] = -1  # -1表示不在队列中
+
+        return result
 
     @router.get("/download/{job_id}")
     async def download_result(job_id: str, copy_to_source: bool = False):
