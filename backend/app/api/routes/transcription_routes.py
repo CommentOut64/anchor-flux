@@ -232,6 +232,11 @@ def create_transcription_router(
                     queue_position = list(queue_service.queue).index(job_id) + 1 if job_id in queue_service.queue else -1
                     job.message = f"已在队列中 (位置: {queue_position})"
 
+            # 保存队列状态并推送 SSE 通知（修复：之前缺少这一步导致前端收不到状态更新）
+            queue_service._save_state()
+            queue_service._notify_queue_change()
+            queue_service._notify_job_status(job_id, job.status)
+
             return {
                 "job_id": job_id,
                 "started": True,
@@ -348,6 +353,54 @@ def create_transcription_router(
         """获取队列状态摘要"""
         queue_service = get_queue_service()
         return queue_service.get_queue_status()
+
+    @router.get("/events/global")
+    async def stream_global_events(request: Request):
+        """
+        全局SSE流 - 推送所有任务的状态变化 (V3.0)
+
+        事件类型:
+        - initial_state: 连接时的初始状态
+        - queue_update: 队列顺序变化
+        - job_status: 任务状态变化
+        - job_progress: 任务进度更新
+
+        注意:
+        - initial_state只返回精简列表（避免数据膨胀）
+        - 详细信息由前端按需查询
+        """
+        queue_service = get_queue_service()
+
+        def get_initial_state():
+            """返回精简版任务列表"""
+            with queue_service.lock:
+                jobs_summary = []
+                for jid, job in queue_service.jobs.items():
+                    jobs_summary.append({
+                        "id": jid,
+                        "status": job.status,
+                        "progress": job.progress,
+                        "filename": job.filename,
+                        "message": job.message
+                    })
+
+                return {
+                    "queue": list(queue_service.queue),
+                    "running": queue_service.running_job_id,
+                    "interrupted": queue_service.interrupted_job_id,
+                    "jobs": jobs_summary
+                }
+
+        # 订阅SSE流，频道名为 "global"
+        return StreamingResponse(
+            sse_manager.subscribe("global", request, initial_state_callback=get_initial_state),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
 
     @router.get("/incomplete-jobs")
     async def get_incomplete_jobs():

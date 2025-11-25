@@ -294,17 +294,19 @@
     <div class="test-instructions">
       <el-divider content-position="left">测试说明</el-divider>
       <el-alert type="info" :closable="false" show-icon>
-        <template #title>V2.4 任务队列测试要点</template>
+        <template #title>V3.0 任务队列测试要点</template>
         <template #default>
           <ol style="margin: 8px 0; padding-left: 20px;">
+            <li><strong>[V3.0新增]</strong> 页面加载时自动连接全局SSE，实时接收队列状态更新</li>
             <li>从input目录选择3个视频文件，点击"创建任务并启动"</li>
-            <li>观察：应该只有1个任务显示"处理中"，其他显示"排队中"</li>
-            <li>测试<strong>温和插队</strong>：点击排队任务的"插队"按钮（默认温和模式）</li>
-            <li>观察：插队任务移到队列第1位，当前任务继续执行</li>
+            <li>观察：任务状态和队列位置<strong>实时更新</strong>，无需手动刷新</li>
+            <li>测试<strong>温和插队</strong>：点击排队任务的"插队"按钮</li>
+            <li>观察：队列顺序立即更新，当前任务继续执行</li>
             <li>测试<strong>强制插队</strong>：点击插队按钮右侧下拉菜单选择"强制插队"</li>
-            <li>观察：当前任务被暂停，插队任务开始执行</li>
-            <li>观察：插队任务完成后，被中断的任务自动恢复执行</li>
+            <li>观察：当前任务状态实时变为"暂停中"，插队任务开始执行</li>
+            <li>观察：插队任务完成后，被中断的任务自动恢复到队列头部</li>
             <li>修改"默认插队模式"设置，测试设置是否生效</li>
+            <li><strong>[降级测试]</strong> 断开后端连接，观察是否自动切换到轮询模式</li>
           </ol>
         </template>
       </el-alert>
@@ -317,6 +319,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CaretRight, Warning } from '@element-plus/icons-vue'
 import axios from 'axios'
+import { getQueueService } from '@/services/queueService'
 
 // input目录文件相关
 const inputFiles = ref([])
@@ -337,6 +340,10 @@ const pollTimer = ref(null)
 const defaultPrioritizeMode = ref('gentle')
 const loadingSettings = ref(false)
 
+// 全局SSE服务 (V3.0)
+const queueService = getQueueService()
+const useGlobalSSE = ref(false) // 是否使用全局SSE
+
 // 计算属性
 const queuedCount = computed(() => tasks.value.filter(t => t.status === 'queued').length)
 const runningCount = computed(() => tasks.value.filter(t => t.status === 'processing').length)
@@ -347,8 +354,10 @@ async function loadInputFiles() {
   loadingInputFiles.value = true
   try {
     const response = await axios.get('/api/files')
-    inputFiles.value = response.data
-    ElMessage.success(`从input目录加载了 ${response.data.length} 个文件`)
+    // 修复：后端返回 {files: [...], input_dir: "..."} 格式
+    const files = response.data.files || response.data || []
+    inputFiles.value = files
+    ElMessage.success(`从input目录加载了 ${files.length} 个文件`)
   } catch (error) {
     console.error('加载input文件失败:', error)
     ElMessage.error('加载input目录文件失败')
@@ -376,18 +385,25 @@ async function createJobsFromInput() {
   creatingJobs.value = true
   let successCount = 0
   let failCount = 0
+  const totalFiles = selectedInputFiles.value.length
 
-  for (const filename of selectedInputFiles.value) {
+  // 逐个创建任务，但添加超时和更好的错误处理
+  for (let i = 0; i < selectedInputFiles.value.length; i++) {
+    const filename = selectedInputFiles.value[i]
     try {
+      ElMessage.info(`正在创建任务 (${i + 1}/${totalFiles}): ${filename}`)
+
       // 创建任务
       const formData = new FormData()
       formData.append('filename', filename)
 
-      const response = await axios.post('/api/create-job', formData)
+      const response = await axios.post('/api/create-job', formData, {
+        timeout: 30000  // 30秒超时
+      })
       const jobData = response.data
 
       // 添加到任务列表
-      tasks.value.push({
+      const newTask = {
         job_id: jobData.job_id,
         filename: jobData.filename,
         status: 'created',
@@ -398,17 +414,24 @@ async function createJobsFromInput() {
         pausing: false,
         canceling: false,
         prioritizing: false
-      })
+      }
+      tasks.value.push(newTask)
 
-      // 自动启动任务
-      await startTask(tasks.value[tasks.value.length - 1])
-      successCount++
-      ElMessage.success(`任务 ${filename} 已创建并启动`)
+      // 自动启动任务（添加超时）
+      try {
+        await startTaskWithTimeout(newTask, 30000)
+        successCount++
+      } catch (startError) {
+        console.error(`启动任务失败 ${filename}:`, startError)
+        newTask.status = 'failed'
+        newTask.message = '启动失败: ' + (startError.message || '超时')
+        failCount++
+      }
 
     } catch (error) {
       failCount++
       console.error('创建任务失败:', error)
-      ElMessage.error(`文件 ${filename} 创建任务失败`)
+      ElMessage.error(`文件 ${filename} 创建任务失败: ${error.message || '未知错误'}`)
     }
   }
 
@@ -420,6 +443,24 @@ async function createJobsFromInput() {
 
   // 刷新队列状态
   setTimeout(() => refreshQueue(), 1000)
+}
+
+// 带超时的启动任务
+async function startTaskWithTimeout(task, timeoutMs = 30000) {
+  return new Promise(async (resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error('请求超时'))
+    }, timeoutMs)
+
+    try {
+      await startTask(task)
+      clearTimeout(timeoutId)
+      resolve()
+    } catch (error) {
+      clearTimeout(timeoutId)
+      reject(error)
+    }
+  })
 }
 
 // 文件处理
@@ -551,12 +592,14 @@ async function startTask(task) {
       word_timestamps: false
     }
 
-    // 发送开始请求
+    // 发送开始请求（添加超时）
     const formData = new FormData()
     formData.append('job_id', task.job_id)
     formData.append('settings', JSON.stringify(settings))
 
-    await axios.post('/api/start', formData)
+    await axios.post('/api/start', formData, {
+      timeout: 30000  // 30秒超时
+    })
 
     ElMessage.success(`任务 ${task.filename} 已加入队列`)
     task.status = 'queued'
@@ -565,7 +608,8 @@ async function startTask(task) {
     setTimeout(() => refreshQueue(), 1000)
   } catch (error) {
     console.error('启动任务失败:', error)
-    ElMessage.error('启动任务失败')
+    ElMessage.error('启动任务失败: ' + (error.message || '未知错误'))
+    throw error  // 重新抛出错误，让调用者知道失败了
   } finally {
     task.starting = false
   }
@@ -743,15 +787,187 @@ function stopPolling() {
   }
 }
 
+// ========== 全局SSE相关 (V3.0) ==========
+
+// 初始化全局SSE
+function initGlobalSSE() {
+  console.log('[TaskQueueTest] 尝试连接全局SSE...')
+
+  // 订阅初始状态
+  queueService.on('initial_state', (data) => {
+    console.log('[TaskQueueTest] 收到初始状态:', data)
+    useGlobalSSE.value = true
+
+    // 更新任务列表
+    updateTasksFromSSE(data)
+
+    // 停止轮询，改用SSE
+    stopPolling()
+    ElMessage.success('已连接全局SSE，实时更新已启用')
+  })
+
+  // 订阅队列更新
+  queueService.on('queue_update', (data) => {
+    console.log('[TaskQueueTest] 队列更新:', data)
+    // 更新队列位置
+    updateQueuePositions(data)
+  })
+
+  // 订阅任务状态
+  queueService.on('job_status', (data) => {
+    console.log('[TaskQueueTest] 任务状态:', data)
+    // 更新单个任务状态
+    updateTaskStatus(data)
+  })
+
+  // 订阅任务进度
+  queueService.on('job_progress', (data) => {
+    console.log('[TaskQueueTest] 任务进度:', data)
+    // 更新单个任务进度
+    updateTaskProgress(data)
+  })
+
+  // 错误处理
+  queueService.on('error', () => {
+    if (useGlobalSSE.value) {
+      ElMessage.warning('SSE连接中断，切换到轮询模式')
+      useGlobalSSE.value = false
+      startPolling()
+    }
+  })
+
+  // 连接SSE
+  queueService.connect()
+}
+
+// 从SSE数据更新任务列表
+function updateTasksFromSSE(data) {
+  const { jobs, queue, running } = data
+
+  // 创建任务映射
+  const tasksMap = new Map()
+
+  jobs.forEach(job => {
+    tasksMap.set(job.id, {
+      job_id: job.id,
+      filename: job.filename,
+      status: job.status,
+      progress: job.progress,
+      message: job.message,
+      queue_position: -1,
+      starting: false,
+      pausing: false,
+      canceling: false,
+      prioritizing: false
+    })
+  })
+
+  // 计算队列位置
+  queue.forEach((jobId, index) => {
+    const task = tasksMap.get(jobId)
+    if (task) {
+      task.queue_position = index + 1
+    }
+  })
+
+  // 设置正在执行的任务
+  if (running && tasksMap.has(running)) {
+    tasksMap.get(running).queue_position = 0
+  }
+
+  tasks.value = Array.from(tasksMap.values())
+}
+
+// 更新队列位置
+function updateQueuePositions(data) {
+  const { queue, running } = data
+
+  // 重置所有队列位置
+  tasks.value.forEach(task => {
+    task.queue_position = -1
+  })
+
+  // 设置队列位置
+  queue.forEach((jobId, index) => {
+    const task = tasks.value.find(t => t.job_id === jobId)
+    if (task) {
+      task.queue_position = index + 1
+    }
+  })
+
+  // 设置正在执行的任务
+  if (running) {
+    const task = tasks.value.find(t => t.job_id === running)
+    if (task) {
+      task.queue_position = 0
+    }
+  }
+}
+
+// 更新任务状态
+function updateTaskStatus(data) {
+  const { id, status, message, filename } = data
+
+  const task = tasks.value.find(t => t.job_id === id)
+  if (task) {
+    task.status = status
+    task.message = message
+    if (filename) {
+      task.filename = filename
+    }
+  } else {
+    // 新任务，添加到列表
+    tasks.value.push({
+      job_id: id,
+      filename: filename || id,
+      status: status,
+      message: message,
+      progress: 0,
+      queue_position: -1,
+      starting: false,
+      pausing: false,
+      canceling: false,
+      prioritizing: false
+    })
+  }
+}
+
+// 更新任务进度
+function updateTaskProgress(data) {
+  const { id, progress, message, phase } = data
+
+  const task = tasks.value.find(t => t.job_id === id)
+  if (task) {
+    task.progress = progress
+    if (message) {
+      task.message = message
+    }
+    if (phase) {
+      task.phase = phase
+    }
+  }
+}
+
 // 生命周期
 onMounted(() => {
   loadInputFiles() // 加载input目录文件
   loadPrioritizeSettings() // 加载插队设置
-  startPolling()
+
+  // 尝试连接全局SSE (V3.0)
+  initGlobalSSE()
+
+  // 如果SSE连接失败，使用轮询模式
+  setTimeout(() => {
+    if (!useGlobalSSE.value) {
+      console.log('[TaskQueueTest] SSE未连接，使用轮询模式')
+      startPolling()
+    }
+  }, 2000)
 })
 
 onUnmounted(() => {
   stopPolling()
+  queueService.disconnect()
 })
 </script>
 

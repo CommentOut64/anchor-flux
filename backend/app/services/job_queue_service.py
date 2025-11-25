@@ -57,7 +57,7 @@ class JobQueueService:
 
         # 控制信号
         self.stop_event = threading.Event()
-        self.lock = threading.Lock()  # 保护queue和running_job_id
+        self.lock = threading.RLock()  # 使用可重入锁，避免嵌套调用死锁
 
         # 持久化文件路径
         from core.config import config
@@ -97,6 +97,10 @@ class JobQueueService:
         # 保存队列状态
         self._save_state()
 
+        # 推送全局SSE通知
+        self._notify_queue_change()
+        self._notify_job_status(job.job_id, job.status)
+
     def get_job(self, job_id: str) -> Optional[JobState]:
         """获取任务状态"""
         return self.jobs.get(job_id)
@@ -130,6 +134,10 @@ class JobQueueService:
 
         # 保存队列状态
         self._save_state()
+
+        # 推送全局SSE通知
+        self._notify_queue_change()
+        self._notify_job_status(job_id, job.status)
         return True
 
     def cancel_job(self, job_id: str, delete_data: bool = False) -> bool:
@@ -167,6 +175,10 @@ class JobQueueService:
 
         # 保存队列状态
         self._save_state()
+
+        # 推送全局SSE通知
+        self._notify_queue_change()
+        self._notify_job_status(job_id, job.status)
         return result
 
     def _worker_loop(self):
@@ -210,6 +222,10 @@ class JobQueueService:
                         job.status = "processing"
                         job.message = "开始处理"
 
+                        # 推送队列变化和任务状态通知（在lock内，避免数据不一致）
+                        self._notify_queue_change()
+                        self._notify_job_status(job_id, "processing")
+
                 # 2. 如果没有任务，休眠后继续
                 if self.running_job_id is None:
                     time.sleep(1)
@@ -250,7 +266,7 @@ class JobQueueService:
                     # 资源大清洗
                     self._cleanup_resources()
 
-                    # 推送任务结束信号
+                    # 推送任务结束信号（单任务频道）
                     self.sse_manager.broadcast_sync(
                         f"job:{job.job_id}",
                         "signal",
@@ -260,6 +276,10 @@ class JobQueueService:
                             "status": job.status
                         }
                     )
+
+                    # 推送全局SSE通知
+                    self._notify_job_status(job.job_id, job.status)
+                    self._notify_queue_change()
 
                     # 5. 检查是否需要恢复被中断的任务（强制插队后的自动恢复）
                     self._try_restore_interrupted_job(finished_job_id, job.status)
@@ -352,6 +372,57 @@ class JobQueueService:
 
             # 清除中断标记
             self.interrupted_job_id = None
+
+    # ========== 全局SSE通知方法 (V3.0) ==========
+
+    def _notify_queue_change(self):
+        """推送队列变化事件到全局SSE"""
+        with self.lock:
+            data = {
+                "queue": list(self.queue),
+                "running": self.running_job_id,
+                "interrupted": self.interrupted_job_id,
+                "timestamp": time.time()
+            }
+
+        self.sse_manager.broadcast_sync("global", "queue_update", data)
+        logger.debug(f"[全局SSE] 推送队列变化: queue={len(data['queue'])}个, running={data['running']}")
+
+    def _notify_job_status(self, job_id: str, status: str):
+        """推送任务状态变化到全局SSE"""
+        job = self.jobs.get(job_id)
+        if not job:
+            return
+
+        data = {
+            "id": job_id,
+            "status": status,
+            "progress": job.progress,
+            "message": job.message,
+            "filename": job.filename,
+            "timestamp": time.time()
+        }
+
+        self.sse_manager.broadcast_sync("global", "job_status", data)
+        logger.debug(f"[全局SSE] 推送任务状态: {job_id[:8]}... -> {status}")
+
+    def _notify_job_progress(self, job_id: str):
+        """推送任务进度更新到全局SSE（低频调用，节省带宽）"""
+        job = self.jobs.get(job_id)
+        if not job:
+            return
+
+        data = {
+            "id": job_id,
+            "progress": job.progress,
+            "message": job.message,
+            "phase": job.phase,
+            "processed": job.processed,
+            "total": job.total,
+            "timestamp": time.time()
+        }
+
+        self.sse_manager.broadcast_sync("global", "job_progress", data)
 
     def _load_settings(self):
         """加载队列设置"""
@@ -586,6 +657,14 @@ class JobQueueService:
 
         # 保存队列状态
         self._save_state()
+
+        # 推送全局SSE通知
+        self._notify_queue_change()
+        self._notify_job_status(job_id, job.status)
+        if mode == "force" and result.get("interrupted_job_id"):
+            # 通知被中断的任务状态变化
+            self._notify_job_status(result["interrupted_job_id"], "pausing")
+
         return result
 
     def reorder_queue(self, job_ids: list) -> bool:
@@ -622,6 +701,10 @@ class JobQueueService:
 
         # 保存队列状态
         self._save_state()
+
+        # 推送全局SSE通知
+        self._notify_queue_change()
+
         return True
 
     def get_queue_status(self) -> dict:
