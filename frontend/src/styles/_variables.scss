@@ -1,68 +1,130 @@
 // ==============================================
-// 主题色彩系统 (深色模式优先)
+// 主题色彩系统 - 专业深色主题
+// 设计灵感：VS Code Dark+, GitHub Dark Dimmed, Figma Dark
 // ==============================================
 
-// 深色模式变量
-$bg-primary: #1e1e1e;
-$bg-secondary: #2d2d2d;
-$bg-tertiary: #3d3d3d;
-$text-normal: #cccccc;
-$text-muted: #888888;
-$text-bright: #ffffff;
-$accent-blue: #409eff;
-$accent-green: #67c23a;
-$accent-orange: #e6a23c;
-$accent-red: #f56c6c;
-$border-color: rgba(255, 255, 255, 0.1);
+// 核心背景色 - 深邃而不刺眼的层次
+$bg-base: #0d1117;        // 最深背景
+$bg-primary: #161b22;     // 主背景
+$bg-secondary: #21262d;   // 次级背景/卡片
+$bg-tertiary: #30363d;    // 三级背景/悬停
+$bg-elevated: #2d333b;    // 浮层背景
+$bg-overlay: rgba(0, 0, 0, 0.5);  // 遮罩层
 
-// CSS 变量定义 (支持主题切换)
+// 文本色 - 柔和对比度
+$text-primary: #e6edf3;   // 主要文本
+$text-normal: #c9d1d9;    // 普通文本
+$text-secondary: #8b949e; // 次要文本
+$text-muted: #6e7681;     // 更弱的文本
+$text-disabled: #484f58;  // 禁用文本
+
+// 主题强调色 - 精心调配的色板
+$primary: #58a6ff;        // 主色（蓝）
+$primary-hover: #79c0ff;  // 主色悬停
+$primary-dim: #388bfd;    // 主色深色
+
+$success: #3fb950;        // 成功（绿）
+$success-dim: #238636;    // 成功深色
+
+$warning: #d29922;        // 警告（橙）
+$warning-dim: #9e6a03;    // 警告深色
+
+$danger: #f85149;         // 危险（红）
+$danger-dim: #da3633;     // 危险深色
+
+$purple: #a371f7;         // 紫色（特殊强调）
+$pink: #db61a2;           // 粉色
+
+// 边框色
+$border-default: #30363d;
+$border-muted: #21262d;
+$border-subtle: rgba(240, 246, 252, 0.1);
+
+// 波形配色 - 专业音频编辑器风格
+$waveform-color: #58a6ff;
+$waveform-progress: #238636;
+$waveform-cursor: #f85149;
+$region-default: rgba(88, 166, 255, 0.25);
+$region-active: rgba(88, 166, 255, 0.4);
+$region-selected: rgba(163, 113, 247, 0.35);
+
+// CSS 变量定义
 :root {
-  // 背景色
+  // 背景层次
+  --bg-base: #{$bg-base};
   --bg-primary: #{$bg-primary};
   --bg-secondary: #{$bg-secondary};
   --bg-tertiary: #{$bg-tertiary};
+  --bg-elevated: #{$bg-elevated};
+  --bg-overlay: #{$bg-overlay};
 
-  // 文本色
+  // 文本层次
+  --text-primary: #{$text-primary};
   --text-normal: #{$text-normal};
+  --text-secondary: #{$text-secondary};
   --text-muted: #{$text-muted};
-  --text-bright: #{$text-bright};
+  --text-disabled: #{$text-disabled};
+
+  // 兼容旧变量
+  --text-bright: #{$text-primary};
 
   // 主题色
-  --accent-blue: #{$accent-blue};
-  --accent-green: #{$accent-green};
-  --accent-orange: #{$accent-orange};
-  --accent-red: #{$accent-red};
+  --primary: #{$primary};
+  --primary-hover: #{$primary-hover};
+  --primary-dim: #{$primary-dim};
+  --accent-blue: #{$primary};
 
-  // 边框色
-  --border-color: #{$border-color};
+  --success: #{$success};
+  --success-dim: #{$success-dim};
+  --accent-green: #{$success};
 
-  // 阴影
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.3);
-  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.3);
+  --warning: #{$warning};
+  --warning-dim: #{$warning-dim};
+  --accent-orange: #{$warning};
+
+  --danger: #{$danger};
+  --danger-dim: #{$danger-dim};
+  --accent-red: #{$danger};
+
+  --purple: #{$purple};
+  --pink: #{$pink};
+
+  // 边框
+  --border-default: #{$border-default};
+  --border-muted: #{$border-muted};
+  --border-subtle: #{$border-subtle};
+  --border-color: #{$border-default};
+
+  // 波形专用
+  --waveform-color: #{$waveform-color};
+  --waveform-progress: #{$waveform-progress};
+  --waveform-cursor: #{$waveform-cursor};
+  --region-default: #{$region-default};
+  --region-active: #{$region-active};
+  --region-selected: #{$region-selected};
+
+  // 阴影 - 精心设计的层次感
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 3px 6px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.4), 0 3px 8px rgba(0, 0, 0, 0.3);
+  --shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.5), 0 6px 16px rgba(0, 0, 0, 0.4);
+  --shadow-glow: 0 0 16px rgba(88, 166, 255, 0.15);
 
   // 圆角
-  --radius-sm: 4px;
+  --radius-xs: 3px;
+  --radius-sm: 6px;
   --radius-md: 8px;
   --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
 
   // 过渡
-  --transition-fast: 0.15s ease;
-  --transition-normal: 0.3s ease;
-}
+  --transition-fast: 0.1s ease;
+  --transition-normal: 0.2s ease;
+  --transition-slow: 0.3s ease;
 
-// 浅色模式覆盖
-[data-theme="light"] {
-  --bg-primary: #ffffff;
-  --bg-secondary: #f5f5f5;
-  --bg-tertiary: #e8e8e8;
-  --text-normal: #333333;
-  --text-muted: #666666;
-  --text-bright: #000000;
-  --border-color: rgba(0, 0, 0, 0.1);
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.1);
-  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.1);
-  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.15);
+  // 字体
+  --font-mono: 'JetBrains Mono', 'SF Mono', Monaco, Consolas, monospace;
 }
 
 // ==============================================
@@ -78,15 +140,16 @@ $spacing-xxl: 48px;
 // ==============================================
 // 字体系统
 // ==============================================
-$font-family-base: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-$font-family-mono: "SF Mono", Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+$font-family-base: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+$font-family-mono: "JetBrains Mono", "SF Mono", Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 
-$font-size-xs: 12px;
-$font-size-sm: 13px;
+$font-size-xs: 11px;
+$font-size-sm: 12px;
 $font-size-md: 14px;
 $font-size-lg: 16px;
-$font-size-xl: 18px;
+$font-size-xl: 20px;
 $font-size-xxl: 24px;
+$font-size-xxxl: 32px;
 
 // ==============================================
 // Z-Index 层级
@@ -98,3 +161,4 @@ $z-modal-backdrop: 400;
 $z-modal: 500;
 $z-popover: 600;
 $z-tooltip: 700;
+$z-notification: 800;
