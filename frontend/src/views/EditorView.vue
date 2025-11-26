@@ -11,6 +11,12 @@
         <div class="project-info">
           <h1 class="project-name">{{ projectName }}</h1>
           <span v-if="isDirty" class="unsaved-badge">未保存</span>
+          <!-- 转录状态指示器 -->
+          <span v-if="isTranscribing" class="transcribing-badge">
+            <span class="spinner-small"></span>
+            转录中 {{ taskProgress }}%
+          </span>
+          <span v-else-if="taskStatus === 'queued'" class="queued-badge">排队中</span>
         </div>
       </div>
 
@@ -63,8 +69,25 @@
       </div>
     </header>
 
+    <!-- 加载状态 -->
+    <div v-if="isLoading" class="loading-overlay">
+      <div class="loading-spinner"></div>
+      <span>加载项目中...</span>
+    </div>
+
+    <!-- 错误状态 -->
+    <div v-else-if="loadError" class="error-overlay">
+      <svg viewBox="0 0 24 24" fill="currentColor" class="error-icon">
+        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+      </svg>
+      <h3>加载失败</h3>
+      <p>{{ loadError }}</p>
+      <button class="retry-btn" @click="loadProject">重试</button>
+      <router-link to="/tasks" class="back-link">返回任务列表</router-link>
+    </div>
+
     <!-- 主编辑区域 -->
-    <main class="editor-main">
+    <main v-else class="editor-main">
       <!-- 左侧面板：视频 + 波形 -->
       <div class="panel panel-left" :style="{ width: leftPanelWidth + 'px' }">
         <div class="video-section">
@@ -145,10 +168,12 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, provide } from 'vue'
+import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
 import { useRouter, onBeforeRouteLeave } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { mediaApi, transcriptionApi } from '@/services/api'
+import { sseService } from '@/services/sseService'
 import PlaybackControls from '@/components/editor/PlaybackControls/index.vue'
 import VideoStage from '@/components/editor/VideoStage/index.vue'
 import SubtitleList from '@/components/editor/SubtitleList/index.vue'
@@ -165,6 +190,15 @@ const lastSaved = ref(null)
 const showExportMenu = ref(false)
 const leftPanelWidth = ref(600)
 const isResizing = ref(false)
+// 加载状态
+const isLoading = ref(true)
+const loadError = ref(null)
+// 任务状态（用于实时转录显示）
+const taskStatus = ref(null)     // 'created' | 'queued' | 'processing' | 'finished' | 'failed'
+const taskProgress = ref(0)      // 转录进度 0-100
+const isTranscribing = ref(false) // 是否正在转录中
+let sseUnsubscribe = null         // SSE 取消订阅函数
+let progressPollTimer = null      // 进度轮询定时器
 
 provide('editorContext', { jobId: props.jobId, saving })
 
@@ -178,49 +212,210 @@ const canRedo = computed(() => projectStore.canRedo)
 const validationErrors = computed(() => projectStore.validationErrors)
 const errorCount = computed(() => validationErrors.value.filter(e => e.severity === 'error').length)
 
+// 从后端加载项目数据（支持流式加载）
 async function loadProject() {
+  isLoading.value = true
+  loadError.value = null
+
   try {
-    const restored = await projectStore.restoreProject(props.jobId)
-    if (!restored) loadTestData()
+    // 1. 获取任务状态
+    console.log('[EditorView] 获取任务状态:', props.jobId)
+    const jobStatus = await transcriptionApi.getJobStatus(props.jobId, true)
+    console.log('[EditorView] 任务状态:', jobStatus)
+
+    taskStatus.value = jobStatus.status
+    taskProgress.value = jobStatus.progress || 0
+
+    // 设置元数据
+    projectStore.meta.jobId = props.jobId
+    projectStore.meta.filename = jobStatus.filename || '未知文件'
+    projectStore.meta.videoPath = mediaApi.getVideoUrl(props.jobId)
+    projectStore.meta.audioPath = mediaApi.getAudioUrl(props.jobId)
+    projectStore.meta.duration = jobStatus.media_status?.video?.duration || 0
+
+    // 2. 根据任务状态加载字幕数据
+    if (jobStatus.status === 'finished') {
+      // 任务已完成，加载完整 SRT
+      await loadCompletedSRT()
+    } else if (['processing', 'queued'].includes(jobStatus.status)) {
+      // 正在转录，加载已有的 segments 并订阅 SSE
+      isTranscribing.value = true
+      await loadTranscribingSegments()
+      subscribeSSE()
+      startProgressPolling()
+    } else if (jobStatus.status === 'created') {
+      // 任务刚创建，等待开始
+      isTranscribing.value = true
+      subscribeSSE()
+    } else if (jobStatus.status === 'failed') {
+      // 任务失败，尝试加载已有 segments
+      await loadTranscribingSegments()
+    }
+    // paused, canceled 状态也尝试加载已有内容
+
+    console.log('[EditorView] 项目加载完成')
   } catch (error) {
-    console.error('加载项目失败:', error)
+    console.error('[EditorView] 加载项目失败:', error)
+    loadError.value = error.message || '加载失败'
+  } finally {
+    isLoading.value = false
   }
 }
 
-function loadTestData() {
-  const testSRT = `1
-00:00:01,000 --> 00:00:04,000
-欢迎使用字幕编辑器
+// 加载已完成的 SRT 文件
+async function loadCompletedSRT() {
+  try {
+    const srtData = await mediaApi.getSRTContent(props.jobId)
+    console.log('[EditorView] SRT 数据:', srtData)
 
-2
-00:00:05,000 --> 00:00:08,500
-这是一个功能强大的在线工具
-
-3
-00:00:09,000 --> 00:00:12,000
-支持波形可视化和精确时间调整
-
-4
-00:00:13,000 --> 00:00:16,500
-让字幕编辑变得简单高效`
-
-  projectStore.importSRT(testSRT, {
-    jobId: props.jobId,
-    filename: '示例视频.mp4',
-    duration: 60,
-    videoPath: `/api/media/${props.jobId}/video`,
-    audioPath: `/api/media/${props.jobId}/audio`
-  })
+    projectStore.importSRT(srtData.content, {
+      jobId: props.jobId,
+      filename: srtData.filename || projectStore.meta.filename,
+      duration: projectStore.meta.duration,
+      videoPath: projectStore.meta.videoPath,
+      audioPath: projectStore.meta.audioPath
+    })
+    isTranscribing.value = false
+  } catch (error) {
+    console.warn('[EditorView] 加载 SRT 失败，尝试加载 segments:', error)
+    await loadTranscribingSegments()
+  }
 }
 
+// 加载正在转录的 segments（从 checkpoint）
+async function loadTranscribingSegments() {
+  try {
+    const textData = await transcriptionApi.getTranscriptionText(props.jobId)
+    console.log('[EditorView] 转录文字数据:', textData)
+
+    if (textData.segments && textData.segments.length > 0) {
+      // 将 segments 转换为 SRT 格式
+      const srtContent = segmentsToSRT(textData.segments)
+      projectStore.importSRT(srtContent, {
+        jobId: props.jobId,
+        filename: projectStore.meta.filename,
+        duration: projectStore.meta.duration,
+        videoPath: projectStore.meta.videoPath,
+        audioPath: projectStore.meta.audioPath
+      })
+      taskProgress.value = textData.progress?.percentage || 0
+    }
+  } catch (error) {
+    console.warn('[EditorView] 加载转录文字失败:', error)
+    // 没有数据也不报错，等待 SSE 推送
+  }
+}
+
+// 将 segments 转换为 SRT 格式字符串
+function segmentsToSRT(segments) {
+  if (!segments || segments.length === 0) return ''
+
+  return segments.map((seg, idx) => {
+    const start = formatSRTTime(seg.start)
+    const end = formatSRTTime(seg.end)
+    return `${idx + 1}\n${start} --> ${end}\n${seg.text || ''}\n`
+  }).join('\n')
+}
+
+// 格式化为 SRT 时间格式
+function formatSRTTime(seconds) {
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = Math.floor(seconds % 60)
+  const ms = Math.round((seconds % 1) * 1000)
+  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')},${ms.toString().padStart(3, '0')}`
+}
+
+// 订阅 SSE 实时进度
+function subscribeSSE() {
+  const sseUrl = `/api/stream/${props.jobId}`
+  console.log('[EditorView] 订阅 SSE:', sseUrl)
+
+  // 连接 SSE
+  sseService.connect(sseUrl)
+
+  // 监听进度事件
+  const handleProgress = (data) => {
+    console.log('[EditorView] SSE progress:', data)
+    taskProgress.value = data.percent || 0
+    taskStatus.value = data.status
+  }
+
+  // 监听信号事件（完成/失败）
+  const handleSignal = async (data) => {
+    console.log('[EditorView] SSE signal:', data)
+    if (data.signal === 'job_complete') {
+      // 转录完成，加载完整 SRT
+      isTranscribing.value = false
+      taskStatus.value = 'finished'
+      await loadCompletedSRT()
+      stopProgressPolling()
+    } else if (data.signal === 'job_failed') {
+      taskStatus.value = 'failed'
+      isTranscribing.value = false
+      stopProgressPolling()
+    }
+  }
+
+  // 监听消息
+  const handleMessage = (msg) => {
+    if (msg.type === 'progress') handleProgress(msg.data)
+    if (msg.type === 'signal') handleSignal(msg.data)
+  }
+
+  sseService.on('progress', handleProgress)
+  sseService.on('signal', handleSignal)
+  sseService.on('message', handleMessage)
+
+  // 保存取消订阅函数
+  sseUnsubscribe = () => {
+    sseService.off('progress', handleProgress)
+    sseService.off('signal', handleSignal)
+    sseService.off('message', handleMessage)
+    sseService.disconnect()
+  }
+}
+
+// 开始进度轮询（定期刷新 segments）
+function startProgressPolling() {
+  stopProgressPolling()
+  progressPollTimer = setInterval(async () => {
+    if (!isTranscribing.value) {
+      stopProgressPolling()
+      return
+    }
+    try {
+      await loadTranscribingSegments()
+    } catch (e) {
+      console.warn('[EditorView] 轮询刷新 segments 失败:', e)
+    }
+  }, 5000) // 每5秒刷新一次
+}
+
+// 停止进度轮询
+function stopProgressPolling() {
+  if (progressPollTimer) {
+    clearInterval(progressPollTimer)
+    progressPollTimer = null
+  }
+}
+
+// 保存项目到后端
 async function saveProject() {
   if (saving.value) return
   saving.value = true
   try {
+    // 生成 SRT 内容
+    const srtContent = projectStore.generateSRT()
+    // 调用后端 API 保存
+    await mediaApi.saveSRTContent(props.jobId, srtContent)
+    // 更新本地状态
     await projectStore.saveProject()
     lastSaved.value = Date.now()
+    console.log('[EditorView] 项目保存成功')
   } catch (error) {
-    console.error('保存失败:', error)
+    console.error('[EditorView] 保存失败:', error)
+    alert('保存失败: ' + (error.message || '未知错误'))
   } finally {
     saving.value = false
   }
@@ -345,6 +540,9 @@ onMounted(() => {
 onUnmounted(() => {
   document.removeEventListener('keydown', handleKeydown)
   document.removeEventListener('click', handleClickOutside)
+  // 清理 SSE 订阅和轮询
+  if (sseUnsubscribe) sseUnsubscribe()
+  stopProgressPolling()
 })
 </script>
 
@@ -359,6 +557,76 @@ onUnmounted(() => {
   background: var(--bg-base);
   color: var(--text-normal);
 }
+
+// 加载状态
+.loading-overlay {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: var(--text-muted);
+
+  .loading-spinner {
+    width: 48px;
+    height: 48px;
+    border: 3px solid var(--border-default);
+    border-top-color: var(--primary);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+}
+
+// 错误状态
+.error-overlay {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: var(--text-muted);
+  text-align: center;
+
+  .error-icon {
+    width: 64px;
+    height: 64px;
+    color: var(--danger);
+  }
+
+  h3 {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+  }
+
+  p {
+    font-size: 14px;
+    max-width: 400px;
+    margin: 0;
+  }
+
+  .retry-btn {
+    padding: 10px 24px;
+    background: var(--primary);
+    color: white;
+    border-radius: var(--radius-md);
+    font-size: 14px;
+    transition: background var(--transition-fast);
+    &:hover { background: var(--primary-hover); }
+  }
+
+  .back-link {
+    font-size: 13px;
+    color: var(--text-secondary);
+    text-decoration: underline;
+    &:hover { color: var(--text-primary); }
+  }
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .editor-header {
   @include flex-between;
@@ -384,6 +652,13 @@ onUnmounted(() => {
 
   .project-name { font-size: 16px; font-weight: 600; color: var(--text-primary); margin: 0; }
   .unsaved-badge { padding: 2px 8px; background: rgba(210, 153, 34, 0.15); color: var(--warning); font-size: 11px; border-radius: var(--radius-full); }
+  .transcribing-badge {
+    display: flex; align-items: center; gap: 6px;
+    padding: 2px 10px; background: rgba(88, 166, 255, 0.15); color: var(--primary);
+    font-size: 11px; border-radius: var(--radius-full);
+    .spinner-small { width: 12px; height: 12px; border: 2px solid rgba(88, 166, 255, 0.3); border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite; }
+  }
+  .queued-badge { padding: 2px 8px; background: rgba(139, 148, 158, 0.15); color: var(--text-muted); font-size: 11px; border-radius: var(--radius-full); }
 
   .btn-group { display: flex; background: var(--bg-secondary); border-radius: var(--radius-md); overflow: hidden; }
 
@@ -414,8 +689,6 @@ onUnmounted(() => {
     button { display: block; width: 100%; padding: 8px 12px; text-align: left; font-size: 13px; color: var(--text-normal); border-radius: var(--radius-sm); transition: background var(--transition-fast); &:hover { background: var(--bg-tertiary); } }
   }
 }
-
-@keyframes spin { to { transform: rotate(360deg); } }
 
 .editor-main { flex: 1; display: flex; overflow: hidden; }
 .panel { display: flex; flex-direction: column; overflow: hidden; }

@@ -37,7 +37,7 @@
       <div v-else class="task-grid">
         <div
           v-for="task in tasks"
-          :key="task.jobId"
+          :key="task.job_id"
           class="task-card"
           :class="`status-${task.status}`"
           @click="handleTaskClick(task)"
@@ -49,20 +49,20 @@
                 <path d="M8 5v14l11-7z"/>
               </svg>
             </div>
-            <div v-if="task.status !== 'completed'" class="status-overlay">
+            <div v-if="task.status !== 'finished'" class="status-overlay">
               <span class="status-text">{{ getStatusText(task.status) }}</span>
             </div>
           </div>
 
           <!-- 任务信息 -->
           <div class="task-info">
-            <h3 class="task-title" :title="task.fileName">{{ task.fileName }}</h3>
+            <h3 class="task-title" :title="task.filename">{{ task.filename }}</h3>
             <div class="task-meta">
               <span class="meta-item">
                 <el-icon><Clock /></el-icon>
                 {{ formatDate(task.createdAt) }}
               </span>
-              <span v-if="task.status === 'transcribing'" class="meta-item">
+              <span v-if="task.status === 'processing' || task.status === 'queued'" class="meta-item">
                 <el-icon><Loading /></el-icon>
                 {{ task.progress }}%
               </span>
@@ -70,7 +70,7 @@
 
             <!-- 进度条 -->
             <el-progress
-              v-if="task.status === 'transcribing'"
+              v-if="task.status === 'processing' || task.status === 'queued'"
               :percentage="task.progress"
               :show-text="false"
               :stroke-width="4"
@@ -80,17 +80,16 @@
           <!-- 操作按钮 -->
           <div class="task-actions" @click.stop>
             <el-button
-              v-if="task.status === 'completed'"
               type="primary"
               size="small"
-              @click="openEditor(task.jobId)"
+              @click="openEditor(task.job_id)"
             >
               <el-icon><Edit /></el-icon>
-              编辑
+              {{ task.status === 'finished' ? '编辑' : '查看' }}
             </el-button>
             <el-button
               size="small"
-              @click="deleteTask(task.jobId)"
+              @click="deleteTask(task.job_id)"
             >
               <el-icon><Delete /></el-icon>
               删除
@@ -142,6 +141,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Upload, UploadFilled, Edit, Delete, Clock, Loading } from '@element-plus/icons-vue'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { transcriptionApi } from '@/services/api'
 
 const router = useRouter()
 const taskStore = useUnifiedTaskStore()
@@ -169,32 +169,52 @@ async function handleUpload() {
 
   uploading.value = true
   try {
-    // 生成临时任务 ID (实际应该由后端返回)
-    const jobId = `job-${Date.now()}`
+    // 上传文件到后端
+    const { job_id, filename, queue_position } = await transcriptionApi.uploadFile(
+      selectedFile.value,
+      (percent) => {
+        // 上传进度回调
+        console.log(`上传进度: ${percent}%`)
+      }
+    )
 
     // 添加任务到 store
     taskStore.addTask({
-      job_id: jobId,
-      filename: selectedFile.value.name,
+      job_id,
+      filename,
       file_path: null,
       status: 'queued',
       phase: 'uploading',
       progress: 0,
-      message: '准备上传...',
-      settings: {
-        fileSize: selectedFile.value.size
-      }
+      message: `已加入队列 (位置: ${queue_position})`,
+      settings: {}
     })
 
-    ElMessage.success('任务已创建，准备上传...')
+    // 启动转录任务（使用默认设置）
+    const defaultSettings = {
+      model: 'medium',
+      compute_type: 'float16',
+      device: 'cuda',
+      batch_size: 16,
+      word_timestamps: false
+    }
+
+    await transcriptionApi.startJob(job_id, defaultSettings)
+
+    // 更新任务状态
+    taskStore.updateTask(job_id, {
+      status: 'queued',
+      phase: 'transcribing',
+      message: '等待转录...'
+    })
+
+    ElMessage.success('上传成功，已加入转录队列')
     showUploadDialog.value = false
     selectedFile.value = null
     uploadRef.value?.clearFiles()
-
-    // TODO: 实际的上传和转录逻辑应该调用后端 API
-    // await api.uploadVideo(jobId, selectedFile.value)
   } catch (error) {
-    ElMessage.error(`上传失败: ${error.message}`)
+    console.error('上传失败:', error)
+    ElMessage.error(`上传失败: ${error.message || '未知错误'}`)
   } finally {
     uploading.value = false
   }
@@ -205,11 +225,9 @@ function openEditor(jobId) {
   router.push(`/editor/${jobId}`)
 }
 
-// 处理任务卡片点击
+// 处理任务卡片点击 - 所有状态都可以打开编辑器查看
 function handleTaskClick(task) {
-  if (task.status === 'completed') {
-    openEditor(task.jobId)
-  }
+  openEditor(task.job_id)
 }
 
 // 删除任务
@@ -224,11 +242,17 @@ async function deleteTask(jobId) {
         type: 'warning'
       }
     )
-    
+
+    // 调用后端 API 删除任务数据
+    await transcriptionApi.cancelJob(jobId, true)
+
+    // 从本地 store 中删除
     await taskStore.deleteTask(jobId)
+
     ElMessage.success('任务已删除')
   } catch (error) {
     if (error !== 'cancel') {
+      console.error('删除任务失败:', error)
       ElMessage.error(`删除失败: ${error.message}`)
     }
   }
@@ -256,14 +280,16 @@ function formatDate(timestamp) {
   return date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
 }
 
-// 获取状态文本
+// 获取状态文本（与后端状态枚举保持一致）
 function getStatusText(status) {
   const statusMap = {
-    uploading: '上传中',
-    transcribing: '转录中',
-    editing: '编辑中',
-    completed: '已完成',
-    failed: '失败'
+    created: '已创建',
+    queued: '排队中',
+    processing: '转录中',
+    paused: '已暂停',
+    finished: '已完成',
+    failed: '失败',
+    canceled: '已取消'
   }
   return statusMap[status] || status
 }
@@ -375,21 +401,12 @@ onMounted(() => {
   border-radius: var(--radius-lg);
   overflow: hidden;
   transition: all var(--transition-normal);
-  cursor: pointer;
+  cursor: pointer;  // 所有状态都可点击
 
   &:hover {
     border-color: var(--primary);
     box-shadow: var(--shadow-md);
     transform: translateY(-2px);
-  }
-
-  &.status-completed:hover {
-    cursor: pointer;
-  }
-
-  &.status-transcribing,
-  &.status-uploading {
-    cursor: default;
   }
 
   .task-thumbnail {

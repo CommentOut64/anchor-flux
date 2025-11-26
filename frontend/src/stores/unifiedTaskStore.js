@@ -148,6 +148,18 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   }
 
   /**
+   * 通用更新任务方法（更新任意字段）
+   */
+  function updateTask(jobId, updates) {
+    const task = tasksMap.value.get(jobId)
+    if (task) {
+      Object.assign(task, updates, { updatedAt: Date.now() })
+      saveTasks()
+      console.log(`[UnifiedTaskStore] 任务已更新: ${jobId}`, updates)
+    }
+  }
+
+  /**
    * 加载任务到编辑器
    */
   async function loadTask(jobId) {
@@ -324,6 +336,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     updateTaskStatus,
     updateTaskProgress,
     updateTaskMessage,
+    updateTask,
     loadTask,
     saveCurrentTask,
     deleteTask,
