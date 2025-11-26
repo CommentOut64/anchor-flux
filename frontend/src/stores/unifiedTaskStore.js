@@ -1,0 +1,342 @@
+/**
+ * UnifiedTaskStore - 统一任务状态管理
+ *
+ * 负责管理所有任务的生命周期，从上传、转录到编辑、导出的完整流程
+ * 实现了任务状态的统一管理，确保转录和编辑工作流的无缝衔接
+ */
+import { defineStore } from 'pinia'
+import { ref, computed, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import { useProjectStore } from './projectStore'
+
+export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
+  const router = useRouter()
+
+  // ========== 任务阶段枚举 ==========
+  const TaskPhase = {
+    UPLOADING: 'uploading',      // 上传中
+    TRANSCRIBING: 'transcribing', // 转录中
+    EDITING: 'editing',          // 编辑中
+    EXPORTING: 'exporting',      // 导出中
+    COMPLETED: 'completed'       // 已完成
+  }
+
+  // 任务状态枚举（与后端一致）
+  const TaskStatus = {
+    CREATED: 'created',
+    QUEUED: 'queued',
+    PROCESSING: 'processing',
+    PAUSED: 'paused',
+    FINISHED: 'finished',
+    FAILED: 'failed',
+    CANCELED: 'canceled'
+  }
+
+  // ========== 核心数据 ==========
+  // 使用 Map 数据结构提高查找性能
+  const tasksMap = ref(new Map())
+  const activeTaskId = ref(null)
+  const currentTask = ref(null)
+
+  // ========== 计算属性 ==========
+  // 将 Map 转换为数组供组件使用
+  const tasks = computed(() => Array.from(tasksMap.value.values()))
+
+  // 活跃任务数量
+  const activeCount = computed(() =>
+    tasks.value.filter(t =>
+      ['queued', 'processing'].includes(t.status)
+    ).length
+  )
+
+  // 是否有正在运行的任务
+  const hasRunningTask = computed(() =>
+    tasks.value.some(t => t.status === 'processing')
+  )
+
+  // 最近任务列表（最多8个）
+  const recentTasks = computed(() => {
+    return tasks.value
+      .slice()
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 8)
+  })
+
+  // ========== 自动状态转换 ==========
+  // 监听任务状态变化，自动进入编辑模式
+  watch(() => tasksMap.value, (newTasks) => {
+    for (const [id, task] of newTasks) {
+      // 转录完成且进度100%，自动切换到编辑阶段
+      if (task.status === TaskStatus.FINISHED &&
+          task.phase === TaskPhase.TRANSCRIBING &&
+          task.progress === 100) {
+        console.log(`[UnifiedTaskStore] 任务 ${id} 转录完成，自动进入编辑模式`)
+        task.phase = TaskPhase.EDITING
+        // 自动跳转到编辑器
+        router.push(`/editor/${id}`)
+      }
+    }
+  }, { deep: true })
+
+  // ========== Actions ==========
+
+  /**
+   * 添加新任务
+   */
+  function addTask(taskData) {
+    const task = {
+      job_id: taskData.job_id,
+      filename: taskData.filename,
+      file_path: taskData.file_path || null,
+      status: taskData.status || TaskStatus.CREATED,
+      phase: taskData.phase || TaskPhase.UPLOADING,
+      progress: taskData.progress || 0,
+      message: taskData.message || '',
+      settings: taskData.settings || null,
+      createdAt: taskData.createdAt || Date.now(),
+      updatedAt: Date.now(),
+      isDirty: false
+    }
+
+    tasksMap.value.set(task.job_id, task)
+    saveTasks()
+    console.log(`[UnifiedTaskStore] 任务已添加: ${task.job_id}`)
+  }
+
+  /**
+   * 获取任务
+   */
+  function getTask(jobId) {
+    return tasksMap.value.get(jobId)
+  }
+
+  /**
+   * 更新任务状态
+   */
+  function updateTaskStatus(jobId, status) {
+    const task = tasksMap.value.get(jobId)
+    if (task) {
+      task.status = status
+      task.updatedAt = Date.now()
+      saveTasks()
+      console.log(`[UnifiedTaskStore] 任务状态已更新: ${jobId} -> ${status}`)
+    }
+  }
+
+  /**
+   * 更新任务进度
+   */
+  function updateTaskProgress(jobId, progress, status) {
+    const task = tasksMap.value.get(jobId)
+    if (task) {
+      task.progress = progress
+      if (status) task.status = status
+      task.updatedAt = Date.now()
+      // 进度更新频繁，不立即保存到 localStorage
+    }
+  }
+
+  /**
+   * 更新任务消息
+   */
+  function updateTaskMessage(jobId, message) {
+    const task = tasksMap.value.get(jobId)
+    if (task) {
+      task.message = message
+      task.updatedAt = Date.now()
+    }
+  }
+
+  /**
+   * 加载任务到编辑器
+   */
+  async function loadTask(jobId) {
+    const task = tasksMap.value.get(jobId)
+    if (!task) {
+      console.error(`[UnifiedTaskStore] 任务未找到: ${jobId}`)
+      return false
+    }
+
+    if (task.status !== TaskStatus.FINISHED) {
+      console.warn(`[UnifiedTaskStore] 任务状态异常: ${task.status}`)
+      return false
+    }
+
+    // 设置当前任务
+    currentTask.value = task
+    activeTaskId.value = jobId
+
+    // 自动跳转到编辑器
+    if (router.currentRoute.value.path !== `/editor/${jobId}`) {
+      router.push(`/editor/${jobId}`)
+    }
+
+    console.log(`[UnifiedTaskStore] 任务已加载: ${jobId}`)
+    return true
+  }
+
+  /**
+   * 保存当前任务
+   */
+  async function saveCurrentTask() {
+    if (!currentTask.value) {
+      console.warn('[UnifiedTaskStore] 无当前任务')
+      return
+    }
+
+    // 调用 ProjectStore 的保存逻辑
+    const projectStore = useProjectStore()
+    await projectStore.saveProject()
+
+    currentTask.value.isDirty = false
+    console.log(`[UnifiedTaskStore] 当前任务已保存: ${currentTask.value.job_id}`)
+  }
+
+  /**
+   * 删除任务
+   */
+  function deleteTask(jobId) {
+    tasksMap.value.delete(jobId)
+    saveTasks()
+    console.log(`[UnifiedTaskStore] 任务已删除: ${jobId}`)
+  }
+
+  /**
+   * 清空所有任务
+   */
+  function clearAllTasks() {
+    tasksMap.value.clear()
+    saveTasks()
+    console.log('[UnifiedTaskStore] 所有任务已清空')
+  }
+
+  /**
+   * 清理过期任务（超过7天）
+   */
+  function cleanupOldTasks() {
+    const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000
+    const now = Date.now()
+    let cleanedCount = 0
+
+    for (const [jobId, task] of tasksMap.value) {
+      if (now - task.updatedAt > SEVEN_DAYS) {
+        tasksMap.value.delete(jobId)
+        cleanedCount++
+      }
+    }
+
+    if (cleanedCount > 0) {
+      saveTasks()
+      console.log(`[UnifiedTaskStore] 已清理 ${cleanedCount} 个过期任务`)
+    }
+  }
+
+  // ========== 持久化 ==========
+
+  /**
+   * 保存任务列表到 localStorage
+   */
+  function saveTasks() {
+    try {
+      const tasksArray = Array.from(tasksMap.value.values())
+      localStorage.setItem('task-list', JSON.stringify(tasksArray))
+    } catch (error) {
+      console.error('[UnifiedTaskStore] 保存任务列表失败:', error)
+    }
+  }
+
+  /**
+   * 从 localStorage 恢复任务列表
+   */
+  function restoreTasks() {
+    try {
+      const saved = localStorage.getItem('task-list')
+      if (saved) {
+        const tasksArray = JSON.parse(saved)
+        tasksMap.value = new Map(tasksArray.map(t => [t.job_id, t]))
+        console.log(`[UnifiedTaskStore] 已恢复 ${tasksArray.length} 个任务`)
+      }
+    } catch (error) {
+      console.error('[UnifiedTaskStore] 恢复任务列表失败:', error)
+    }
+  }
+
+  // ========== 批量操作 ==========
+
+  /**
+   * 批量更新任务
+   */
+  function updateMultipleTasks(updates) {
+    updates.forEach(({ jobId, ...data }) => {
+      const task = tasksMap.value.get(jobId)
+      if (task) {
+        Object.assign(task, data, { updatedAt: Date.now() })
+      }
+    })
+    saveTasks()
+  }
+
+  /**
+   * 获取指定状态的任务
+   */
+  function getTasksByStatus(status) {
+    return tasks.value.filter(t => t.status === status)
+  }
+
+  /**
+   * 获取指定阶段的任务
+   */
+  function getTasksByPhase(phase) {
+    return tasks.value.filter(t => t.phase === phase)
+  }
+
+  // ========== 初始化 ==========
+  // 页面加载时恢复任务列表
+  restoreTasks()
+
+  // 自动清理过期任务（启动时执行一次）
+  cleanupOldTasks()
+
+  // 监听任务变化，自动保存（防抖）
+  watch(tasksMap, () => {
+    saveTasks()
+  }, { deep: true })
+
+  return {
+    // 枚举
+    TaskPhase,
+    TaskStatus,
+
+    // 状态
+    tasks,
+    tasksMap,
+    activeTaskId,
+    currentTask,
+
+    // 计算属性
+    activeCount,
+    hasRunningTask,
+    recentTasks,
+
+    // 操作方法
+    addTask,
+    getTask,
+    updateTaskStatus,
+    updateTaskProgress,
+    updateTaskMessage,
+    loadTask,
+    saveCurrentTask,
+    deleteTask,
+    clearAllTasks,
+    cleanupOldTasks,
+
+    // 批量操作
+    updateMultipleTasks,
+    getTasksByStatus,
+    getTasksByPhase,
+
+    // 持久化
+    saveTasks,
+    restoreTasks
+  }
+})

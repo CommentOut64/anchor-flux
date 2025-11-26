@@ -7,14 +7,21 @@ import { createRouter, createWebHistory } from 'vue-router'
 const routes = [
   {
     path: '/',
-    redirect: '/test'
+    redirect: '/store-test'
   },
   {
-    // 测试页面 - 用于验证服务层功能
+    // 阶段1测试页面 - 用于验证服务层功能
     path: '/test',
     name: 'TestView',
     component: () => import('@/views/TestView.vue'),
     meta: { title: '服务测试' }
+  },
+  {
+    // 阶段2测试页面 - 用于验证状态管理层功能
+    path: '/store-test',
+    name: 'StoreTestView',
+    component: () => import('@/views/StoreTestView.vue'),
+    meta: { title: 'Store测试' }
   },
   {
     // 任务列表页 (阶段5实现)
