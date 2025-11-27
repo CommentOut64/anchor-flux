@@ -5,9 +5,10 @@
  * 实现了撤销/重做、自动保存、智能问题检测等功能
  */
 import { defineStore } from "pinia";
-import { ref, computed, watch } from "vue";
+import { ref, computed, watch, toRaw } from "vue";
 import { useRefHistory } from "@vueuse/core";
 import localforage from "localforage";
+import smartSaver from "@/services/SmartSaver";
 
 export const useProjectStore = defineStore("project", () => {
   // ========== 1. 项目元数据 ==========
@@ -135,21 +136,42 @@ export const useProjectStore = defineStore("project", () => {
     return errors;
   });
 
-  // ========== 7. 多级缓存策略 ==========
+  // ========== 7. 智能保存系统 ==========
   // 内存缓存（热数据）
   const memoryCache = new Map();
   const MAX_MEMORY_CACHE = 10; // 最多缓存10个任务的数据
 
-  // 自动保存到 IndexedDB（冷数据持久化）
+  // 标记是否正在进行保存后的状态更新（避免循环触发）
+  let isUpdatingAfterSave = false;
+
+  // 配置智能保存回调
+  smartSaver.onSaveSuccess = (jobId) => {
+    console.log("[ProjectStore] 自动保存成功:", jobId);
+    // 使用标记避免循环触发 watch
+    isUpdatingAfterSave = true;
+    meta.value.lastSaved = Date.now();
+    meta.value.isDirty = false;
+    // 重置每个字幕的 isDirty 标记
+    subtitles.value.forEach((s) => (s.isDirty = false));
+    isUpdatingAfterSave = false;
+  };
+
+  smartSaver.onSaveError = (error, jobId) => {
+    console.error("[ProjectStore] 自动保存失败:", jobId, error);
+  };
+
+  // 监听数据变化，触发智能保存
   watch(
     [subtitles, meta],
-    async () => {
+    () => {
+      // 跳过保存后的状态更新触发
+      if (isUpdatingAfterSave) return;
       if (!meta.value.jobId) return;
 
-      // 先写入内存缓存
+      // 更新内存缓存
       memoryCache.set(meta.value.jobId, {
-        subtitles: subtitles.value,
-        meta: meta.value,
+        subtitles: toRaw(subtitles.value),
+        meta: toRaw(meta.value),
       });
 
       // 限制内存缓存大小（LRU淘汰）
@@ -158,22 +180,14 @@ export const useProjectStore = defineStore("project", () => {
         memoryCache.delete(firstKey);
       }
 
-      // 异步写入IndexedDB
-      try {
-        await localforage.setItem(`project-${meta.value.jobId}`, {
-          subtitles: subtitles.value,
-          meta: meta.value,
-          savedAt: Date.now(),
-        });
-        console.log("[ProjectStore] 项目自动保存成功");
-      } catch (error) {
-        console.error("[ProjectStore] 自动保存失败:", error);
-      }
+      // 触发智能保存
+      smartSaver.save({
+        jobId: meta.value.jobId,
+        subtitles: subtitles.value,
+        meta: meta.value,
+      });
     },
-    {
-      deep: true,
-      throttle: 3000, // 3秒节流，避免频繁写入
-    }
+    { deep: true }
   );
 
   // ========== 8. Actions ==========
@@ -203,7 +217,7 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   /**
-   * 从 IndexedDB 恢复项目
+   * 从缓存/存储恢复项目
    */
   async function restoreProject(jobId) {
     try {
@@ -216,12 +230,12 @@ export const useProjectStore = defineStore("project", () => {
         return true;
       }
 
-      // 从 IndexedDB 恢复
-      const saved = await localforage.getItem(`project-${jobId}`);
+      // 使用智能保存系统恢复（支持 IndexedDB + localStorage 备份）
+      const saved = await smartSaver.restoreFromBackup(jobId);
       if (saved) {
         subtitles.value = saved.subtitles;
         meta.value = saved.meta;
-        console.log("[ProjectStore] 项目已从IndexedDB恢复");
+        console.log("[ProjectStore] 项目已从存储恢复");
         return true;
       }
       return false;
@@ -295,12 +309,19 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   /**
-   * 保存项目（持久化到后端）
+   * 保存项目（持久化到后端 + 本地强制保存）
    */
   async function saveProject() {
     // TODO: 调用后端API保存编辑后的字幕
     const srtContent = generateSRT();
     // await api.saveSubtitle(meta.value.jobId, srtContent)
+
+    // 强制立即保存到本地存储
+    await smartSaver.forceSave({
+      jobId: meta.value.jobId,
+      subtitles: subtitles.value,
+      meta: meta.value,
+    });
 
     meta.value.lastSaved = Date.now();
     meta.value.isDirty = false;

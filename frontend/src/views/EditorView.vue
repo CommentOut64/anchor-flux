@@ -245,7 +245,15 @@ async function loadProject() {
     projectStore.meta.audioPath = mediaApi.getAudioUrl(props.jobId)
     projectStore.meta.duration = jobStatus.media_status?.video?.duration || 0
 
-    // 2. 根据任务状态加载字幕数据
+    // 2. 尝试从本地存储恢复（优先使用本地编辑的数据）
+    const restored = await projectStore.restoreProject(props.jobId)
+    if (restored && projectStore.subtitles.length > 0) {
+      console.log('[EditorView] 从本地存储恢复成功，字幕数量:', projectStore.subtitles.length)
+      isTranscribing.value = false
+      return  // 使用本地数据，不再从后端加载
+    }
+
+    // 3. 本地无数据，根据任务状态从后端加载字幕数据
     if (jobStatus.status === 'finished') {
       // 任务已完成，加载完整 SRT
       await loadCompletedSRT()
@@ -554,10 +562,18 @@ function formatLastSaved(timestamp) {
   return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
-onBeforeRouteLeave((to, from) => {
+onBeforeRouteLeave(async (to, from) => {
+  // 如果有未保存的修改，自动保存后再离开
   if (isDirty.value) {
-    const answer = window.confirm('有未保存的修改，确定要离开吗?')
-    if (!answer) return false
+    try {
+      await projectStore.saveProject()
+      console.log('[EditorView] 离开前自动保存成功')
+    } catch (error) {
+      console.error('[EditorView] 离开前保存失败:', error)
+      // 保存失败时询问用户是否仍要离开
+      const answer = window.confirm('保存失败，确定要离开吗? 未保存的修改可能会丢失。')
+      if (!answer) return false
+    }
   }
 })
 
