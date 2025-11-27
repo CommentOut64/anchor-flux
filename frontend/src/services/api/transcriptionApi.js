@@ -259,6 +259,18 @@ class TranscriptionAPI {
   async getThumbnail(jobId) {
     return apiClient.get(`/api/media/${jobId}/thumbnail`)
   }
+
+  /**
+   * 重命名任务
+   * @param {string} jobId - 任务ID
+   * @param {string} title - 新的任务名称（为空时恢复使用 filename）
+   * @returns {Promise<{success: boolean, job_id: string, title: string, message: string}>}
+   */
+  async renameJob(jobId, title) {
+    return apiClient.post(`/api/rename-job/${jobId}`, {
+      title
+    })
+  }
 }
 
 // 导出单例实例

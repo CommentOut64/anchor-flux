@@ -202,7 +202,18 @@ let progressPollTimer = null      // 进度轮询定时器
 
 provide('editorContext', { jobId: props.jobId, saving })
 
-const projectName = computed(() => projectStore.meta.filename || '未命名项目')
+const projectName = computed(() => {
+  // 优先显示用户自定义的 title，否则显示文件名（去除扩展名）
+  if (projectStore.meta.title) {
+    return projectStore.meta.title
+  }
+  const filename = projectStore.meta.filename || '未命名项目'
+  const lastDotIndex = filename.lastIndexOf('.')
+  if (lastDotIndex > 0) {
+    return filename.substring(0, lastDotIndex)
+  }
+  return filename
+})
 const isDirty = computed(() => projectStore.isDirty)
 const totalSubtitles = computed(() => projectStore.totalSubtitles)
 const currentSubtitle = computed(() => projectStore.currentSubtitle)
@@ -229,6 +240,7 @@ async function loadProject() {
     // 设置元数据
     projectStore.meta.jobId = props.jobId
     projectStore.meta.filename = jobStatus.filename || '未知文件'
+    projectStore.meta.title = jobStatus.title || ''  // 加载用户自定义名称
     projectStore.meta.videoPath = mediaApi.getVideoUrl(props.jobId)
     projectStore.meta.audioPath = mediaApi.getAudioUrl(props.jobId)
     projectStore.meta.duration = jobStatus.media_status?.video?.duration || 0

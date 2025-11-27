@@ -18,6 +18,7 @@ export const useProjectStore = defineStore('project', () => {
     peaksPath: null,          // 波形峰值数据路径
     duration: 0,              // 视频总时长（秒）
     filename: '',             // 源文件名
+    title: '',                // 用户自定义任务名称
     videoFormat: null,        // 视频格式
     hasProxyVideo: false,     // 是否有 Proxy 视频
     lastSaved: Date.now(),    // 最后保存时间

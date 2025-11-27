@@ -40,7 +40,6 @@
           :key="task.job_id"
           class="task-card"
           :class="`status-${task.status}`"
-          @click="handleTaskClick(task)"
         >
           <!-- 视频缩略图 -->
           <div class="task-thumbnail">
@@ -77,7 +76,27 @@
 
           <!-- 任务信息 -->
           <div class="task-info">
-            <h3 class="task-title" :title="task.filename">{{ getTaskDisplayName(task.filename) }}</h3>
+            <!-- 可编辑的任务标题 -->
+            <div class="task-title-wrapper">
+              <input
+                v-if="editingTaskId === task.job_id"
+                ref="titleInputRef"
+                v-model="editingTitle"
+                class="task-title-input"
+                @blur="finishEditTitle(task)"
+                @keyup.enter="finishEditTitle(task)"
+                @keyup.esc="cancelEditTitle"
+              />
+              <h3
+                v-else
+                class="task-title task-title-link"
+                :title="getTaskDisplayName(task) + ' (点击查看，双击重命名)'"
+                @click="handleTitleClick(task)"
+                @dblclick.prevent="startEditTitle(task)"
+              >
+                {{ getTaskDisplayName(task) }}
+              </h3>
+            </div>
             <div class="task-meta">
               <span class="meta-item">
                 <el-icon><Clock /></el-icon>
@@ -99,7 +118,7 @@
           </div>
 
           <!-- 操作按钮 -->
-          <div class="task-actions" @click.stop>
+          <div class="task-actions">
             <el-button
               type="primary"
               size="small"
@@ -107,6 +126,12 @@
             >
               <el-icon><Edit /></el-icon>
               {{ task.status === 'finished' ? '编辑' : '查看' }}
+            </el-button>
+            <el-button
+              size="small"
+              @click="startEditTitle(task)"
+            >
+              重命名
             </el-button>
             <el-button
               size="small"
@@ -157,7 +182,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Upload, UploadFilled, Edit, Delete, Clock, Loading } from '@element-plus/icons-vue'
@@ -173,6 +198,12 @@ const uploading = ref(false)
 const uploadRef = ref(null)
 const selectedFile = ref(null)
 const thumbnailCache = ref({})  // 缩略图缓存，避免重复加载
+
+// 内联重命名相关
+const editingTaskId = ref(null)  // 当前正在编辑的任务ID
+const editingTitle = ref('')     // 编辑中的标题
+const originalTitle = ref('')    // 原始标题（用于恢复）
+const titleInputRef = ref(null)  // 输入框引用
 
 // 计算属性 - 使用 computed 包装确保响应式
 const tasks = computed(() => taskStore.tasks)
@@ -273,9 +304,21 @@ function openEditor(jobId) {
   router.push(`/editor/${jobId}`)
 }
 
-// 处理任务卡片点击 - 所有状态都可以打开编辑器查看
-function handleTaskClick(task) {
-  openEditor(task.job_id)
+// 处理标题单击 - 用于区分单击（跳转）和双击（重命名）
+let clickTimer = null
+function handleTitleClick(task) {
+  if (clickTimer) {
+    // 双击时清除单击定时器，让 dblclick 事件处理
+    clearTimeout(clickTimer)
+    clickTimer = null
+    return
+  }
+
+  // 延迟执行单击操作，给双击留出时间
+  clickTimer = setTimeout(() => {
+    clickTimer = null
+    openEditor(task.job_id)
+  }, 200)
 }
 
 // 删除任务
@@ -344,15 +387,86 @@ function getStatusText(status) {
   return statusMap[status] || status
 }
 
-// 去除文件扩展名（第五阶段修复：任务名显示）
-function getTaskDisplayName(filename) {
+// 去除文件扩展名（优先显示 title，否则显示 filename）
+function getTaskDisplayName(task) {
+  // 优先显示用户自定义的 title
+  if (task.title) {
+    return task.title
+  }
+
+  // 否则显示文件名（去除扩展名）
+  const filename = task.filename || ''
   if (!filename) return ''
+
   // 去除文件扩展名
   const lastDotIndex = filename.lastIndexOf('.')
   if (lastDotIndex > 0) {
     return filename.substring(0, lastDotIndex)
   }
   return filename
+}
+
+// 开始编辑任务标题
+function startEditTitle(task) {
+  editingTaskId.value = task.job_id
+  editingTitle.value = task.title || getTaskDisplayName(task)
+  originalTitle.value = editingTitle.value
+
+  // 等待 DOM 更新后聚焦输入框
+  nextTick(() => {
+    const inputs = document.querySelectorAll('.task-title-input')
+    const input = Array.from(inputs).find(el => el.closest('.task-card')?.querySelector('.task-title-input') === el)
+    if (input) {
+      input.focus()
+      input.select()
+    }
+  })
+}
+
+// 完成编辑任务标题
+async function finishEditTitle(task) {
+  if (editingTaskId.value !== task.job_id) return
+
+  const newTitle = editingTitle.value.trim()
+
+  // 如果标题为空，提示并恢复原名称
+  if (!newTitle) {
+    ElMessage.warning('任务名称不能为空')
+    editingTitle.value = originalTitle.value
+    editingTaskId.value = null
+    return
+  }
+
+  // 如果没有变化，直接关闭编辑
+  if (newTitle === originalTitle.value) {
+    editingTaskId.value = null
+    return
+  }
+
+  try {
+    // 调用 API 重命名任务
+    await transcriptionApi.renameJob(task.job_id, newTitle)
+
+    // 更新本地 store
+    taskStore.updateTask(task.job_id, {
+      title: newTitle
+    })
+
+    ElMessage.success('重命名成功')
+  } catch (error) {
+    console.error('重命名任务失败:', error)
+    ElMessage.error(`重命名失败: ${error.message || '未知错误'}`)
+    // 恢复原名称
+    editingTitle.value = originalTitle.value
+  } finally {
+    editingTaskId.value = null
+  }
+}
+
+// 取消编辑
+function cancelEditTitle() {
+  editingTitle.value = originalTitle.value
+  editingTaskId.value = null
 }
 
 // 组件挂载
@@ -521,14 +635,6 @@ async function getThumbnailUrl(jobId, forceReload = false) {
   border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   overflow: hidden;
-  transition: all var(--transition-normal);
-  cursor: pointer;  // 所有状态都可点击
-
-  &:hover {
-    border-color: var(--primary);
-    box-shadow: var(--shadow-md);
-    transform: translateY(-2px);
-  }
 
   .task-thumbnail {
     position: relative;
@@ -620,14 +726,43 @@ async function getThumbnailUrl(jobId, forceReload = false) {
   .task-info {
     padding: 16px;
 
+    .task-title-wrapper {
+      margin-bottom: 8px;
+    }
+
     .task-title {
       font-size: 15px;
       font-weight: 500;
       color: var(--text-primary);
-      margin: 0 0 8px;
+      margin: 0;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      cursor: pointer;
+
+      &.task-title-link {
+        &:hover {
+          color: var(--primary);
+          text-decoration: underline;
+        }
+      }
+    }
+
+    .task-title-input {
+      width: 100%;
+      font-size: 15px;
+      font-weight: 500;
+      color: var(--text-primary);
+      background: var(--bg-primary);
+      border: 1px solid var(--primary);
+      border-radius: var(--radius-sm);
+      padding: 4px 8px;
+      outline: none;
+      box-sizing: border-box;
+
+      &:focus {
+        box-shadow: 0 0 0 2px rgba(var(--primary-rgb), 0.2);
+      }
     }
 
     .task-meta {

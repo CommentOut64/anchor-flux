@@ -54,6 +54,7 @@ class JobState:
     srt_path: Optional[str] = None
     canceled: bool = False
     paused: bool = False  # 暂停标志
+    title: str = ""  # 用户自定义的任务名称，为空时使用 filename
 
     # 媒体状态（用于编辑器，转录完成后更新）
     media_status: Optional[MediaStatus] = None

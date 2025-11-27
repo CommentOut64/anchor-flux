@@ -392,6 +392,7 @@ def create_transcription_router(
                         "status": job.status,
                         "progress": job.progress,
                         "filename": job.filename,
+                        "title": job.title if hasattr(job, 'title') else "",  # 用户自定义名称
                         "message": job.message,
                         "created_time": job.createdAt if hasattr(job, 'createdAt') else None,
                         "phase": job.phase if hasattr(job, 'phase') else 'unknown'
@@ -458,11 +459,23 @@ def create_transcription_router(
                         except:
                             pass
 
+                    # 尝试从 state.json 读取 title
+                    title = ""
+                    state_file = job_dir / "state.json"
+                    if state_file.exists():
+                        try:
+                            with open(state_file, 'r', encoding='utf-8') as f:
+                                state_data = json_module.load(f)
+                                title = state_data.get('title', '')
+                        except:
+                            pass
+
                     jobs_summary.append({
                         "id": job_id,
                         "status": status,
                         "progress": min(progress, 100),
                         "filename": filename,
+                        "title": title,  # 用户自定义名称
                         "message": "已完成" if is_finished else "处理中",
                         "created_time": created_time,
                         "phase": phase
@@ -519,6 +532,7 @@ def create_transcription_router(
                 all_tasks[job_id] = {
                     "id": job.job_id,
                     "filename": job.filename,
+                    "title": job.title if hasattr(job, 'title') else "",  # 用户自定义名称
                     "status": job.status,
                     "progress": job.progress,
                     "message": job.message,
@@ -581,9 +595,21 @@ def create_transcription_router(
                     except:
                         pass
 
+                # 尝试从 state.json 读取 title
+                title = ""
+                state_file = job_dir / "state.json"
+                if state_file.exists():
+                    try:
+                        with open(state_file, 'r', encoding='utf-8') as f:
+                            state_data = json_module.load(f)
+                            title = state_data.get('title', '')
+                    except:
+                        pass
+
                 all_tasks[job_id] = {
                     "id": job_id,
                     "filename": filename,
+                    "title": title,  # 用户自定义名称
                     "status": status,
                     "progress": min(progress, 100),  # 确保不超过100
                     "message": "已完成" if is_finished else "处理中",
@@ -1004,5 +1030,69 @@ def create_transcription_router(
 
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"参数校验失败: {str(e)}")
+
+    @router.post("/rename-job/{job_id}")
+    async def rename_job(job_id: str, title: str = Body(..., embed=True)):
+        """
+        重命名任务
+
+        Args:
+            job_id: 任务ID
+            title: 新的任务名称（为空时恢复使用 filename）
+
+        Returns:
+            {
+                "success": bool,
+                "job_id": str,
+                "title": str,
+                "message": str
+            }
+        """
+        try:
+            # 从队列服务或转录服务获取任务
+            queue_service = get_queue_service()
+            job = queue_service.get_job(job_id)
+
+            if not job:
+                # 如果队列服务中没有，尝试从 jobs 目录恢复
+                job = transcription_service.get_job(job_id)
+
+            if not job:
+                raise HTTPException(status_code=404, detail="任务未找到")
+
+            # 更新 title 字段
+            job.title = title.strip() if title else ""
+
+            # 保存任务状态到文件
+            if job.dir:
+                from pathlib import Path
+                job_dir = Path(job.dir)
+                state_file = job_dir / "state.json"
+
+                try:
+                    state_data = job.to_dict()
+                    with open(state_file, 'w', encoding='utf-8') as f:
+                        json.dump(state_data, f, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    print(f"保存任务状态失败: {e}")
+
+            # 通知 SSE 订阅者任务信息已更新
+            sse_manager.broadcast_sync("global", "job_renamed", {
+                "job_id": job_id,
+                "title": job.title,
+                "filename": job.filename
+            })
+
+            return {
+                "success": True,
+                "job_id": job_id,
+                "title": job.title,
+                "message": "任务重命名成功"
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"重命名任务失败: {str(e)}")
 
     return router
