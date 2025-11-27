@@ -231,15 +231,15 @@ export const useProjectStore = defineStore('project', () => {
    * 更新字幕内容
    */
   function updateSubtitle(id, payload) {
-    const index = subtitles.value.findIndex(s => s.id === id)
-    if (index === -1) return
+    const index = subtitles.value.findIndex((s) => s.id === id);
+    if (index === -1) return;
 
     subtitles.value[index] = {
       ...subtitles.value[index],
       ...payload,
-      isDirty: true
-    }
-    meta.value.isDirty = true
+      isDirty: true,
+    };
+    meta.value.isDirty = true;
   }
 
   /**
