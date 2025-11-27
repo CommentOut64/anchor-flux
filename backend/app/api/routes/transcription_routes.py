@@ -367,30 +367,117 @@ def create_transcription_router(
         - job_progress: 任务进度更新
 
         注意:
-        - initial_state只返回精简列表（避免数据膨胀）
-        - 详细信息由前端按需查询
+        - initial_state返回所有任务（处理中 + 已完成）
+        - 避免客户端连接时漏掉完成任务的实时更新
         """
         queue_service = get_queue_service()
 
         def get_initial_state():
-            """返回精简版任务列表"""
+            """
+            返回所有任务列表（第二阶段修复：实时更新）
+            包含活跃任务 + 历史完成任务
+            """
+            from services.job_index_service import get_job_index_service
+            from core.config import config
+            from pathlib import Path
+            import json as json_module
+
+            jobs_summary = []
+
+            # 1. 添加活跃任务（从队列中）
             with queue_service.lock:
-                jobs_summary = []
                 for jid, job in queue_service.jobs.items():
                     jobs_summary.append({
                         "id": jid,
                         "status": job.status,
                         "progress": job.progress,
                         "filename": job.filename,
-                        "message": job.message
+                        "message": job.message,
+                        "created_time": job.createdAt if hasattr(job, 'createdAt') else None,
+                        "phase": job.phase if hasattr(job, 'phase') else 'unknown'
                     })
 
-                return {
-                    "queue": list(queue_service.queue),
-                    "running": queue_service.running_job_id,
-                    "interrupted": queue_service.interrupted_job_id,
-                    "jobs": jobs_summary
-                }
+                queue_list = list(queue_service.queue)
+                running_id = queue_service.running_job_id
+                interrupted_id = queue_service.interrupted_job_id
+
+            # 2. 添加历史完成任务（从 jobs 目录）
+            try:
+                jobs_root = Path(config.JOBS_DIR)
+                job_index = get_job_index_service(config.JOBS_DIR)
+                active_job_ids = set(jid for jid, _ in queue_service.jobs.items())
+
+                for job_dir in jobs_root.iterdir():
+                    if not job_dir.is_dir():
+                        continue
+
+                    job_id = job_dir.name
+                    if job_id in active_job_ids:
+                        # 已在活跃任务中，跳过
+                        continue
+
+                    # 尝试找到文件名
+                    filename = "未知文件"
+                    file_path = job_index.get_file_path(job_id)
+                    if file_path:
+                        filename = os.path.basename(file_path)
+                    else:
+                        # 从目录中找视频文件
+                        for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
+                            matches = list(job_dir.glob(f"*{ext}"))
+                            if matches:
+                                filename = matches[0].name
+                                break
+
+                    # 检查是否完成
+                    srt_files = list(job_dir.glob("*.srt"))
+                    is_finished = len(srt_files) > 0
+
+                    # 获取创建时间
+                    try:
+                        stat = job_dir.stat()
+                        created_time = int(stat.st_ctime * 1000)
+                    except:
+                        created_time = None
+
+                    # 尝试从 checkpoint 获取进度
+                    progress = 100 if is_finished else 0
+                    phase = 'editing' if is_finished else 'transcribing'
+                    status = 'finished' if is_finished else 'processing'
+
+                    checkpoint_path = job_dir / "checkpoint.json"
+                    if checkpoint_path.exists():
+                        try:
+                            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                                checkpoint_data = json_module.load(f)
+                                total_segments = checkpoint_data.get('total_segments', 0)
+                                processed_indices = checkpoint_data.get('processed_indices', [])
+                                if total_segments > 0:
+                                    progress = (len(processed_indices) / total_segments) * 100
+                                phase = checkpoint_data.get('phase', 'transcribing')
+                        except:
+                            pass
+
+                    jobs_summary.append({
+                        "id": job_id,
+                        "status": status,
+                        "progress": min(progress, 100),
+                        "filename": filename,
+                        "message": "已完成" if is_finished else "处理中",
+                        "created_time": created_time,
+                        "phase": phase
+                    })
+
+            except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.warning(f"加载历史任务失败: {e}")
+
+            return {
+                "queue": queue_list,
+                "running": running_id,
+                "interrupted": interrupted_id,
+                "jobs": jobs_summary
+            }
 
         # 订阅SSE流，频道名为 "global"
         return StreamingResponse(

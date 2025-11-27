@@ -44,9 +44,30 @@
         >
           <!-- 视频缩略图 -->
           <div class="task-thumbnail">
-            <div class="thumbnail-placeholder">
+            <img
+              v-if="thumbnailCache[task.job_id] && thumbnailCache[task.job_id] !== null"
+              :src="thumbnailCache[task.job_id]"
+              class="thumbnail-image"
+              alt="Video thumbnail"
+            />
+            <div
+              v-else
+              class="thumbnail-placeholder"
+              :class="{ 'clickable': thumbnailCache[task.job_id] === null }"
+              @click.stop="thumbnailCache[task.job_id] === null && getThumbnailUrl(task.job_id, true)"
+              :title="thumbnailCache[task.job_id] === null ? '点击重试' : ''"
+            >
               <svg viewBox="0 0 24 24" fill="currentColor">
                 <path d="M8 5v14l11-7z"/>
+              </svg>
+            </div>
+            <!-- 缩略图加载中 -->
+            <div
+              v-if="thumbnailCache[task.job_id] === undefined"
+              class="thumbnail-loading"
+            >
+              <svg class="loading-spinner" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" fill="none"/>
               </svg>
             </div>
             <div v-if="task.status !== 'finished'" class="status-overlay">
@@ -56,7 +77,7 @@
 
           <!-- 任务信息 -->
           <div class="task-info">
-            <h3 class="task-title" :title="task.filename">{{ task.filename }}</h3>
+            <h3 class="task-title" :title="task.filename">{{ getTaskDisplayName(task.filename) }}</h3>
             <div class="task-meta">
               <span class="meta-item">
                 <el-icon><Clock /></el-icon>
@@ -136,7 +157,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Upload, UploadFilled, Edit, Delete, Clock, Loading } from '@element-plus/icons-vue'
@@ -151,9 +172,27 @@ const showUploadDialog = ref(false)
 const uploading = ref(false)
 const uploadRef = ref(null)
 const selectedFile = ref(null)
+const thumbnailCache = ref({})  // 缩略图缓存，避免重复加载
 
-// 计算属性 - 直接使用 store 中的 tasks (已是 computed)
-const tasks = taskStore.tasks
+// 计算属性 - 使用 computed 包装确保响应式
+const tasks = computed(() => taskStore.tasks)
+
+// 监听任务列表变化，自动加载新增任务的缩略图
+watch(
+  () => tasks.value?.length,
+  (newLength) => {
+    if (newLength && tasks.value) {
+      tasks.value.forEach(task => {
+        // 只加载还没缓存的任务的缩略图
+        if (!(task.job_id in thumbnailCache.value)) {
+          setTimeout(() => {
+            getThumbnailUrl(task.job_id)
+          }, 100)
+        }
+      })
+    }
+  }
+)
 
 // 处理文件选择
 function handleFileChange(file) {
@@ -210,6 +249,12 @@ async function handleUpload() {
 
     // 修复：上传完成后立即从后端同步任务列表（确保 UI 及时更新）
     await taskStore.syncTasksFromBackend()
+
+    // 新增：延迟3秒后尝试加载新任务的缩略图（给后端时间处理视频）
+    setTimeout(() => {
+      console.log(`[TaskListView] 尝试为新任务 ${job_id} 加载缩略图`)
+      getThumbnailUrl(job_id, true)
+    }, 3000)
 
     ElMessage.success('上传成功，已加入转录队列')
     showUploadDialog.value = false
@@ -270,26 +315,19 @@ async function deleteTask(jobId) {
   }
 }
 
-// 格式化日期
+// 格式化日期 - 显示为 YYYY-MM-DD HH:mm 格式（第二阶段修复：实时更新）
 function formatDate(timestamp) {
   if (!timestamp) return ''
   const date = new Date(timestamp)
-  const now = new Date()
-  const diff = now - date
-  
-  // 1小时内
-  if (diff < 3600000) {
-    const minutes = Math.floor(diff / 60000)
-    return `${minutes} 分钟前`
-  }
-  
-  // 今天
-  if (date.toDateString() === now.toDateString()) {
-    return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
-  }
-  
-  // 其他
-  return date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
+
+  // 格式化为 YYYY-MM-DD HH:mm
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hours = String(date.getHours()).padStart(2, '0')
+  const minutes = String(date.getMinutes()).padStart(2, '0')
+
+  return `${year}-${month}-${day} ${hours}:${minutes}`
 }
 
 // 获取状态文本（与后端状态枚举保持一致）
@@ -306,15 +344,86 @@ function getStatusText(status) {
   return statusMap[status] || status
 }
 
+// 去除文件扩展名（第五阶段修复：任务名显示）
+function getTaskDisplayName(filename) {
+  if (!filename) return ''
+  // 去除文件扩展名
+  const lastDotIndex = filename.lastIndexOf('.')
+  if (lastDotIndex > 0) {
+    return filename.substring(0, lastDotIndex)
+  }
+  return filename
+}
+
 // 组件挂载
 onMounted(() => {
   // 任务列表在 store 初始化时已自动加载 (restoreTasks)
   // 无需手动调用
+
+  // 异步���载所有任务的缩略图（不阻塞UI）
+  if (tasks.value && tasks.value.length > 0) {
+    tasks.value.forEach(task => {
+      // 延迟加载缩略图，避免过多并发请求
+      setTimeout(() => {
+        getThumbnailUrl(task.job_id)
+      }, 100)
+    })
+  }
 })
+
+// 获取任务缩略图（带缓存和重试机制）
+async function getThumbnailUrl(jobId, forceReload = false) {
+  // 强制重新加载时清除缓存
+  if (forceReload && thumbnailCache.value[jobId]) {
+    delete thumbnailCache.value[jobId]
+  }
+
+  // 检查缓存（避免重复请求）
+  if (thumbnailCache.value[jobId] !== undefined && !forceReload) {
+    return thumbnailCache.value[jobId]
+  }
+
+  // 标记为加载中
+  thumbnailCache.value[jobId] = undefined
+
+  try {
+    const result = await transcriptionApi.getThumbnail(jobId)
+    const thumbnail = result.thumbnail || null
+
+    // 如果获取失败但视频可能还在处理中，标记为"待重试"而非永久失败
+    if (!thumbnail) {
+      const task = taskStore.getTask(jobId)
+      // 如果任务正在处理中，保持undefined状态以便后续重试
+      if (task && (task.status === 'processing' || task.status === 'queued')) {
+        console.log(`[TaskListView] 任务 ${jobId} 正在处理中，稍后重试加载缩略图`)
+        // 不缓存null，保持为undefined，允许后续重试
+        return null
+      }
+    }
+
+    thumbnailCache.value[jobId] = thumbnail
+    return thumbnail
+  } catch (error) {
+    console.warn(`获取缩略图失败 [${jobId}]:`, error)
+    // 失败时也设置为null（而非undefined），这样至少显示占位符
+    thumbnailCache.value[jobId] = null
+    return null
+  }
+}
 </script>
 
 <style lang="scss" scoped>
 @use '@/styles/variables' as *;
+
+// 加载动画
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
 
 .task-list-view {
   min-height: 100vh;
@@ -427,6 +536,16 @@ onMounted(() => {
     padding-top: 56.25%; // 16:9
     background: var(--bg-tertiary);
 
+    .thumbnail-image {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      background: var(--bg-tertiary);
+    }
+
     .thumbnail-placeholder {
       position: absolute;
       top: 0;
@@ -442,6 +561,40 @@ onMounted(() => {
         height: 64px;
         color: var(--text-disabled);
         opacity: 0.3;
+      }
+
+      &.clickable {
+        cursor: pointer;
+        transition: background var(--transition-fast);
+
+        &:hover {
+          background: rgba(0, 0, 0, 0.05);
+
+          svg {
+            opacity: 0.5;
+          }
+        }
+      }
+    }
+
+    .thumbnail-loading {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.1);
+      cursor: pointer;
+
+      .loading-spinner {
+        width: 40px;
+        height: 40px;
+        color: var(--primary);
+        opacity: 0.6;
+        animation: spin 2s linear infinite;
       }
     }
 

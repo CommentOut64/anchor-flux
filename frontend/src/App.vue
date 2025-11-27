@@ -41,27 +41,30 @@ onMounted(async () => {
     onInitialState(state) {
       console.log('[App] 全局初始状态:', state)
 
-      // 同步任务列表到 store
+      // 同步任务列表到 store（第二阶段修复：实时更新）
       if (state.jobs && Array.isArray(state.jobs)) {
         state.jobs.forEach(job => {
           // 检查 store 中是否已有此任务
           const existingTask = taskStore.getTask(job.id)
           if (!existingTask) {
-            // 添加新任务
+            // 添加新任务（包含完整信息）
             taskStore.addTask({
               job_id: job.id,
               filename: job.filename,
               status: job.status,
               progress: job.progress,
               message: job.message,
-              phase: job.status === 'finished' ? 'editing' : 'transcribing'
+              phase: job.phase || (job.status === 'finished' ? 'editing' : 'transcribing'),
+              createdAt: job.created_time || Date.now()
             })
           } else {
             // 更新现有任务
             taskStore.updateTask(job.id, {
               status: job.status,
               progress: job.progress,
-              message: job.message
+              message: job.message,
+              phase: job.phase || existingTask.phase,
+              createdAt: job.created_time || existingTask.createdAt
             })
           }
         })
@@ -105,7 +108,7 @@ onMounted(async () => {
     onJobProgress(jobId, percent, data) {
       console.log(`[App] 任务 ${jobId} 进度:`, percent)
 
-      // 更新 store 中的任务进度
+      // 更新 store 中的任务进度（实时更新卡片）
       taskStore.updateTaskProgress(jobId, percent, data.status)
 
       // 更新消息

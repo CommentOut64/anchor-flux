@@ -250,6 +250,15 @@ class TranscriptionAPI {
 
     return apiClient.post('/api/validate-resume-settings', formData)
   }
+
+  /**
+   * 获取任务缩略图（任务卡片展示用）
+   * @param {string} jobId - 任务ID
+   * @returns {Promise<{thumbnail: string|null, message: string}>} Base64编码的JPEG缩略图或null
+   */
+  async getThumbnail(jobId) {
+    return apiClient.get(`/api/media/${jobId}/thumbnail`)
+  }
 }
 
 // 导出单例实例

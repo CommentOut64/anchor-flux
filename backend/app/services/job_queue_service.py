@@ -142,7 +142,7 @@ class JobQueueService:
 
     def cancel_job(self, job_id: str, delete_data: bool = False) -> bool:
         """
-        取消任务
+        取消任务（支持删除已完成的任务）
 
         Args:
             job_id: 任务ID
@@ -152,7 +152,19 @@ class JobQueueService:
             bool: 是否成功
         """
         job = self.jobs.get(job_id)
+
+        # 如果任务不在队列服务中（可能是已完成的任务），直接调用transcription_service删除
         if not job:
+            if delete_data:
+                # 尝试通过transcription_service删除已完成的任务
+                try:
+                    result = self.transcription_service.cancel_job(job_id, delete_data=True)
+                    if result:
+                        # 推送全局SSE通知（通知前端任务已删除）
+                        self._notify_job_status(job_id, "canceled")
+                        return True
+                except Exception as e:
+                    logger.warning(f"删除任务 {job_id} 失败: {e}")
             return False
 
         with self.lock:
@@ -168,7 +180,6 @@ class JobQueueService:
 
         # 如果需要删除数据，调用transcription_service的清理逻辑
         if delete_data:
-            # 这里复用原有的清理逻辑
             result = self.transcription_service.cancel_job(job_id, delete_data=True)
         else:
             result = True

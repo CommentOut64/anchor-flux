@@ -103,15 +103,16 @@ def _serve_file_with_range(file_path: Path, request: Request, media_type: str):
     )
 
 
-async def _get_video_duration(video_path: Path) -> float:
-    """使用FFprobe获取视频时长"""
+async def _get_video_resolution(video_path: Path) -> tuple:
+    """使用FFprobe获取视频分辨率"""
     ffmpeg_cmd = config.get_ffmpeg_command()
     ffprobe_cmd = ffmpeg_cmd.replace('ffmpeg', 'ffprobe')
 
     cmd = [
         ffprobe_cmd, '-v', 'error',
-        '-show_entries', 'format=duration',
-        '-of', 'default=noprint_wrappers=1:nokey=1',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height',
+        '-of', 'json',
         str(video_path)
     ]
 
@@ -122,8 +123,62 @@ async def _get_video_duration(video_path: Path) -> float:
             stderr=asyncio.subprocess.PIPE
         )
         stdout, _ = await process.communicate()
-        return float(stdout.decode().strip())
+        data = json.loads(stdout.decode())
+        streams = data.get('streams', [])
+        if streams:
+            width = streams[0].get('width', 0)
+            height = streams[0].get('height', 0)
+            return (width, height)
     except:
+        pass
+    return (0, 0)
+
+
+async def _get_video_duration(video_path: Path) -> float:
+    """使用FFprobe获取视频时长"""
+    ffmpeg_cmd = config.get_ffmpeg_command()
+    ffprobe_cmd = ffmpeg_cmd.replace('ffmpeg', 'ffprobe')
+
+    # 检查视频文件是否存在
+    if not video_path.exists():
+        print(f"[media] 视频文件不存在: {video_path}")
+        return 0.0
+
+    cmd = [
+        ffprobe_cmd, '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        str(video_path)
+    ]
+    
+    print(f"[media] FFprobe 命令: {' '.join(cmd)}")
+
+    try:
+        # 使用同步 subprocess 来避免异步事件循环问题
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
+        
+        if result.returncode != 0:
+            print(f"[media] FFprobe 失败 (返回码 {result.returncode}): {result.stderr}")
+            return 0.0
+            
+        duration_str = result.stdout.strip()
+        if not duration_str:
+            print(f"[media] FFprobe 返回空时长，视频路径: {video_path}")
+            return 0.0
+        
+        print(f"[media] FFprobe 成功获取时长: {duration_str}秒")
+        return float(duration_str)
+    except subprocess.TimeoutExpired:
+        print(f"[media] FFprobe 超时，视频路径: {video_path}")
+        return 0.0
+    except Exception as e:
+        print(f"[media] 获取视频时长异常: {e}, 路径: {video_path}")
         return 0.0
 
 
@@ -394,10 +449,13 @@ async def _generate_sprite_thumbnails(video_path: Path, output_path: Path, count
     import base64
 
     ffmpeg_cmd = config.get_ffmpeg_command()
+    print(f"[media] 生成Sprite图，视频: {video_path}, FFmpeg: {ffmpeg_cmd}")
 
     # 获取视频时长
     duration = await _get_video_duration(video_path)
+    print(f"[media] Sprite - 视频时长: {duration}秒")
     if duration <= 0:
+        print(f"[media] Sprite - 无法获取时长，跳过Sprite生成")
         return None
 
     # 计算时间点
@@ -685,6 +743,112 @@ async def check_proxy_status(job_id: str):
     })
 
 
+@router.get("/{job_id}/thumbnail")
+async def get_thumbnail(job_id: str):
+    """
+    获取任务的单个缩略图（第一帧）用于任务卡片展示（第二阶段修复：实时更新）
+
+    Args:
+        job_id: 任务ID
+
+    Returns:
+        Base64编码的缩略图 or JSON占位符
+    """
+    job_dir = config.JOBS_DIR / job_id
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    # 检查缓存的缩略图文件
+    cached_thumbnail = job_dir / "thumbnail.jpg"
+    if cached_thumbnail.exists():
+        try:
+            import base64
+            with open(cached_thumbnail, 'rb') as f:
+                img_base64 = base64.b64encode(f.read()).decode('utf-8')
+            return JSONResponse({
+                "thumbnail": f"data:image/jpeg;base64,{img_base64}",
+                "cached": True
+            })
+        except:
+            pass  # 缓存读取失败，重新生成
+
+    try:
+        import base64
+
+        # 查找视频文件
+        video_file = _find_video_file(job_dir)
+        if not video_file:
+            proxy = job_dir / "proxy.mp4"
+            if proxy.exists():
+                video_file = proxy
+            else:
+                return JSONResponse({
+                    "thumbnail": None,
+                    "message": "视频文件不存在"
+                })
+
+        # 获取视频分辨率（决定缩略图大小）
+        width, height = await _get_video_resolution(video_file)
+
+        # 计算缩略图尺寸：只有4K及以上视频才压缩，其他保持原分辨率（但限制最大1920px）
+        if width > 3840:  # 4K视频
+            thumb_width = 1920
+        elif width > 1920:  # 大于1080p但不到4K
+            thumb_width = width  # 保持原分辨率
+        elif width > 0:
+            thumb_width = width  # 保持原分辨率
+        else:
+            thumb_width = 1280  # 默认值（无法检测分辨率时）
+
+        # 获取第一帧作为缩略图
+        ffmpeg_cmd = config.get_ffmpeg_command()
+
+        cmd = [
+            ffmpeg_cmd,
+            '-ss', '1',  # 从1秒开始（避免纯黑帧）
+            '-i', str(video_file),
+            '-vframes', '1',  # 只提取1帧
+            '-f', 'image2pipe',
+            '-vcodec', 'mjpeg',
+            '-vf', f'scale={thumb_width}:-1',  # 根据原视频分辨率设置宽度
+            '-q:v', '2',  # 高质量（2-5之间，数字越小质量越高）
+            '-'
+        ]
+
+        result = subprocess.run(
+            cmd, capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+            timeout=10
+        )
+
+        if result.returncode == 0 and result.stdout:
+            # 缓存到文件系统
+            try:
+                with open(cached_thumbnail, 'wb') as f:
+                    f.write(result.stdout)
+                print(f"[media] 缩略图已缓存: {job_id} (宽度: {thumb_width}px)")
+            except Exception as e:
+                print(f"[media] 缓存缩略图失败: {e}")
+
+            img_base64 = base64.b64encode(result.stdout).decode('utf-8')
+            return JSONResponse({
+                "thumbnail": f"data:image/jpeg;base64,{img_base64}",
+                "width": thumb_width,
+                "cached": False
+            })
+        else:
+            return JSONResponse({
+                "thumbnail": None,
+                "message": "无法生成缩略图"
+            })
+
+    except Exception as e:
+        return JSONResponse({
+            "thumbnail": None,
+            "message": str(e)
+        })
+
+
 @router.get("/{job_id}/thumbnails")
 async def get_thumbnails(job_id: str, count: int = 10, sprite: bool = True):
     """
@@ -744,11 +908,13 @@ async def get_thumbnails(job_id: str, count: int = 10, sprite: bool = True):
                 return JSONResponse(sprite_result)
 
         # 回退到单独缩略图模式
+        print(f"[media] 回退到单独缩略图模式，视频文件: {video_file}")
         ffmpeg_cmd = config.get_ffmpeg_command()
         duration = await _get_video_duration(video_file)
+        print(f"[media] 获取到视频时长: {duration}秒")
 
         if duration <= 0:
-            raise HTTPException(status_code=500, detail="无法获取视频时长")
+            raise HTTPException(status_code=500, detail=f"无法获取视频时长，视频路径: {video_file}")
 
         interval = duration / count
         thumbnails = []
