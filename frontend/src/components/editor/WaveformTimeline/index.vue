@@ -165,8 +165,13 @@ async function initWavesurfer() {
       fillParent: true,
       barWidth: 2,
       barGap: 1,
-      barRadius: 2
+      barRadius: 2,
+      // 静音波形音频，避免与视频声音重叠
+      media: document.createElement('audio'),
     })
+    
+    // 确保 WaveSurfer 静音（音频由视频播放器控制）
+    wavesurfer.setMuted(true)
 
     // 设置事件监听
     setupWavesurferEvents()
@@ -228,7 +233,8 @@ function setupWavesurferEvents() {
 function setupRegionEvents() {
   if (!regionsPlugin) return
 
-  regionsPlugin.on('region-update-end', (region) => {
+  // WaveSurfer.js 7.x 使用 'region-updated' 事件
+  regionsPlugin.on('region-updated', (region) => {
     if (isUpdatingRegions.value) return
     projectStore.updateSubtitle(region.id, {
       start: region.start,
@@ -355,14 +361,18 @@ function formatTime(seconds) {
 }
 
 // 监听字幕变化
-watch(() => projectStore.subtitles, () => {
-  if (isReady.value && !isUpdatingRegions.value) {
-    clearTimeout(regionUpdateTimer)
-    regionUpdateTimer = setTimeout(() => {
-      renderSubtitleRegions()
-    }, 300)
-  }
-}, { deep: true })
+watch(
+  () => [...projectStore.subtitles],
+  () => {
+    if (isReady.value && !isUpdatingRegions.value) {
+      clearTimeout(regionUpdateTimer)
+      regionUpdateTimer = setTimeout(() => {
+        renderSubtitleRegions()
+      }, 100)
+    }
+  },
+  { deep: true }
+)
 
 // 监听播放状态
 watch(() => projectStore.player.isPlaying, (playing) => {

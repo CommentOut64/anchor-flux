@@ -231,14 +231,32 @@ export const useProjectStore = defineStore('project', () => {
    * 更新字幕内容
    */
   function updateSubtitle(id, payload) {
-    const index = subtitles.value.findIndex(s => s.id === id)
-    if (index === -1) return
+    console.log("[ProjectStore] updateSubtitle 调用:", { id, payload });
+    const index = subtitles.value.findIndex((s) => s.id === id);
+    if (index === -1) {
+      console.warn(
+        "[ProjectStore] 未找到字幕:",
+        id,
+        "当前字幕IDs:",
+        subtitles.value.map((s) => s.id)
+      );
+      return;
+    }
 
+    const oldSubtitle = { ...subtitles.value[index] };
     subtitles.value[index] = {
       ...subtitles.value[index],
       ...payload,
-      isDirty: true
-    }
+      isDirty: true,
+    };
+    console.log("[ProjectStore] 字幕已更新:", {
+      index,
+      old: { start: oldSubtitle.start, end: oldSubtitle.end },
+      new: {
+        start: subtitles.value[index].start,
+        end: subtitles.value[index].end,
+      },
+    });
     meta.value.isDirty = true
   }
 
