@@ -4,6 +4,7 @@
 import os
 import uuid
 import shutil
+import time
 from typing import Optional
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request, Body
 from fastapi.responses import FileResponse, StreamingResponse
@@ -401,6 +402,118 @@ def create_transcription_router(
                 "X-Accel-Buffering": "no"
             }
         )
+
+    @router.get("/sync-tasks")
+    async def sync_tasks():
+        """
+        同步所有任务（第一阶段修复：数据同步）
+
+        返回所有任务列表（处理中 + 已完成），前端用此接口同步后端实际存在的任务
+        此接口为真实源，用于修复幽灵任务问题
+        """
+        from services.job_index_service import get_job_index_service
+        from core.config import config
+        from pathlib import Path
+        import json as json_module
+
+        queue_service = get_queue_service()
+        job_index = get_job_index_service(config.JOBS_DIR)
+        jobs_root = Path(config.JOBS_DIR)
+
+        # 清理无效映射（任务或文件不存在的映射）
+        job_index.cleanup_invalid_mappings()
+
+        # 收集所有任务
+        all_tasks = {}  # 使用 dict 避免重复，key 为 job_id
+
+        # 1. 队列中的任务（处理中或等待中）- 优先级最高
+        with queue_service.lock:
+            for job_id, job in queue_service.jobs.items():
+                all_tasks[job_id] = {
+                    "id": job.job_id,
+                    "filename": job.filename,
+                    "status": job.status,
+                    "progress": job.progress,
+                    "message": job.message,
+                    "created_time": job.createdAt if hasattr(job, 'createdAt') else None,
+                    "phase": job.phase if hasattr(job, 'phase') else 'unknown'
+                }
+
+        # 2. 扫描 jobs 目录中的所有任务（包括已完成的）
+        try:
+            for job_dir in jobs_root.iterdir():
+                if not job_dir.is_dir():
+                    continue
+
+                job_id = job_dir.name
+                if job_id in all_tasks:
+                    # 已在队列中，跳过
+                    continue
+
+                # 尝试找到文件名
+                filename = "未知文件"
+
+                # 1. 从 job_index 查找
+                file_path = job_index.get_file_path(job_id)
+                if file_path:
+                    filename = os.path.basename(file_path)
+                else:
+                    # 2. 从目录中找视频文件
+                    for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
+                        matches = list(job_dir.glob(f"*{ext}"))
+                        if matches:
+                            filename = matches[0].name
+                            break
+
+                # 判断任务是否完成
+                srt_files = list(job_dir.glob("*.srt"))
+                is_finished = len(srt_files) > 0
+
+                # 获取创建时间
+                try:
+                    stat = job_dir.stat()
+                    created_time = int(stat.st_ctime * 1000)
+                except:
+                    created_time = None
+
+                # 尝试从 checkpoint 获取进度信息
+                checkpoint_path = job_dir / "checkpoint.json"
+                progress = 100 if is_finished else 0
+                phase = 'editing' if is_finished else 'transcribing'
+                status = 'finished' if is_finished else 'processing'
+
+                if checkpoint_path.exists():
+                    try:
+                        with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                            checkpoint_data = json_module.load(f)
+                            total_segments = checkpoint_data.get('total_segments', 0)
+                            processed_indices = checkpoint_data.get('processed_indices', [])
+                            if total_segments > 0:
+                                progress = (len(processed_indices) / total_segments) * 100
+                            phase = checkpoint_data.get('phase', 'transcribing')
+                    except:
+                        pass
+
+                all_tasks[job_id] = {
+                    "id": job_id,
+                    "filename": filename,
+                    "status": status,
+                    "progress": min(progress, 100),  # 确保不超过100
+                    "message": "已完成" if is_finished else "处理中",
+                    "created_time": created_time,
+                    "phase": phase
+                }
+
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.error(f"扫描 jobs 目录失败: {e}")
+
+        return {
+            "success": True,
+            "tasks": list(all_tasks.values()),
+            "count": len(all_tasks),
+            "timestamp": int(time.time() * 1000)
+        }
 
     @router.get("/incomplete-jobs")
     async def get_incomplete_jobs():

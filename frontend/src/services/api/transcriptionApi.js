@@ -181,6 +181,19 @@ class TranscriptionAPI {
   }
 
   /**
+   * 同步所有任务（第一阶段修复：数据同步）
+   *
+   * 从后端获取所有实际存在的任务列表（处理中 + 已完成）
+   * 用于在应用启动时同步前端的 localStorage 与后端 jobs 目录的一致性
+   * 修复幽灵任务问题
+   *
+   * @returns {Promise<{success: boolean, tasks: Array, count: number, timestamp: number}>}
+   */
+  async syncTasks() {
+    return apiClient.get('/api/sync-tasks')
+  }
+
+  /**
    * 获取所有未完成的任务
    * @returns {Promise<{jobs: Object[], count: number}>}
    */

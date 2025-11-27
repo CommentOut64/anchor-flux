@@ -208,6 +208,9 @@ async function handleUpload() {
       message: '等待转录...'
     })
 
+    // 修复：上传完成后立即从后端同步任务列表（确保 UI 及时更新）
+    await taskStore.syncTasksFromBackend()
+
     ElMessage.success('上传成功，已加入转录队列')
     showUploadDialog.value = false
     selectedFile.value = null
@@ -244,10 +247,19 @@ async function deleteTask(jobId) {
     )
 
     // 调用后端 API 删除任务数据
-    await transcriptionApi.cancelJob(jobId, true)
+    try {
+      await transcriptionApi.cancelJob(jobId, true)
+    } catch (error) {
+      console.warn('调用后端删除失败，继续清理本地记录:', error)
+      // 即使后端删除失败，也继续清理本地记录
+      // 这有助于修复幽灵任务问题
+    }
 
     // 从本地 store 中删除
     await taskStore.deleteTask(jobId)
+
+    // 修复：删除完成后立即从后端同步任务列表（确保 UI 及时更新）
+    await taskStore.syncTasksFromBackend()
 
     ElMessage.success('任务已删除')
   } catch (error) {

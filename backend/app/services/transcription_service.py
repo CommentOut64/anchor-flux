@@ -123,13 +123,16 @@ class TranscriptionService:
         # 执行硬件检测
         self._detect_hardware()
 
+        # 启动时扫描并加载所有任务（修复重启后无法打开旧任务的问题）
+        self._load_all_jobs_from_disk()
+
     def _detect_hardware(self):
         """执行硬件检测并生成优化配置"""
         try:
             self.logger.info("开始硬件检测...")
             self._hardware_info = self.hardware_detector.detect()
             self._optimization_config = self.hardware_optimizer.get_optimization_config(self._hardware_info)
-            
+
             # 记录检测结果
             hw = self._hardware_info
             opt = self._optimization_config
@@ -139,6 +142,34 @@ class TranscriptionService:
                            f"优化配置: batch={opt.batch_size}, device={opt.recommended_device}")
         except Exception as e:
             self.logger.error(f"硬件检测失败: {e}")
+
+    def _load_all_jobs_from_disk(self):
+        """
+        启动时扫描并加载所有任务到内存（修复重启后无法打开旧任务的问题）
+
+        这个方法会扫描 jobs 目录中的所有任务，并加载到内存中，
+        避免重启后因为内存为空导致无法访问旧任务
+        """
+        try:
+            loaded_count = 0
+            for job_dir in self.jobs_root.iterdir():
+                if not job_dir.is_dir():
+                    continue
+
+                job_id = job_dir.name
+                if job_id in self.jobs:
+                    # 已加载，跳过
+                    continue
+
+                # 尝试加载任务
+                job = self.get_job(job_id)
+                if job:
+                    loaded_count += 1
+
+            if loaded_count > 0:
+                self.logger.info(f"启动时已加载 {loaded_count} 个历史任务到内存")
+        except Exception as e:
+            self.logger.error(f"加载历史任务失败: {e}")
     
     def get_hardware_info(self) -> Optional[HardwareInfo]:
         """获取硬件信息"""
@@ -229,7 +260,73 @@ class TranscriptionService:
             Optional[JobState]: 任务状态对象，不存在则返回None
         """
         with self.lock:
-            return self.jobs.get(job_id)
+            # 首先从内存中查找
+            if job_id in self.jobs:
+                return self.jobs[job_id]
+
+        # 如果内存中没有，尝试从 jobs 目录读取（修复重启后无法打开旧任务的问题）
+        job_dir = self.jobs_root / job_id
+        if not job_dir.exists():
+            return None
+
+        try:
+            # 尝试找到原始文件
+            filename = "未知文件"
+            input_path = None
+
+            # 从目录中查找视频/音频文件
+            for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
+                matches = list(job_dir.glob(f"*{ext}"))
+                if matches:
+                    filename = matches[0].name
+                    input_path = str(matches[0])
+                    break
+
+            # 检查是否有 SRT 文件（表示已完成）
+            srt_files = list(job_dir.glob("*.srt"))
+            is_finished = len(srt_files) > 0
+
+            # 创建 JobState 对象
+            job = JobState(
+                job_id=job_id,
+                filename=filename,
+                dir=str(job_dir),
+                input_path=input_path,
+                status='finished' if is_finished else 'processing',
+                phase='editing' if is_finished else 'transcribing',
+                progress=100 if is_finished else 0,
+                message='已完成' if is_finished else '处理中',
+                srt_path=str(srt_files[0]) if srt_files else None
+            )
+
+            # 尝试从 checkpoint 获取更详细的信息
+            checkpoint_path = job_dir / "checkpoint.json"
+            if checkpoint_path.exists():
+                try:
+                    with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                        checkpoint_data = json.load(f)
+                        total_segments = checkpoint_data.get('total_segments', 0)
+                        processed_indices = checkpoint_data.get('processed_indices', [])
+                        if total_segments > 0:
+                            job.progress = min((len(processed_indices) / total_segments) * 100, 100)
+                        job.phase = checkpoint_data.get('phase', 'transcribing')
+                        job.language = checkpoint_data.get('language')
+                        # 从checkpoint恢复segments
+                        if 'unaligned_results' in checkpoint_data:
+                            job.segments = checkpoint_data['unaligned_results']
+                except Exception as e:
+                    self.logger.warning(f"读取checkpoint失败 {checkpoint_path}: {e}")
+
+            # 缓存到内存
+            with self.lock:
+                self.jobs[job_id] = job
+
+            self.logger.info(f"从磁盘恢复任务: {job_id}")
+            return job
+
+        except Exception as e:
+            self.logger.error(f"从磁盘读取任务失败 {job_id}: {e}")
+            return None
 
     def scan_incomplete_jobs(self) -> List[Dict]:
         """

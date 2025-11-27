@@ -214,6 +214,80 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   }
 
   /**
+   * 从后端同步任务列表（第一阶段修复：数据同步）
+   *
+   * 从后端获取所有实际存在的任务列表，用于修复幽灵任务问题
+   * 这是前端 localStorage 的真实源
+   */
+  async function syncTasksFromBackend() {
+    try {
+      const transcriptionApi = (await import('@/services/api/transcriptionApi')).default
+      const response = await transcriptionApi.syncTasks()
+
+      if (!response.success) {
+        console.warn('[UnifiedTaskStore] 任务同步失败:', response)
+        return false
+      }
+
+      const backendTasks = response.tasks || []
+      console.log(`[UnifiedTaskStore] 从后端同步了 ${backendTasks.length} 个任务`)
+
+      // 1. 获取后端任务ID集合
+      const backendTaskIds = new Set(backendTasks.map(t => t.id))
+
+      // 2. 删除前端有但后端没有的任务（幽灵任务清理）
+      const localTaskIds = Array.from(tasksMap.value.keys())
+      let deletedCount = 0
+      for (const localId of localTaskIds) {
+        if (!backendTaskIds.has(localId)) {
+          console.log(`[UnifiedTaskStore] 删除幽灵任务: ${localId}`)
+          tasksMap.value.delete(localId)
+          deletedCount++
+        }
+      }
+      if (deletedCount > 0) {
+        console.log(`[UnifiedTaskStore] 共清理了 ${deletedCount} 个幽灵任务`)
+      }
+
+      // 3. 更新或添加后端任务
+      let updatedCount = 0
+      let addedCount = 0
+      for (const backendTask of backendTasks) {
+        const existingTask = tasksMap.value.get(backendTask.id)
+        if (existingTask) {
+          // 更新现有任务（只更新关键字段）
+          Object.assign(existingTask, {
+            status: backendTask.status,
+            progress: backendTask.progress,
+            message: backendTask.message,
+            filename: backendTask.filename
+          }, { updatedAt: Date.now() })
+          updatedCount++
+        } else {
+          // 添加新任务
+          addTask({
+            job_id: backendTask.id,
+            filename: backendTask.filename,
+            status: backendTask.status,
+            progress: backendTask.progress,
+            message: backendTask.message,
+            phase: backendTask.phase || (backendTask.status === 'finished' ? 'editing' : 'transcribing'),
+            createdAt: backendTask.created_time || Date.now()
+          })
+          addedCount++
+        }
+      }
+
+      console.log(`[UnifiedTaskStore] 任务同步完成: ${updatedCount} 个更新, ${addedCount} 个新增, ${deletedCount} 个删除`)
+      saveTasks()
+      return true
+    } catch (error) {
+      console.error('[UnifiedTaskStore] 任务同步失败:', error)
+      return false
+    }
+  }
+
+  /**
    * 清空所有任务
    */
   function clearAllTasks() {
@@ -340,6 +414,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     loadTask,
     saveCurrentTask,
     deleteTask,
+    syncTasksFromBackend,
     clearAllTasks,
     cleanupOldTasks,
 

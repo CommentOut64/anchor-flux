@@ -256,7 +256,25 @@ async function loadProject() {
     console.log('[EditorView] 项目加载完成')
   } catch (error) {
     console.error('[EditorView] 加载项目失败:', error)
-    loadError.value = error.message || '加载失败'
+
+    // 第一阶段修复：处理 404 错误，清理无效任务
+    if (error.response?.status === 404) {
+      console.warn(`[EditorView] 任务已在后端删除: ${props.jobId}，正在清理本地记录...`)
+      try {
+        // 删除本地任务记录
+        await taskStore.deleteTask(props.jobId)
+        loadError.value = '任务不存在（已被删除），本地记录已清理'
+        // 2秒后返回任务列表
+        setTimeout(() => {
+          router.push('/tasks')
+        }, 2000)
+      } catch (deleteError) {
+        console.error('[EditorView] 删除本地任务记录失败:', deleteError)
+        loadError.value = '任务不存在，且清理本地记录失败，请刷新页面'
+      }
+    } else {
+      loadError.value = error.message || '加载失败'
+    }
   } finally {
     isLoading.value = false
   }

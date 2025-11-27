@@ -3,6 +3,7 @@
  * App.vue - 应用根组件
  *
  * 职责：
+ * - 启动时同步后端任务列表（修复幽灵任务）
  * - 全局 SSE 事件监听
  * - 自动跳转到编辑器（转录完成时）
  * - 全局任务状态同步
@@ -18,10 +19,24 @@ const taskStore = useUnifiedTaskStore()
 
 let unsubscribeGlobal = null
 
-onMounted(() => {
-  console.log('[App] 应用已挂载，启动全局 SSE 监听')
+onMounted(async () => {
+  console.log('[App] 应用已挂载，执行初始化')
 
-  // 订阅全局事件流
+  // 第一步：从后端同步任务列表（第一阶段修复：数据同步）
+  console.log('[App] 步骤 1: 从后端同步任务列表...')
+  try {
+    const syncSuccess = await taskStore.syncTasksFromBackend()
+    if (syncSuccess) {
+      console.log('[App] 任务列表同步成功')
+    } else {
+      console.warn('[App] 任务列表同步失败，将使用本地 localStorage 数据')
+    }
+  } catch (error) {
+    console.error('[App] 任务列表同步异常:', error)
+  }
+
+  // 第二步：订阅全局 SSE 事件流（用于实时更新）
+  console.log('[App] 步骤 2: 订阅全局 SSE 事件流...')
   unsubscribeGlobal = sseChannelManager.subscribeGlobal({
     onInitialState(state) {
       console.log('[App] 全局初始状态:', state)

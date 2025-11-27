@@ -108,6 +108,16 @@ async def startup_event():
         queue_service = get_queue_service(transcription_service)
         logger.info("任务队列服务已启动")
 
+        # 5. 清理无效的任务索引映射（第一阶段修复：数据同步）
+        logger.info("清理无效的任务索引映射...")
+        try:
+            from services.job_index_service import get_job_index_service
+            job_index = get_job_index_service(str(config.JOBS_DIR))
+            job_index.cleanup_invalid_mappings()
+            logger.info("任务索引映射清理完成")
+        except Exception as e:
+            logger.warning(f"清理任务索引映射失败: {e}")
+
         # 不在启动时预加载模型，等待前端就绪后通过API调用
         logger.info("后端服务已就绪，等待前端启动后进行模型预加载")
 
