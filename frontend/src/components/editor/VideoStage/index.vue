@@ -1,7 +1,7 @@
 <template>
   <div class="video-stage" :class="{ 'is-fullscreen': isFullscreen }">
     <!-- 视频容器 -->
-    <div class="video-container" ref="containerRef" @dblclick="toggleFullscreen">
+    <div class="video-container" ref="containerRef" @click="handleContainerClick" @dblclick="toggleFullscreen">
       <!-- HTML5 视频元素 -->
       <video
         ref="videoRef"
@@ -43,22 +43,7 @@
         </div>
       </transition>
 
-      <!-- 大播放按钮 -->
-      <transition name="fade">
-        <div
-          v-if="showBigPlayButton && !isBuffering && !hasError"
-          class="video-overlay play-overlay"
-          @click="togglePlay"
-        >
-          <div class="big-play-btn">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M8 5v14l11-7z"/>
-            </svg>
-          </div>
-        </div>
-      </transition>
-
-      <!-- 音量/播放状态提示 -->
+      <!-- 播放/暂停状态提示（短暂显示） -->
       <transition name="pop">
         <div v-if="showStateHint" class="state-hint">
           <svg v-if="stateHintType === 'play'" viewBox="0 0 24 24" fill="currentColor">
@@ -106,11 +91,10 @@ const isBuffering = ref(false)
 const hasError = ref(false)
 const errorMessage = ref('')
 const canRetry = ref(false)
-const showBigPlayButton = ref(true)
 const isFullscreen = ref(false)
 const lastSyncTime = ref(0)
 
-// 状态提示
+// 状态提示（短暂显示播放/暂停图标）
 const showStateHint = ref(false)
 const stateHintType = ref('')
 const stateHintText = ref('')
@@ -137,15 +121,23 @@ function showHint(type, text = '') {
   }, 800)
 }
 
-// 监听 Store 播放状态
-watch(() => projectStore.player.isPlaying, (playing) => {
+// 监听 Store 播放状态（单向：Store → Video）
+watch(() => projectStore.player.isPlaying, async (playing) => {
   if (!videoRef.value) return
-  if (playing) {
-    videoRef.value.play().catch(error => {
-      console.error('播放失败:', error)
+
+  const isPaused = videoRef.value.paused
+
+  if (playing && isPaused) {
+    // 需要播放且当前是暂停状态
+    try {
+      await videoRef.value.play()
+    } catch (error) {
+      console.error('[VideoStage] 播放失败:', error)
+      // 播放失败时回滚状态
       projectStore.player.isPlaying = false
-    })
-  } else {
+    }
+  } else if (!playing && !isPaused) {
+    // 需要暂停且当前是播放状态
     videoRef.value.pause()
   }
 })
@@ -188,21 +180,20 @@ function onTimeUpdate() {
 }
 
 function onPlay() {
-  projectStore.player.isPlaying = true
-  showBigPlayButton.value = false
+  // 显示播放状态提示
   showHint('play')
   emit('play')
 }
 
 function onPause() {
-  projectStore.player.isPlaying = false
+  // 显示暂停状态提示
   showHint('pause')
   emit('pause')
 }
 
 function onEnded() {
+  // 视频播放结束，需要同步到 Store
   projectStore.player.isPlaying = false
-  showBigPlayButton.value = true
   emit('ended')
 }
 
@@ -287,31 +278,34 @@ function handleFullscreenChange() {
   isFullscreen.value = !!document.fullscreenElement
 }
 
-// 鼠标移动显示播放按钮
-let hideTimer = null
-function handleMouseMove() {
-  if (!isPlaying.value) {
-    showBigPlayButton.value = true
-    return
+// 处理视频容器点击（切换播放暂停）
+let clickTimer = null
+function handleContainerClick(e) {
+  // 清除之前的延迟
+  if (clickTimer) {
+    clearTimeout(clickTimer)
+    clickTimer = null
+    return // 这是双击的第二次点击，忽略
   }
-  showBigPlayButton.value = true
-  clearTimeout(hideTimer)
-  hideTimer = setTimeout(() => {
-    if (isPlaying.value) showBigPlayButton.value = false
-  }, 2000)
+
+  // 延迟执行，如果在延迟期间发生双击，则取消单击操作
+  clickTimer = setTimeout(() => {
+    clickTimer = null
+    // 执行切换播放暂停
+    togglePlay()
+  }, 200) // 200ms 延迟，足够检测双击
 }
 
 onMounted(() => {
   document.addEventListener('keydown', handleKeyboard)
   document.addEventListener('fullscreenchange', handleFullscreenChange)
-  containerRef.value?.addEventListener('mousemove', handleMouseMove)
 })
 
 onUnmounted(() => {
   document.removeEventListener('keydown', handleKeyboard)
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
   clearTimeout(stateHintTimer)
-  clearTimeout(hideTimer)
+  if (clickTimer) clearTimeout(clickTimer)
 })
 </script>
 
@@ -423,36 +417,7 @@ onUnmounted(() => {
   }
 }
 
-// 播放按钮覆盖层
-.play-overlay {
-  background: transparent;
-  cursor: pointer;
-
-  .big-play-btn {
-    width: 72px;
-    height: 72px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: rgba(0, 0, 0, 0.6);
-    border-radius: 50%;
-    transition: all var(--transition-normal);
-
-    svg {
-      width: 36px;
-      height: 36px;
-      color: white;
-      margin-left: 4px;
-    }
-
-    &:hover {
-      background: var(--primary);
-      transform: scale(1.1);
-    }
-  }
-}
-
-// 状态提示
+// 状态提示（短暂显示播放/暂停图标）
 .state-hint {
   position: absolute;
   top: 50%;

@@ -91,10 +91,10 @@
       <!-- 左侧面板：视频 + 波形 -->
       <div class="panel panel-left" :style="{ width: leftPanelWidth + 'px' }">
         <div class="video-section">
-          <VideoStage :job-id="jobId" :show-subtitle="true" @loaded="handleVideoLoaded" @error="handleVideoError" />
+          <VideoStage ref="videoStageRef" :job-id="jobId" :show-subtitle="true" :enable-keyboard="false" @loaded="handleVideoLoaded" @error="handleVideoError" />
         </div>
         <div class="timeline-section">
-          <WaveformTimeline :job-id="jobId" @ready="handleWaveformReady" @region-update="handleRegionUpdate" @region-click="handleRegionClick" />
+          <WaveformTimeline ref="waveformRef" :job-id="jobId" @ready="handleWaveformReady" @region-update="handleRegionUpdate" @region-click="handleRegionClick" />
         </div>
       </div>
 
@@ -174,6 +174,7 @@ import { useProjectStore } from '@/stores/projectStore'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { mediaApi, transcriptionApi } from '@/services/api'
 import { sseService } from '@/services/sseService'
+import { useShortcuts } from '@/hooks/useShortcuts'
 import PlaybackControls from '@/components/editor/PlaybackControls/index.vue'
 import VideoStage from '@/components/editor/VideoStage/index.vue'
 import SubtitleList from '@/components/editor/SubtitleList/index.vue'
@@ -199,6 +200,10 @@ const taskProgress = ref(0)      // 转录进度 0-100
 const isTranscribing = ref(false) // 是否正在转录中
 let sseUnsubscribe = null         // SSE 取消订阅函数
 let progressPollTimer = null      // 进度轮询定时器
+
+// 子组件引用（用于快捷键调用组件方法）
+const videoStageRef = ref(null)
+const waveformRef = ref(null)
 
 provide('editorContext', { jobId: props.jobId, saving })
 
@@ -546,16 +551,154 @@ function handleClickOutside(e) {
   }
 }
 
-function handleKeydown(e) {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
-  if (e.ctrlKey || e.metaKey) {
-    switch (e.key) {
-      case 's': e.preventDefault(); saveProject(); break
-      case 'z': e.preventDefault(); e.shiftKey ? redo() : undo(); break
-      case 'y': e.preventDefault(); redo(); break
-    }
-  }
+// ========== 快捷键操作函数 ==========
+
+// 播放/暂停切换
+function togglePlay() {
+  projectStore.player.isPlaying = !projectStore.player.isPlaying
 }
+
+// 上一帧（步进后退）
+function stepBackward() {
+  // TODO: 实现逐帧后退功能（需要根据帧率计算）
+  const frameTime = 1 / 30 // 假设30fps
+  const newTime = Math.max(0, projectStore.player.currentTime - frameTime)
+  projectStore.seekTo(newTime)
+}
+
+// 下一帧（步进前进）
+function stepForward() {
+  // TODO: 实现逐帧前进功能（需要根据帧率计算）
+  const frameTime = 1 / 30 // 假设30fps
+  const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + frameTime)
+  projectStore.seekTo(newTime)
+}
+
+// 快退5秒
+function seekBackward() {
+  const newTime = Math.max(0, projectStore.player.currentTime - 5)
+  projectStore.seekTo(newTime)
+}
+
+// 快进5秒
+function seekForward() {
+  const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + 5)
+  projectStore.seekTo(newTime)
+}
+
+// 跳转到开头
+function seekToStart() {
+  projectStore.seekTo(0)
+}
+
+// 跳转到结尾
+function seekToEnd() {
+  projectStore.seekTo(projectStore.meta.duration)
+}
+
+// 波形放大
+function zoomInWave() {
+  // TODO: 需要 WaveformTimeline 组件暴露 zoomIn 方法
+  console.log('波形放大功能待实现')
+}
+
+// 波形缩小
+function zoomOutWave() {
+  // TODO: 需要 WaveformTimeline 组件暴露 zoomOut 方法
+  console.log('波形缩小功能待实现')
+}
+
+// 波形适应屏幕
+function fitWave() {
+  // TODO: 需要 WaveformTimeline 组件暴露 fitToScreen 方法
+  console.log('波形适应屏幕功能待实现')
+}
+
+// 视频画面放大
+function zoomInVideo() {
+  // TODO: 需要实现视频画面缩放功能
+  console.log('视频画面放大功能待实现')
+}
+
+// 视频画面缩小
+function zoomOutVideo() {
+  // TODO: 需要实现视频���面缩放功能
+  console.log('视频画面缩小功能待实现')
+}
+
+// 画面适应窗口
+function fitVideo() {
+  // TODO: 需要实现视频画面自适应功能
+  console.log('画面适应窗口功能待实现')
+}
+
+// 字体变大
+function fontSizeUp() {
+  // TODO: 需要实现字幕字体大小调整功能
+  console.log('字体变大功能待实现')
+}
+
+// 字体变小
+function fontSizeDown() {
+  // TODO: 需要实现字幕字体大小调整功能
+  console.log('字体变小功能待实现')
+}
+
+// 分割字幕
+function splitSubtitle() {
+  // TODO: 需要实现在当前播放位置分割字幕的功能
+  console.log('分割字幕功能待实现')
+}
+
+// 合并字幕
+function mergeSubtitle() {
+  // TODO: 需要实现合并选中字幕的功能
+  console.log('合并字幕功能待实现')
+}
+
+// 导出（显示导出菜单）
+function exportSubtitle() {
+  showExportMenu.value = !showExportMenu.value
+}
+
+// 打开任务监控
+function openTaskMonitor() {
+  // TODO: 需要实现任务监控面板功能
+  console.log('打开任务监控功能待实现')
+}
+
+// 使用快捷键系统
+useShortcuts({
+  // 播放与导航
+  togglePlay,           // Space: 播放/暂停
+  stepBackward,         // Left: 上一帧
+  stepForward,          // Right: 下一帧
+  seekBackward,         // Shift+Left: 快退5秒
+  seekForward,          // Shift+Right: 快进5秒
+  seekToStart,          // Home: 跳转到开头
+  seekToEnd,            // End: 跳转到结尾
+
+  // 视图缩放
+  zoomInWave,           // =: 波形放大
+  zoomOutWave,          // -: 波形缩小
+  fitWave,              // \: 波形适应屏幕
+  zoomInVideo,          // .: 视频画面放大
+  zoomOutVideo,         // ,: 视频画面缩小
+  fitVideo,             // Shift+Z: 画面适应窗口
+
+  // 字幕编辑
+  fontSizeUp,           // Alt+]: 字体变大
+  fontSizeDown,         // Alt+[: 字体变小
+  splitSubtitle,        // Ctrl+K: 分割字幕
+  mergeSubtitle,        // Ctrl+J: 合并字幕
+
+  // 全局操作
+  save: saveProject,    // Ctrl+S: 保存
+  undo,                 // Ctrl+Z: 撤销
+  redo,                 // Ctrl+Shift+Z 或 Ctrl+Y: 重做
+  export: exportSubtitle, // Ctrl+E: 导出
+  openTaskMonitor,      // Ctrl+M: 打开任务监控
+})
 
 function formatLastSaved(timestamp) {
   const date = new Date(timestamp)
@@ -579,14 +722,12 @@ onBeforeRouteLeave(async (to, from) => {
 
 onMounted(() => {
   loadProject()
-  document.addEventListener('keydown', handleKeydown)
   document.addEventListener('click', handleClickOutside)
 })
 
 onUnmounted(() => {
-  document.removeEventListener('keydown', handleKeydown)
   document.removeEventListener('click', handleClickOutside)
-  // 清理 SSE 订阅和轮询
+  // ���理 SSE 订阅和轮询
   if (sseUnsubscribe) sseUnsubscribe()
   stopProgressPolling()
 })

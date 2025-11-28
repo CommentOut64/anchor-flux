@@ -198,13 +198,9 @@ function setupWavesurferEvents() {
     emit('ready')
   })
 
-  wavesurfer.on('play', () => {
-    projectStore.player.isPlaying = true
-  })
-
-  wavesurfer.on('pause', () => {
-    projectStore.player.isPlaying = false
-  })
+  // 注意：不监听 wavesurfer 的 play/pause 事件来修改 Store
+  // WaveSurfer 只作为视觉组件，跟随 VideoStage 的状态
+  // Store.isPlaying 由 VideoStage 和用户操作统一管理
 
   wavesurfer.on('timeupdate', (time) => {
     projectStore.player.currentTime = time

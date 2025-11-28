@@ -242,34 +242,6 @@ function formatTime(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
-// 键盘快捷键
-function handleKeyboard(e) {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
-
-  switch (e.code) {
-    case 'Space':
-      e.preventDefault()
-      togglePlay()
-      break
-    case 'ArrowLeft':
-      e.preventDefault()
-      seek(e.shiftKey ? -props.microSeekStep : -props.seekStep)
-      break
-    case 'ArrowRight':
-      e.preventDefault()
-      seek(e.shiftKey ? props.microSeekStep : props.seekStep)
-      break
-    case 'ArrowUp':
-      e.preventDefault()
-      projectStore.player.volume = Math.min(1, projectStore.player.volume + 0.1)
-      break
-    case 'ArrowDown':
-      e.preventDefault()
-      projectStore.player.volume = Math.max(0, projectStore.player.volume - 0.1)
-      break
-  }
-}
-
 // 点击外部关闭倍速菜单
 function handleClickOutside(e) {
   if (speedBtnRef.value && !speedBtnRef.value.contains(e.target) &&
@@ -286,13 +258,13 @@ watch(currentTime, (time) => {
   }
 })
 
+// 键盘快捷键已由 EditorView 的 useShortcuts 统一管理，此处不再重复监听
+
 onMounted(() => {
-  document.addEventListener('keydown', handleKeyboard)
   document.addEventListener('click', handleClickOutside)
 })
 
 onUnmounted(() => {
-  document.removeEventListener('keydown', handleKeyboard)
   document.removeEventListener('click', handleClickOutside)
 })
 </script>
