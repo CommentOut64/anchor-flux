@@ -239,6 +239,10 @@ class JobQueueService:
                         # 推送初始进度（让前端立即知道任务的初始状态）
                         self._notify_job_progress(job_id)
 
+                # 任务开始执行前保存状态（确保断电后能恢复 running 任务）
+                if self.running_job_id:
+                    self._save_state()
+
                 # 2. 如果没有任务，休眠后继续
                 if self.running_job_id is None:
                     time.sleep(1)
@@ -541,10 +545,9 @@ class JobQueueService:
 
         恢复逻辑:
         1. 读取queue_state.json
-        2. 如果有running任务，检查checkpoint是否存在
-        3. 恢复running任务为paused，放队列头部
-        4. 恢复队列中的其他任务
-        5. 恢复interrupted任务（被强制中断的任务）
+        2. 如果有running任务，恢复并自动加入队列继续执行
+        3. 恢复队列中的其他任务
+        4. 恢复interrupted任务（被强制中断的任务）
         """
         if not self.queue_file.exists():
             logger.info("无队列状态文件，从空队列启动")
@@ -562,12 +565,12 @@ class JobQueueService:
                 # 尝试从checkpoint恢复
                 job = self.transcription_service.restore_job_from_checkpoint(running_id)
                 if job:
-                    # 安全起见，改为paused，不自动开始
-                    job.status = "paused"
-                    job.message = "程序重启，任务已暂停"
+                    # 自动恢复：设为 queued 状态，放队列头部继续执行
+                    job.status = "queued"
+                    job.message = "程序重启，任务自动恢复"
                     self.jobs[running_id] = job
                     self.queue.appendleft(running_id)  # 放队头
-                    logger.info(f"恢复中断任务到队头: {running_id}")
+                    logger.info(f"恢复中断任务到队头（自动继续）: {running_id}")
                 else:
                     logger.warning(f"无法恢复running任务: {running_id}")
 
@@ -593,11 +596,12 @@ class JobQueueService:
             if interrupted_id and interrupted_id not in self.jobs:
                 job = self.transcription_service.restore_job_from_checkpoint(interrupted_id)
                 if job:
-                    job.status = "paused"
-                    job.message = "程序重启，被中断任务已暂停"
+                    # 被中断的任务也自动恢复到队列
+                    job.status = "queued"
+                    job.message = "程序重启，被中断任务自动恢复"
                     self.jobs[interrupted_id] = job
-                    # 不加入队列，等用户手动恢复
-                    logger.info(f"恢复被中断任务: {interrupted_id}")
+                    self.queue.append(interrupted_id)
+                    logger.info(f"恢复被中断任务到队列: {interrupted_id}")
 
             logger.info(f"队列恢复完成: {len(self.queue)}个任务")
 

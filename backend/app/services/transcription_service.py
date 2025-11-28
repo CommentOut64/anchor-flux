@@ -391,7 +391,7 @@ class TranscriptionService:
 
     def restore_job_from_checkpoint(self, job_id: str) -> Optional[JobState]:
         """
-        从检查点恢复任务状态
+        从检查点恢复任务状态（无 checkpoint 时从头开始）
 
         Args:
             job_id: 任务ID
@@ -403,9 +403,8 @@ class TranscriptionService:
         if not job_dir.exists():
             return None
 
+        # 尝试加载 checkpoint（可能不存在）
         checkpoint = self._load_checkpoint(job_dir)
-        if not checkpoint:
-            return None
 
         try:
             # 查找原文件
@@ -433,25 +432,43 @@ class TranscriptionService:
                 exclude_cores=None
             )
 
+            # 根据是否有 checkpoint 决定恢复状态
+            if checkpoint:
+                # 有 checkpoint，从断点恢复
+                phase = checkpoint.get('phase', 'pending')
+                total_segments = checkpoint.get('total_segments', 0)
+                processed_indices = checkpoint.get('processed_indices', [])
+                processed = len(processed_indices)
+                progress = round((processed / max(1, total_segments)) * 100, 2)
+                message = f"已暂停 ({processed}/{total_segments}段)"
+                self.logger.info(f"从检查点恢复任务: {job_id}")
+            else:
+                # 无 checkpoint，从头开始
+                phase = 'pending'
+                total_segments = 0
+                processed = 0
+                progress = 0
+                message = "程序重启，任务将从头开始"
+                self.logger.info(f"无检查点，任务将从头开始: {job_id}")
+
             # 创建任务状态对象
             job = JobState(
                 job_id=job_id,
                 filename=filename,
                 dir=str(job_dir),
                 input_path=input_path,
-                settings=JobSettings(cpu_affinity=default_cpu_config),  # 提供默认的cpu_affinity
+                settings=JobSettings(cpu_affinity=default_cpu_config),
                 status="paused",
-                phase=checkpoint.get('phase', 'pending'),
-                message=f"已暂停 ({len(checkpoint.get('processed_indices', []))}/{checkpoint.get('total_segments', 0)}段)",
-                total=checkpoint.get('total_segments', 0),
-                processed=len(checkpoint.get('processed_indices', [])),
-                progress=round((len(checkpoint.get('processed_indices', [])) / max(1, checkpoint.get('total_segments', 1))) * 100, 2)
+                phase=phase,
+                message=message,
+                total=total_segments,
+                processed=processed,
+                progress=progress
             )
 
             with self.lock:
                 self.jobs[job_id] = job
 
-            self.logger.info(f"从检查点恢复任务: {job_id}")
             return job
 
         except Exception as e:
