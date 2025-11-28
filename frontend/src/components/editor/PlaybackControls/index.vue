@@ -1,5 +1,6 @@
 <template>
-  <div class="playback-controls" :class="{ compact }">
+  <!-- 底座模式或紧凑模式 -->
+  <div class="playback-controls" :class="{ compact, pedestal }">
     <!-- 主控制区 -->
     <div class="controls-main">
       <!-- 快退 -->
@@ -110,6 +111,7 @@ import { useProjectStore } from '@/stores/projectStore'
 // Props
 const props = defineProps({
   compact: { type: Boolean, default: false },
+  pedestal: { type: Boolean, default: false },  // 底座模式：融入背景，无圆角
   showSpeed: { type: Boolean, default: true },
   showVolume: { type: Boolean, default: true },
   showLoop: { type: Boolean, default: true },
@@ -279,12 +281,26 @@ onUnmounted(() => {
   border-radius: var(--radius-lg);
   user-select: none;
 
+  // 紧凑模式
   &.compact {
     gap: 12px;
     padding: 8px 12px;
 
     .controls-progress {
       .time-display { font-size: 11px; }
+    }
+  }
+
+  // 底座模式：融入背景，无圆角
+  &.pedestal {
+    border-radius: 0;
+    background: var(--bg-primary);
+    height: 48px;
+    padding: 0 20px;
+    border: none;
+
+    .controls-progress .time-display {
+      font-size: 11px;
     }
   }
 }

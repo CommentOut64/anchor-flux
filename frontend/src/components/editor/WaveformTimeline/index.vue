@@ -520,9 +520,38 @@ onUnmounted(() => {
   flex: 1;
   position: relative;
   min-height: 128px;
+  overflow: hidden;
 
   #waveform {
     height: 100%;
+
+    // 自定义 WaveSurfer 滚动条样式
+    :deep(.wavesurfer-scroll) {
+      &::-webkit-scrollbar {
+        height: 8px;
+        background: transparent;
+      }
+
+      &::-webkit-scrollbar-track {
+        background: var(--bg-tertiary);
+        border-radius: 4px;
+        margin: 0 16px;
+      }
+
+      &::-webkit-scrollbar-thumb {
+        background: var(--border-muted);
+        border-radius: 4px;
+        transition: background 0.2s;
+
+        &:hover {
+          background: var(--text-muted);
+        }
+
+        &:active {
+          background: var(--primary);
+        }
+      }
+    }
 
     :deep(.wavesurfer-region) {
       border-radius: 2px;

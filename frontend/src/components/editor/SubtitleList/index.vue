@@ -285,26 +285,28 @@ function formatDuration(seconds) {
   background: var(--bg-primary);
 }
 
-// 工具栏
+// 工具栏 - 针对 350px 宽度优化
 .list-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 16px;
+  padding: 10px 12px;  // 减少内边距
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-default);
-  gap: 16px;
+  gap: 12px;
 
   .toolbar-left {
     .subtitle-count {
-      font-size: 13px;
+      font-size: 12px;
       color: var(--text-secondary);
+      white-space: nowrap;
     }
   }
 
   .toolbar-center {
     flex: 1;
-    max-width: 300px;
+    max-width: 180px;  // 缩小搜索框
+    min-width: 100px;
   }
 
   .search-box {
@@ -312,45 +314,49 @@ function formatDuration(seconds) {
     align-items: center;
     background: var(--bg-tertiary);
     border-radius: var(--radius-md);
-    padding: 6px 12px;
-    gap: 8px;
+    padding: 5px 10px;
+    gap: 6px;
 
     .search-icon {
-      width: 16px;
-      height: 16px;
+      width: 14px;
+      height: 14px;
       color: var(--text-muted);
+      flex-shrink: 0;
     }
 
     .search-input {
       flex: 1;
+      min-width: 0;
       background: transparent;
       border: none;
       color: var(--text-normal);
-      font-size: 13px;
+      font-size: 12px;
 
       &::placeholder { color: var(--text-muted); }
     }
 
     .search-clear {
-      width: 18px;
-      height: 18px;
+      width: 16px;
+      height: 16px;
       color: var(--text-muted);
+      flex-shrink: 0;
       svg { width: 100%; height: 100%; }
       &:hover { color: var(--text-normal); }
     }
   }
 
   .toolbar-btn {
-    width: 32px;
-    height: 32px;
+    width: 30px;
+    height: 30px;
     display: flex;
     align-items: center;
     justify-content: center;
     border-radius: var(--radius-md);
     color: var(--text-secondary);
     transition: all var(--transition-fast);
+    flex-shrink: 0;
 
-    svg { width: 20px; height: 20px; }
+    svg { width: 18px; height: 18px; }
 
     &:hover {
       background: var(--bg-tertiary);
@@ -363,17 +369,17 @@ function formatDuration(seconds) {
 .list-container {
   flex: 1;
   overflow-y: auto;
-  padding: 8px;
+  padding: 6px;
 
   &::-webkit-scrollbar {
-    width: 8px;
+    width: 6px;
   }
   &::-webkit-scrollbar-track {
     background: transparent;
   }
   &::-webkit-scrollbar-thumb {
     background: var(--border-default);
-    border-radius: 4px;
+    border-radius: 3px;
     &:hover { background: var(--text-muted); }
   }
 }
@@ -384,38 +390,38 @@ function formatDuration(seconds) {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 48px;
+  padding: 32px 16px;
   color: var(--text-muted);
 
   svg {
-    width: 64px;
-    height: 64px;
-    margin-bottom: 16px;
+    width: 48px;
+    height: 48px;
+    margin-bottom: 12px;
     opacity: 0.5;
   }
 
   p {
-    font-size: 14px;
-    margin-bottom: 16px;
+    font-size: 13px;
+    margin-bottom: 12px;
   }
 
   .add-first-btn {
-    padding: 8px 20px;
+    padding: 6px 16px;
     background: var(--primary);
     color: white;
     border-radius: var(--radius-md);
-    font-size: 14px;
+    font-size: 13px;
     transition: background var(--transition-fast);
     &:hover { background: var(--primary-hover); }
   }
 }
 
-// 字幕项
+// 字幕项 - 紧凑布局
 .subtitle-item {
   display: flex;
-  gap: 12px;
-  padding: 12px;
-  margin-bottom: 8px;
+  gap: 10px;
+  padding: 10px;  // 减少内边距
+  margin-bottom: 6px;
   background: var(--bg-secondary);
   border: 1px solid transparent;
   border-radius: var(--radius-md);
@@ -445,16 +451,16 @@ function formatDuration(seconds) {
   }
 }
 
-// 序号
+// 序号 - 缩小尺寸
 .item-index {
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
   background: var(--bg-tertiary);
   border-radius: var(--radius-sm);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   color: var(--text-secondary);
   flex-shrink: 0;
@@ -466,20 +472,21 @@ function formatDuration(seconds) {
   min-width: 0;
 }
 
-// 时间行
+// 时间行 - 优化间距
 .time-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
+  gap: 6px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
 
   .time-input {
-    width: 100px;
-    padding: 4px 8px;
+    width: 75px;  // 缩小宽度
+    padding: 3px 6px;
     background: var(--bg-tertiary);
     border: 1px solid transparent;
     border-radius: var(--radius-sm);
-    font-size: 12px;
+    font-size: 11px;
     font-family: var(--font-mono);
     color: var(--text-normal);
     text-align: center;
@@ -492,34 +499,34 @@ function formatDuration(seconds) {
 
   .time-arrow {
     color: var(--text-muted);
-    svg { width: 16px; height: 16px; }
+    svg { width: 14px; height: 14px; }
   }
 
   .duration-tag {
-    padding: 2px 8px;
+    padding: 2px 6px;
     background: var(--bg-tertiary);
     border-radius: var(--radius-full);
-    font-size: 11px;
+    font-size: 10px;
     font-family: var(--font-mono);
     color: var(--text-muted);
   }
 }
 
-// 文本行
+// 文本行 - 优化尺寸
 .text-row {
   position: relative;
 
   .text-input {
     width: 100%;
-    padding: 8px 10px;
-    padding-right: 40px;
+    padding: 6px 8px;
+    padding-right: 35px;
     background: var(--bg-tertiary);
     border: 1px solid transparent;
     border-radius: var(--radius-sm);
-    font-size: 13px;
+    font-size: 12px;
     color: var(--text-normal);
     resize: none;
-    line-height: 1.5;
+    line-height: 1.4;
 
     &:focus {
       border-color: var(--primary);
@@ -531,9 +538,9 @@ function formatDuration(seconds) {
 
   .char-count {
     position: absolute;
-    right: 8px;
-    bottom: 8px;
-    font-size: 11px;
+    right: 6px;
+    bottom: 6px;
+    font-size: 10px;
     font-family: var(--font-mono);
     color: var(--text-muted);
 
@@ -545,12 +552,12 @@ function formatDuration(seconds) {
 .error-tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
+  gap: 4px;
+  margin-top: 6px;
 
   .error-tag {
-    padding: 2px 8px;
-    font-size: 11px;
+    padding: 2px 6px;
+    font-size: 10px;
     border-radius: var(--radius-full);
 
     &.error {
@@ -565,17 +572,16 @@ function formatDuration(seconds) {
   }
 }
 
-// 操作按钮
+// 操作按钮 - 始终可见，更小尺寸
 .item-actions {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity var(--transition-fast);
+  gap: 2px;
+  opacity: 1;  // 始终显示
 
   .action-btn {
-    width: 28px;
-    height: 28px;
+    width: 24px;
+    height: 24px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -583,7 +589,7 @@ function formatDuration(seconds) {
     color: var(--text-muted);
     transition: all var(--transition-fast);
 
-    svg { width: 16px; height: 16px; }
+    svg { width: 14px; height: 14px; }
 
     &:hover {
       background: var(--bg-tertiary);

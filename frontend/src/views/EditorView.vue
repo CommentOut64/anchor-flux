@@ -1,73 +1,22 @@
 <template>
   <div class="editor-view">
-    <!-- 顶部导航栏 -->
-    <header class="editor-header">
-      <div class="header-left">
-        <router-link to="/tasks" class="back-btn" title="返回任务列表">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
-          </svg>
-        </router-link>
-        <div class="project-info">
-          <h1 class="project-name">{{ projectName }}</h1>
-          <span v-if="isDirty" class="unsaved-badge">未保存</span>
-          <!-- 转录状态指示器 -->
-          <span v-if="isTranscribing" class="transcribing-badge">
-            <span class="spinner-small"></span>
-            转录中 {{ taskProgress }}%
-          </span>
-          <span v-else-if="taskStatus === 'queued'" class="queued-badge">排队中</span>
-        </div>
-      </div>
-
-      <div class="header-center">
-        <PlaybackControls :compact="true" />
-      </div>
-
-      <div class="header-right">
-        <!-- 撤销/重做 -->
-        <div class="btn-group">
-          <button class="header-btn" :class="{ disabled: !canUndo }" @click="undo" title="撤销 (Ctrl+Z)">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/>
-            </svg>
-          </button>
-          <button class="header-btn" :class="{ disabled: !canRedo }" @click="redo" title="重做 (Ctrl+Y)">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M18.4 10.6C16.55 8.99 14.15 8 11.5 8c-4.65 0-8.58 3.03-9.96 7.22L3.9 16c1.05-3.19 4.05-5.5 7.6-5.5 1.95 0 3.73.72 5.12 1.88L13 16h9V7l-3.6 3.6z"/>
-            </svg>
-          </button>
-        </div>
-
-        <!-- 保存按钮 -->
-        <button class="header-btn header-btn--primary" @click="saveProject" :class="{ loading: saving }" title="保存 (Ctrl+S)">
-          <svg v-if="!saving" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/>
-          </svg>
-          <span v-if="saving" class="spinner"></span>
-          <span>保存</span>
-        </button>
-
-        <!-- 导出下拉菜单 -->
-        <div class="dropdown" ref="exportDropdownRef">
-          <button class="header-btn" @click="toggleExportMenu">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
-            </svg>
-            <span>导出</span>
-            <svg class="arrow" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M7 10l5 5 5-5z"/>
-            </svg>
-          </button>
-          <div v-show="showExportMenu" class="dropdown-menu">
-            <button @click="handleExport('srt')">SRT 格式</button>
-            <button @click="handleExport('vtt')">WebVTT 格式</button>
-            <button @click="handleExport('txt')">纯文本</button>
-            <button @click="handleExport('json')">JSON 格式</button>
-          </div>
-        </div>
-      </div>
-    </header>
+    <!-- 顶部导航栏 - 使用新的 EditorHeader 组件 -->
+    <EditorHeader
+      :job-id="jobId"
+      :task-name="projectName"
+      :current-task-status="taskStatus"
+      :current-task-progress="taskProgress"
+      :queue-completed="queueCompleted"
+      :queue-total="queueTotal"
+      :can-undo="canUndo"
+      :can-redo="canRedo"
+      :active-tasks="activeTasks"
+      :last-saved="lastSaved"
+      @undo="undo"
+      @redo="redo"
+      @pause="pauseTranscription"
+      @cancel="cancelTranscription"
+    />
 
     <!-- 加载状态 -->
     <div v-if="isLoading" class="loading-overlay">
@@ -86,37 +35,79 @@
       <router-link to="/tasks" class="back-link">返回任务列表</router-link>
     </div>
 
-    <!-- 主编辑区域 -->
-    <main v-else class="editor-main">
-      <!-- 左侧面板：视频 + 波形 -->
-      <div class="panel panel-left" :style="{ width: leftPanelWidth + 'px' }">
-        <div class="video-section">
-          <VideoStage ref="videoStageRef" :job-id="jobId" :show-subtitle="true" :enable-keyboard="false" @loaded="handleVideoLoaded" @error="handleVideoError" />
+    <!-- 主编辑区域 - Grid 布局 -->
+    <main v-else class="workspace-grid" :style="gridStyle">
+      <!-- 左侧舞台列 -->
+      <section class="stage-column">
+        <!-- 视频区域 -->
+        <div class="video-wrapper">
+          <VideoStage
+            ref="videoStageRef"
+            :job-id="jobId"
+            :show-subtitle="true"
+            :enable-keyboard="false"
+            @loaded="handleVideoLoaded"
+            @error="handleVideoError"
+          />
         </div>
-        <div class="timeline-section">
-          <WaveformTimeline ref="waveformRef" :job-id="jobId" @ready="handleWaveformReady" @region-update="handleRegionUpdate" @region-click="handleRegionClick" />
+
+        <!-- 播放控制条 - 底座模式 -->
+        <div class="controls-wrapper">
+          <PlaybackControls :pedestal="true" />
         </div>
-      </div>
 
-      <!-- 调整分隔条 -->
-      <div class="resizer" @mousedown="startResize"></div>
+        <!-- 波形时间轴 -->
+        <div class="waveform-wrapper">
+          <WaveformTimeline
+            ref="waveformRef"
+            :job-id="jobId"
+            @ready="handleWaveformReady"
+            @region-update="handleRegionUpdate"
+            @region-click="handleRegionClick"
+          />
+        </div>
+      </section>
 
-      <!-- 右侧面板：字幕列表 + 其他 -->
-      <div class="panel panel-right">
+      <!-- 可拖拽分隔条 -->
+      <div class="resizer" @mousedown="startResize" :class="{ active: isResizing }"></div>
+
+      <!-- 右侧边栏 -->
+      <aside class="sidebar-column">
         <!-- 标签页导航 -->
         <div class="tab-nav">
-          <button class="tab-btn" :class="{ active: activeTab === 'subtitles' }" @click="activeTab = 'subtitles'">字幕列表</button>
-          <button class="tab-btn" :class="{ active: activeTab === 'validation' }" @click="activeTab = 'validation'">
+          <button
+            class="tab-btn"
+            :class="{ active: activeTab === 'subtitles' }"
+            @click="activeTab = 'subtitles'"
+          >
+            字幕列表
+          </button>
+          <button
+            class="tab-btn"
+            :class="{ active: activeTab === 'validation' }"
+            @click="activeTab = 'validation'"
+          >
             问题检查
             <span v-if="errorCount > 0" class="badge">{{ errorCount }}</span>
           </button>
-          <button class="tab-btn" :class="{ active: activeTab === 'assistant' }" @click="activeTab = 'assistant'">AI 助手</button>
+          <button
+            class="tab-btn"
+            :class="{ active: activeTab === 'assistant' }"
+            @click="activeTab = 'assistant'"
+          >
+            AI 助手
+          </button>
         </div>
 
         <!-- 标签页内容 -->
         <div class="tab-content">
           <div v-show="activeTab === 'subtitles'" class="tab-pane">
-            <SubtitleList :auto-scroll="true" :editable="true" @subtitle-click="handleSubtitleClick" @subtitle-edit="handleSubtitleEdit" />
+            <SubtitleList
+              :auto-scroll="true"
+              :editable="true"
+              @subtitle-click="handleSubtitleClick"
+              @subtitle-edit="handleSubtitleEdit"
+            />
           </div>
 
           <div v-show="activeTab === 'validation'" class="tab-pane">
@@ -128,7 +119,13 @@
               <p v-if="errorCount === 0">没有发现问题</p>
               <p v-else>发现 {{ errorCount }} 个问题</p>
               <div class="error-list" v-if="errorCount > 0">
-                <div v-for="error in validationErrors" :key="`${error.type}-${error.index}`" class="error-item" :class="error.severity" @click="jumpToError(error)">
+                <div
+                  v-for="error in validationErrors"
+                  :key="`${error.type}-${error.index}`"
+                  class="error-item"
+                  :class="error.severity"
+                  @click="jumpToError(error)"
+                >
                   <span class="error-index">#{{ error.index + 1 }}</span>
                   <span class="error-message">{{ error.message }}</span>
                 </div>
@@ -147,7 +144,7 @@
             </div>
           </div>
         </div>
-      </div>
+      </aside>
     </main>
 
     <!-- 底部状态栏 -->
@@ -157,17 +154,41 @@
         <span v-if="currentSubtitle" class="divider">|</span>
         <span v-if="currentSubtitle">当前: #{{ currentSubtitleIndex + 1 }}</span>
       </div>
+
       <div class="footer-center">
-        <span v-if="lastSaved">最后保存: {{ formatLastSaved(lastSaved) }}</span>
+        <span v-if="lastSaved" class="save-time">
+          <svg class="icon" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/>
+          </svg>
+          自动保存于 {{ formatLastSaved(lastSaved) }}
+        </span>
       </div>
+
       <div class="footer-right">
-        <span v-if="errorCount > 0" class="error-indicator" @click="activeTab = 'validation'">{{ errorCount }} 个问题</span>
+        <span v-if="errorCount > 0" class="error-indicator" @click="activeTab = 'validation'">
+          {{ errorCount }} 个问题
+        </span>
+        <span class="divider">|</span>
+        <button class="settings-btn" @click="showSettings" title="设置">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/>
+          </svg>
+        </button>
       </div>
     </footer>
   </div>
 </template>
 
 <script setup>
+/**
+ * EditorView - 编辑器主视图
+ *
+ * 采用现代 NLE 软件的布局逻辑：
+ * - Grid 布局实现响应式主工作区
+ * - 视频优先，波形图退居辅助
+ * - 可拖拽调整侧边栏宽度
+ * - 智能进度显示和多任务管理
+ */
 import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
 import { useRouter, onBeforeRouteLeave } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
@@ -175,60 +196,100 @@ import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { mediaApi, transcriptionApi } from '@/services/api'
 import { sseService } from '@/services/sseService'
 import { useShortcuts } from '@/hooks/useShortcuts'
+
+// 组件导入
+import EditorHeader from '@/components/editor/EditorHeader.vue'
 import PlaybackControls from '@/components/editor/PlaybackControls/index.vue'
 import VideoStage from '@/components/editor/VideoStage/index.vue'
 import SubtitleList from '@/components/editor/SubtitleList/index.vue'
 import WaveformTimeline from '@/components/editor/WaveformTimeline/index.vue'
 
-const props = defineProps({ jobId: { type: String, required: true } })
+// Props
+const props = defineProps({
+  jobId: { type: String, required: true }
+})
+
+// Router & Stores
 const router = useRouter()
 const projectStore = useProjectStore()
 const taskStore = useUnifiedTaskStore()
-const exportDropdownRef = ref(null)
+
+// Refs
+const videoStageRef = ref(null)
+const waveformRef = ref(null)
 const activeTab = ref('subtitles')
 const saving = ref(false)
 const lastSaved = ref(null)
-const showExportMenu = ref(false)
-const leftPanelWidth = ref(600)
+
+// 布局状态
+const sidebarWidth = ref(350)
 const isResizing = ref(false)
+
 // 加载状态
 const isLoading = ref(true)
 const loadError = ref(null)
-// 任务状态（用于实时转录显示）
-const taskStatus = ref(null)     // 'created' | 'queued' | 'processing' | 'finished' | 'failed'
-const taskProgress = ref(0)      // 转录进度 0-100
-const isTranscribing = ref(false) // 是否正在转录中
-let sseUnsubscribe = null         // SSE 取消订阅函数
-let progressPollTimer = null      // 进度轮询定时器
 
-// 子组件引用（用于快捷键调用组件方法）
-const videoStageRef = ref(null)
-const waveformRef = ref(null)
+// 任务状态
+const taskStatus = ref(null)
+const taskProgress = ref(0)
+const isTranscribing = ref(false)
+let sseUnsubscribe = null
+let progressPollTimer = null
 
+// Provide 编辑器上下文
 provide('editorContext', { jobId: props.jobId, saving })
 
+// ========== 计算属性 ==========
+
+// 项目名称
 const projectName = computed(() => {
-  // 优先显示用户自定义的 title，否则显示文件名（去除扩展名）
   if (projectStore.meta.title) {
     return projectStore.meta.title
   }
   const filename = projectStore.meta.filename || '未命名项目'
   const lastDotIndex = filename.lastIndexOf('.')
-  if (lastDotIndex > 0) {
-    return filename.substring(0, lastDotIndex)
-  }
-  return filename
+  return lastDotIndex > 0 ? filename.substring(0, lastDotIndex) : filename
 })
+
+// 基础状态
 const isDirty = computed(() => projectStore.isDirty)
 const totalSubtitles = computed(() => projectStore.totalSubtitles)
 const currentSubtitle = computed(() => projectStore.currentSubtitle)
-const currentSubtitleIndex = computed(() => currentSubtitle.value ? projectStore.subtitles.findIndex(s => s.id === currentSubtitle.value.id) : -1)
+const currentSubtitleIndex = computed(() =>
+  currentSubtitle.value
+    ? projectStore.subtitles.findIndex(s => s.id === currentSubtitle.value.id)
+    : -1
+)
+
+// 撤销/重做
 const canUndo = computed(() => projectStore.canUndo)
 const canRedo = computed(() => projectStore.canRedo)
-const validationErrors = computed(() => projectStore.validationErrors)
-const errorCount = computed(() => validationErrors.value.filter(e => e.severity === 'error').length)
 
-// 从后端加载项目数据（支持流式加载）
+// 验证错误
+const validationErrors = computed(() => projectStore.validationErrors)
+const errorCount = computed(() =>
+  validationErrors.value.filter(e => e.severity === 'error').length
+)
+
+// 队列进度计算
+const queueCompleted = computed(() =>
+  taskStore.tasks.filter(t => t.status === 'finished').length
+)
+const queueTotal = computed(() =>
+  taskStore.tasks.filter(t => t.status !== 'created').length
+)
+const activeTasks = computed(() =>
+  taskStore.tasks.filter(t => ['processing', 'queued'].includes(t.status)).length
+)
+
+// Grid 布局样式
+const gridStyle = computed(() => ({
+  gridTemplateColumns: `1fr 4px ${sidebarWidth.value}px`
+}))
+
+// ========== 数据加载 ==========
+
+// 加载项目数据
 async function loadProject() {
   isLoading.value = true
   loadError.value = null
@@ -245,56 +306,45 @@ async function loadProject() {
     // 设置元数据
     projectStore.meta.jobId = props.jobId
     projectStore.meta.filename = jobStatus.filename || '未知文件'
-    projectStore.meta.title = jobStatus.title || ''  // 加载用户自定义名称
+    projectStore.meta.title = jobStatus.title || ''
     projectStore.meta.videoPath = mediaApi.getVideoUrl(props.jobId)
     projectStore.meta.audioPath = mediaApi.getAudioUrl(props.jobId)
     projectStore.meta.duration = jobStatus.media_status?.video?.duration || 0
 
-    // 2. 尝试从本地存储恢复（优先使用本地编辑的数据）
+    // 2. 尝试从本地存储恢复
     const restored = await projectStore.restoreProject(props.jobId)
     if (restored && projectStore.subtitles.length > 0) {
-      console.log('[EditorView] 从本地存储恢复成功，字幕数量:', projectStore.subtitles.length)
+      console.log('[EditorView] 从本地存储恢复成功')
       isTranscribing.value = false
-      return  // 使用本地数据，不再从后端加载
+      return
     }
 
-    // 3. 本地无数据，根据任务状态从后端加载字幕数据
+    // 3. 根据任务状态从后端加载字幕数据
     if (jobStatus.status === 'finished') {
-      // 任务已完成，加载完整 SRT
       await loadCompletedSRT()
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
-      // 正在转录，加载已有的 segments 并订阅 SSE
       isTranscribing.value = true
       await loadTranscribingSegments()
       subscribeSSE()
       startProgressPolling()
     } else if (jobStatus.status === 'created') {
-      // 任务刚创建，等待开始
       isTranscribing.value = true
       subscribeSSE()
     } else if (jobStatus.status === 'failed') {
-      // 任务失败，尝试加载已有 segments
       await loadTranscribingSegments()
     }
-    // paused, canceled 状态也尝试加载已有内容
 
     console.log('[EditorView] 项目加载完成')
   } catch (error) {
     console.error('[EditorView] 加载项目失败:', error)
 
-    // 第一阶段修复：处理 404 错误，清理无效任务
     if (error.response?.status === 404) {
-      console.warn(`[EditorView] 任务已在后端删除: ${props.jobId}，正在清理本地记录...`)
+      console.warn(`[EditorView] 任务已在后端删除: ${props.jobId}`)
       try {
-        // 删除本地任务记录
         await taskStore.deleteTask(props.jobId)
         loadError.value = '任务不存在（已被删除），本地记录已清理'
-        // 2秒后返回任务列表
-        setTimeout(() => {
-          router.push('/tasks')
-        }, 2000)
+        setTimeout(() => router.push('/tasks'), 2000)
       } catch (deleteError) {
-        console.error('[EditorView] 删除本地任务记录失败:', deleteError)
         loadError.value = '任务不存在，且清理本地记录失败，请刷新页面'
       }
     } else {
@@ -309,8 +359,6 @@ async function loadProject() {
 async function loadCompletedSRT() {
   try {
     const srtData = await mediaApi.getSRTContent(props.jobId)
-    console.log('[EditorView] SRT 数据:', srtData)
-
     projectStore.importSRT(srtData.content, {
       jobId: props.jobId,
       filename: srtData.filename || projectStore.meta.filename,
@@ -325,14 +373,11 @@ async function loadCompletedSRT() {
   }
 }
 
-// 加载正在转录的 segments（从 checkpoint）
+// 加载转录中的 segments
 async function loadTranscribingSegments() {
   try {
     const textData = await transcriptionApi.getTranscriptionText(props.jobId)
-    console.log('[EditorView] 转录文字数据:', textData)
-
     if (textData.segments && textData.segments.length > 0) {
-      // 将 segments 转换为 SRT 格式
       const srtContent = segmentsToSRT(textData.segments)
       projectStore.importSRT(srtContent, {
         jobId: props.jobId,
@@ -345,14 +390,12 @@ async function loadTranscribingSegments() {
     }
   } catch (error) {
     console.warn('[EditorView] 加载转录文字失败:', error)
-    // 没有数据也不报错，等待 SSE 推送
   }
 }
 
-// 将 segments 转换为 SRT 格式字符串
+// Segments 转 SRT 格式
 function segmentsToSRT(segments) {
   if (!segments || segments.length === 0) return ''
-
   return segments.map((seg, idx) => {
     const start = formatSRTTime(seg.start)
     const end = formatSRTTime(seg.end)
@@ -360,7 +403,7 @@ function segmentsToSRT(segments) {
   }).join('\n')
 }
 
-// 格式化为 SRT 时间格式
+// SRT 时间格式化
 function formatSRTTime(seconds) {
   const h = Math.floor(seconds / 3600)
   const m = Math.floor((seconds % 3600) / 60)
@@ -369,26 +412,20 @@ function formatSRTTime(seconds) {
   return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')},${ms.toString().padStart(3, '0')}`
 }
 
-// 订阅 SSE 实时进度
+// ========== SSE 实时更新 ==========
+
 function subscribeSSE() {
   const sseUrl = `/api/stream/${props.jobId}`
   console.log('[EditorView] 订阅 SSE:', sseUrl)
-
-  // 连接 SSE
   sseService.connect(sseUrl)
 
-  // 监听进度事件
   const handleProgress = (data) => {
-    console.log('[EditorView] SSE progress:', data)
     taskProgress.value = data.percent || 0
     taskStatus.value = data.status
   }
 
-  // 监听信号事件（完成/失败）
   const handleSignal = async (data) => {
-    console.log('[EditorView] SSE signal:', data)
     if (data.signal === 'job_complete') {
-      // 转录完成，加载完整 SRT
       isTranscribing.value = false
       taskStatus.value = 'finished'
       await loadCompletedSRT()
@@ -400,7 +437,6 @@ function subscribeSSE() {
     }
   }
 
-  // 监听消息
   const handleMessage = (msg) => {
     if (msg.type === 'progress') handleProgress(msg.data)
     if (msg.type === 'signal') handleSignal(msg.data)
@@ -410,7 +446,6 @@ function subscribeSSE() {
   sseService.on('signal', handleSignal)
   sseService.on('message', handleMessage)
 
-  // 保存取消订阅函数
   sseUnsubscribe = () => {
     sseService.off('progress', handleProgress)
     sseService.off('signal', handleSignal)
@@ -419,7 +454,6 @@ function subscribeSSE() {
   }
 }
 
-// 开始进度轮询（定期刷新 segments）
 function startProgressPolling() {
   stopProgressPolling()
   progressPollTimer = setInterval(async () => {
@@ -430,12 +464,11 @@ function startProgressPolling() {
     try {
       await loadTranscribingSegments()
     } catch (e) {
-      console.warn('[EditorView] 轮询刷新 segments 失败:', e)
+      console.warn('[EditorView] 轮询刷新失败:', e)
     }
-  }, 5000) // 每5秒刷新一次
+  }, 5000)
 }
 
-// 停止进度轮询
 function stopProgressPolling() {
   if (progressPollTimer) {
     clearInterval(progressPollTimer)
@@ -443,16 +476,14 @@ function stopProgressPolling() {
   }
 }
 
-// 保存项目到后端
+// ========== 保存功能 ==========
+
 async function saveProject() {
   if (saving.value) return
   saving.value = true
   try {
-    // 生成 SRT 内容
     const srtContent = projectStore.generateSRT()
-    // 调用后端 API 保存
     await mediaApi.saveSRTContent(props.jobId, srtContent)
-    // 更新本地状态
     await projectStore.saveProject()
     lastSaved.value = Date.now()
     console.log('[EditorView] 项目保存成功')
@@ -464,20 +495,71 @@ async function saveProject() {
   }
 }
 
+// ========== 任务控制 ==========
+
+async function pauseTranscription() {
+  try {
+    await transcriptionApi.pauseJob(props.jobId)
+    taskStatus.value = 'paused'
+    isTranscribing.value = false
+  } catch (error) {
+    console.error('暂停任务失败:', error)
+  }
+}
+
+async function cancelTranscription() {
+  if (!confirm('确定要取消当前转录任务吗?')) return
+  try {
+    await transcriptionApi.cancelJob(props.jobId, false)
+    taskStatus.value = 'canceled'
+    isTranscribing.value = false
+  } catch (error) {
+    console.error('取消任务失败:', error)
+  }
+}
+
+// ========== 撤销/重做 ==========
+
 function undo() { if (canUndo.value) projectStore.undo() }
 function redo() { if (canRedo.value) projectStore.redo() }
-function toggleExportMenu() { showExportMenu.value = !showExportMenu.value }
+
+// ========== 导出功能 ==========
+
+// 监听导出事件（从 EditorHeader 触发）
+onMounted(() => {
+  window.addEventListener('header-export', handleExportEvent)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('header-export', handleExportEvent)
+})
+
+function handleExportEvent(event) {
+  const format = event.detail
+  handleExport(format)
+}
 
 function handleExport(format) {
-  showExportMenu.value = false
   let content = ''
   let filename = projectName.value.replace(/\.[^/.]+$/, '')
 
   switch (format) {
-    case 'srt': content = projectStore.generateSRT(); filename += '.srt'; break
-    case 'vtt': content = generateVTT(); filename += '.vtt'; break
-    case 'txt': content = projectStore.subtitles.map(s => s.text).join('\n'); filename += '.txt'; break
-    case 'json': content = JSON.stringify(projectStore.subtitles, null, 2); filename += '.json'; break
+    case 'srt':
+      content = projectStore.generateSRT()
+      filename += '.srt'
+      break
+    case 'vtt':
+      content = generateVTT()
+      filename += '.vtt'
+      break
+    case 'txt':
+      content = projectStore.subtitles.map(s => s.text).join('\n')
+      filename += '.txt'
+      break
+    case 'json':
+      content = JSON.stringify(projectStore.subtitles, null, 2)
+      filename += '.json'
+      break
   }
 
   downloadFile(content, filename)
@@ -510,13 +592,57 @@ function downloadFile(content, filename) {
   URL.revokeObjectURL(url)
 }
 
-function handleVideoLoaded(duration) { console.log('视频加载完成:', duration) }
-function handleVideoError(error) { console.error('视频加载错误:', error) }
-function handleWaveformReady() { console.log('波形加载完成') }
-function handleRegionUpdate(region) { console.log('区域更新:', region) }
-function handleRegionClick(region) { console.log('区域点击:', region) }
-function handleSubtitleClick(subtitle) { console.log('字幕点击:', subtitle) }
-function handleSubtitleEdit(id, field, value) { console.log('字幕编辑:', id, field, value) }
+// ========== 拖拽调整宽度 ==========
+
+function startResize(e) {
+  isResizing.value = true
+  document.addEventListener('mousemove', onResize)
+  document.addEventListener('mouseup', stopResize)
+}
+
+function onResize(e) {
+  if (!isResizing.value) return
+  const newWidth = window.innerWidth - e.clientX
+  sidebarWidth.value = Math.max(280, Math.min(600, newWidth))
+}
+
+function stopResize() {
+  isResizing.value = false
+  document.removeEventListener('mousemove', onResize)
+  document.removeEventListener('mouseup', stopResize)
+  // 保存用户偏好
+  localStorage.setItem('editor-sidebar-width', sidebarWidth.value.toString())
+}
+
+// ========== 事件处理 ==========
+
+function handleVideoLoaded(duration) {
+  console.log('视频加载完成:', duration)
+}
+
+function handleVideoError(error) {
+  console.error('视频加载错误:', error)
+}
+
+function handleWaveformReady() {
+  console.log('波形加载完成')
+}
+
+function handleRegionUpdate(region) {
+  console.log('区域更新:', region)
+}
+
+function handleRegionClick(region) {
+  console.log('区域点击:', region)
+}
+
+function handleSubtitleClick(subtitle) {
+  console.log('字幕点击:', subtitle)
+}
+
+function handleSubtitleEdit(id, field, value) {
+  console.log('字幕编辑:', id, field, value)
+}
 
 function jumpToError(error) {
   const subtitle = projectStore.subtitles[error.index]
@@ -527,209 +653,154 @@ function jumpToError(error) {
   }
 }
 
-function startResize(e) {
-  isResizing.value = true
-  document.addEventListener('mousemove', onResize)
-  document.addEventListener('mouseup', stopResize)
+function showSettings() {
+  // TODO: 实现设置面板
+  console.log('打开设置')
 }
-
-function onResize(e) {
-  if (!isResizing.value) return
-  const newWidth = e.clientX
-  leftPanelWidth.value = Math.max(400, Math.min(window.innerWidth - 400, newWidth))
-}
-
-function stopResize() {
-  isResizing.value = false
-  document.removeEventListener('mousemove', onResize)
-  document.removeEventListener('mouseup', stopResize)
-}
-
-function handleClickOutside(e) {
-  if (exportDropdownRef.value && !exportDropdownRef.value.contains(e.target)) {
-    showExportMenu.value = false
-  }
-}
-
-// ========== 快捷键操作函数 ==========
-
-// 播放/暂停切换
-function togglePlay() {
-  projectStore.player.isPlaying = !projectStore.player.isPlaying
-}
-
-// 上一帧（步进后退）
-function stepBackward() {
-  // TODO: 实现逐帧后退功能（需要根据帧率计算）
-  const frameTime = 1 / 30 // 假设30fps
-  const newTime = Math.max(0, projectStore.player.currentTime - frameTime)
-  projectStore.seekTo(newTime)
-}
-
-// 下一帧（步进前进）
-function stepForward() {
-  // TODO: 实现逐帧前进功能（需要根据帧率计算）
-  const frameTime = 1 / 30 // 假设30fps
-  const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + frameTime)
-  projectStore.seekTo(newTime)
-}
-
-// 快退5秒
-function seekBackward() {
-  const newTime = Math.max(0, projectStore.player.currentTime - 5)
-  projectStore.seekTo(newTime)
-}
-
-// 快进5秒
-function seekForward() {
-  const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + 5)
-  projectStore.seekTo(newTime)
-}
-
-// 跳转到开头
-function seekToStart() {
-  projectStore.seekTo(0)
-}
-
-// 跳转到结尾
-function seekToEnd() {
-  projectStore.seekTo(projectStore.meta.duration)
-}
-
-// 波形放大
-function zoomInWave() {
-  // TODO: 需要 WaveformTimeline 组件暴露 zoomIn 方法
-  console.log('波形放大功能待实现')
-}
-
-// 波形缩小
-function zoomOutWave() {
-  // TODO: 需要 WaveformTimeline 组件暴露 zoomOut 方法
-  console.log('波形缩小功能待实现')
-}
-
-// 波形适应屏幕
-function fitWave() {
-  // TODO: 需要 WaveformTimeline 组件暴露 fitToScreen 方法
-  console.log('波形适应屏幕功能待实现')
-}
-
-// 视频画面放大
-function zoomInVideo() {
-  // TODO: 需要实现视频画面缩放功能
-  console.log('视频画面放大功能待实现')
-}
-
-// 视频画面缩小
-function zoomOutVideo() {
-  // TODO: 需要实现视频���面缩放功能
-  console.log('视频画面缩小功能待实现')
-}
-
-// 画面适应窗口
-function fitVideo() {
-  // TODO: 需要实现视频画面自适应功能
-  console.log('画面适应窗口功能待实现')
-}
-
-// 字体变大
-function fontSizeUp() {
-  // TODO: 需要实现字幕字体大小调整功能
-  console.log('字体变大功能待实现')
-}
-
-// 字体变小
-function fontSizeDown() {
-  // TODO: 需要实现字幕字体大小调整功能
-  console.log('字体变小功能待实现')
-}
-
-// 分割字幕
-function splitSubtitle() {
-  // TODO: 需要实现在当前播放位置分割字幕的功能
-  console.log('分割字幕功能待实现')
-}
-
-// 合并字幕
-function mergeSubtitle() {
-  // TODO: 需要实现合并选中字幕的功能
-  console.log('合并字幕功能待实现')
-}
-
-// 导出（显示导出菜单）
-function exportSubtitle() {
-  showExportMenu.value = !showExportMenu.value
-}
-
-// 打开任务监控
-function openTaskMonitor() {
-  // TODO: 需要实现任务监控面板功能
-  console.log('打开任务监控功能待实现')
-}
-
-// 使用快捷键系统
-useShortcuts({
-  // 播放与导航
-  togglePlay,           // Space: 播放/暂停
-  stepBackward,         // Left: 上一帧
-  stepForward,          // Right: 下一帧
-  seekBackward,         // Shift+Left: 快退5秒
-  seekForward,          // Shift+Right: 快进5秒
-  seekToStart,          // Home: 跳转到开头
-  seekToEnd,            // End: 跳转到结尾
-
-  // 视图缩放
-  zoomInWave,           // =: 波形放大
-  zoomOutWave,          // -: 波形缩小
-  fitWave,              // \: 波形适应屏幕
-  zoomInVideo,          // .: 视频画面放大
-  zoomOutVideo,         // ,: 视频画面缩小
-  fitVideo,             // Shift+Z: 画面适应窗口
-
-  // 字幕编辑
-  fontSizeUp,           // Alt+]: 字体变大
-  fontSizeDown,         // Alt+[: 字体变小
-  splitSubtitle,        // Ctrl+K: 分割字幕
-  mergeSubtitle,        // Ctrl+J: 合并字幕
-
-  // 全局操作
-  save: saveProject,    // Ctrl+S: 保存
-  undo,                 // Ctrl+Z: 撤销
-  redo,                 // Ctrl+Shift+Z 或 Ctrl+Y: 重做
-  export: exportSubtitle, // Ctrl+E: 导出
-  openTaskMonitor,      // Ctrl+M: 打开任务监控
-})
 
 function formatLastSaved(timestamp) {
   const date = new Date(timestamp)
   return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
+// ========== 快捷键操作 ==========
+
+function togglePlay() {
+  projectStore.player.isPlaying = !projectStore.player.isPlaying
+}
+
+function stepBackward() {
+  const frameTime = 1 / 30
+  const newTime = Math.max(0, projectStore.player.currentTime - frameTime)
+  projectStore.seekTo(newTime)
+}
+
+function stepForward() {
+  const frameTime = 1 / 30
+  const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + frameTime)
+  projectStore.seekTo(newTime)
+}
+
+function seekBackward() {
+  const newTime = Math.max(0, projectStore.player.currentTime - 5)
+  projectStore.seekTo(newTime)
+}
+
+function seekForward() {
+  const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + 5)
+  projectStore.seekTo(newTime)
+}
+
+function seekToStart() {
+  projectStore.seekTo(0)
+}
+
+function seekToEnd() {
+  projectStore.seekTo(projectStore.meta.duration)
+}
+
+function zoomInWave() {
+  console.log('波形放大')
+}
+
+function zoomOutWave() {
+  console.log('波形缩小')
+}
+
+function fitWave() {
+  console.log('波形适应屏幕')
+}
+
+function zoomInVideo() {
+  console.log('视频画面放大')
+}
+
+function zoomOutVideo() {
+  console.log('视频画面缩小')
+}
+
+function fitVideo() {
+  console.log('画面适应窗口')
+}
+
+function fontSizeUp() {
+  console.log('字体变大')
+}
+
+function fontSizeDown() {
+  console.log('字体变小')
+}
+
+function splitSubtitle() {
+  console.log('分割字幕')
+}
+
+function mergeSubtitle() {
+  console.log('合并字幕')
+}
+
+function exportSubtitle() {
+  // 触发导出菜单
+}
+
+function openTaskMonitor() {
+  console.log('打开任务监控')
+}
+
+// 使用快捷键系统
+useShortcuts({
+  togglePlay,
+  stepBackward,
+  stepForward,
+  seekBackward,
+  seekForward,
+  seekToStart,
+  seekToEnd,
+  zoomInWave,
+  zoomOutWave,
+  fitWave,
+  zoomInVideo,
+  zoomOutVideo,
+  fitVideo,
+  fontSizeUp,
+  fontSizeDown,
+  splitSubtitle,
+  mergeSubtitle,
+  save: saveProject,
+  undo,
+  redo,
+  export: exportSubtitle,
+  openTaskMonitor,
+})
+
+// ========== 生命周期 ==========
+
+onMounted(() => {
+  // 恢复侧边栏宽度偏好
+  const savedWidth = localStorage.getItem('editor-sidebar-width')
+  if (savedWidth) {
+    sidebarWidth.value = parseInt(savedWidth)
+  }
+
+  loadProject()
+})
+
+onUnmounted(() => {
+  if (sseUnsubscribe) sseUnsubscribe()
+  stopProgressPolling()
+})
+
 onBeforeRouteLeave(async (to, from) => {
-  // 如果有未保存的修改，自动保存后再离开
   if (isDirty.value) {
     try {
       await projectStore.saveProject()
       console.log('[EditorView] 离开前自动保存成功')
     } catch (error) {
       console.error('[EditorView] 离开前保存失败:', error)
-      // 保存失败时询问用户是否仍要离开
       const answer = window.confirm('保存失败，确定要离开吗? 未保存的修改可能会丢失。')
       if (!answer) return false
     }
   }
-})
-
-onMounted(() => {
-  loadProject()
-  document.addEventListener('click', handleClickOutside)
-})
-
-onUnmounted(() => {
-  document.removeEventListener('click', handleClickOutside)
-  // ���理 SSE 订阅和轮询
-  if (sseUnsubscribe) sseUnsubscribe()
-  stopProgressPolling()
 })
 </script>
 
@@ -743,6 +814,7 @@ onUnmounted(() => {
   height: 100vh;
   background: var(--bg-base);
   color: var(--text-normal);
+  overflow: hidden;
 }
 
 // 加载状态
@@ -799,8 +871,10 @@ onUnmounted(() => {
     padding: 10px 24px;
     background: var(--primary);
     color: white;
+    border: none;
     border-radius: var(--radius-md);
     font-size: 14px;
+    cursor: pointer;
     transition: background var(--transition-fast);
     &:hover { background: var(--primary-hover); }
   }
@@ -815,115 +889,241 @@ onUnmounted(() => {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.editor-header {
-  @include flex-between;
-  height: 56px;
-  padding: 0 16px;
-  background: var(--bg-primary);
-  border-bottom: 1px solid var(--border-default);
-  flex-shrink: 0;
+// 主工作区 Grid 布局
+.workspace-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 4px 350px;
+  height: 100%;
+  overflow: hidden;
+}
 
-  .header-left, .header-center, .header-right { display: flex; align-items: center; gap: 12px; }
-  .header-center { flex: 1; justify-content: center; max-width: 600px; margin: 0 24px; }
+// 舞台列 (三明治结构: 视频 + 控制 + 波形)
+.stage-column {
+  display: grid;
+  grid-template-rows: 1fr 48px 160px;
+  background: #000;
+  min-width: 0;
+  overflow: hidden;
 
-  .back-btn {
-    @include flex-center;
-    width: 36px;
-    height: 36px;
-    border-radius: var(--radius-md);
-    color: var(--text-secondary);
-    transition: all var(--transition-fast);
-    svg { width: 20px; height: 20px; }
-    &:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+  .video-wrapper {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    overflow: hidden;
   }
 
-  .project-name { font-size: 16px; font-weight: 600; color: var(--text-primary); margin: 0; }
-  .unsaved-badge { padding: 2px 8px; background: rgba(210, 153, 34, 0.15); color: var(--warning); font-size: 11px; border-radius: var(--radius-full); }
-  .transcribing-badge {
-    display: flex; align-items: center; gap: 6px;
-    padding: 2px 10px; background: rgba(88, 166, 255, 0.15); color: var(--primary);
-    font-size: 11px; border-radius: var(--radius-full);
-    .spinner-small { width: 12px; height: 12px; border: 2px solid rgba(88, 166, 255, 0.3); border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite; }
+  .controls-wrapper {
+    background: var(--bg-primary);
+    border-top: 1px solid var(--border-default);
   }
-  .queued-badge { padding: 2px 8px; background: rgba(139, 148, 158, 0.15); color: var(--text-muted); font-size: 11px; border-radius: var(--radius-full); }
 
-  .btn-group { display: flex; background: var(--bg-secondary); border-radius: var(--radius-md); overflow: hidden; }
-
-  .header-btn {
-    height: 36px;
-    padding: 0 12px;
-    @include flex-center;
-    gap: 6px;
+  .waveform-wrapper {
     background: var(--bg-secondary);
-    border-radius: var(--radius-md);
-    color: var(--text-normal);
-    font-size: 13px;
-    transition: all var(--transition-fast);
-    svg { width: 18px; height: 18px; }
-    .arrow { width: 14px; height: 14px; margin-left: -2px; }
-    &:hover { background: var(--bg-tertiary); }
-    &.disabled { opacity: 0.4; pointer-events: none; }
-    &--primary { background: var(--primary); color: white; &:hover { background: var(--primary-hover); } }
-    &.loading { pointer-events: none; }
-    .spinner { width: 14px; height: 14px; border: 2px solid rgba(255, 255, 255, 0.3); border-top-color: white; border-radius: 50%; animation: spin 0.8s linear infinite; }
-  }
-
-  .dropdown { position: relative; }
-  .dropdown-menu {
-    position: absolute; top: 100%; right: 0; margin-top: 4px;
-    background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg); padding: 4px; z-index: 100; min-width: 140px;
-    button { display: block; width: 100%; padding: 8px 12px; text-align: left; font-size: 13px; color: var(--text-normal); border-radius: var(--radius-sm); transition: background var(--transition-fast); &:hover { background: var(--bg-tertiary); } }
+    border-top: 1px solid var(--border-default);
+    overflow: hidden;
   }
 }
 
-.editor-main { flex: 1; display: flex; overflow: hidden; }
-.panel { display: flex; flex-direction: column; overflow: hidden; }
-.panel-left { min-width: 400px; .video-section { flex: 1; min-height: 200px; padding: 12px; } .timeline-section { height: 240px; padding: 0 12px 12px; } }
-.resizer { width: 4px; background: var(--border-default); cursor: col-resize; transition: background var(--transition-fast); &:hover { background: var(--primary); } }
-.panel-right { flex: 1; min-width: 350px; display: flex; flex-direction: column; background: var(--bg-primary); }
+// 可拖拽分隔条
+.resizer {
+  width: 4px;
+  background: var(--border-default);
+  cursor: col-resize;
+  transition: background 0.2s;
+  position: relative;
+  z-index: 10;
 
+  &:hover, &.active {
+    background: var(--primary);
+  }
+}
+
+// 侧边栏
+.sidebar-column {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+  border-left: 1px solid var(--border-default);
+  min-width: 280px;
+  max-width: 600px;
+  overflow: hidden;
+}
+
+// 标签页导航
 .tab-nav {
-  display: flex; padding: 0 12px; background: var(--bg-secondary); border-bottom: 1px solid var(--border-default);
+  display: flex;
+  padding: 0 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-default);
+
   .tab-btn {
-    position: relative; padding: 12px 16px; font-size: 13px; color: var(--text-secondary); transition: color var(--transition-fast);
-    &::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: transparent; transition: background var(--transition-fast); }
+    position: relative;
+    padding: 12px 16px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    transition: color var(--transition-fast);
+
+    &::after {
+      content: '';
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: transparent;
+      transition: background var(--transition-fast);
+    }
+
     &:hover { color: var(--text-normal); }
-    &.active { color: var(--primary); &::after { background: var(--primary); } }
-    .badge { @include flex-center; min-width: 18px; height: 18px; margin-left: 6px; padding: 0 5px; background: var(--danger); color: white; font-size: 11px; border-radius: var(--radius-full); }
+
+    &.active {
+      color: var(--primary);
+      &::after { background: var(--primary); }
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 18px;
+      height: 18px;
+      margin-left: 6px;
+      padding: 0 5px;
+      background: var(--danger);
+      color: white;
+      font-size: 11px;
+      border-radius: var(--radius-full);
+    }
   }
 }
 
+// 标签页内容
 .tab-content { flex: 1; overflow: hidden; }
 .tab-pane { height: 100%; overflow: auto; }
 
+// 占位面板
 .placeholder-panel {
   @include flex-center;
   @include flex-column;
-  padding: 48px 24px; text-align: center; color: var(--text-muted);
-  svg { width: 48px; height: 48px; margin-bottom: 16px; opacity: 0.5; }
-  h3 { font-size: 16px; font-weight: 600; color: var(--text-normal); margin-bottom: 8px; }
+  padding: 48px 24px;
+  text-align: center;
+  color: var(--text-muted);
+
+  svg {
+    width: 48px;
+    height: 48px;
+    margin-bottom: 16px;
+    opacity: 0.5;
+  }
+
+  h3 {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-normal);
+    margin-bottom: 8px;
+  }
+
   p { font-size: 13px; margin-bottom: 4px; }
   .coming-soon { color: var(--primary); font-style: italic; }
-  .error-list { width: 100%; max-width: 400px; margin-top: 16px; text-align: left; }
+
+  .error-list {
+    width: 100%;
+    max-width: 400px;
+    margin-top: 16px;
+    text-align: left;
+  }
+
   .error-item {
-    display: flex; align-items: center; gap: 8px; padding: 8px 12px; margin-bottom: 4px;
-    background: var(--bg-secondary); border-radius: var(--radius-sm); cursor: pointer; transition: background var(--transition-fast);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    margin-bottom: 4px;
+    background: var(--bg-secondary);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background var(--transition-fast);
+
     &:hover { background: var(--bg-tertiary); }
     &.error { border-left: 3px solid var(--danger); }
     &.warning { border-left: 3px solid var(--warning); }
-    .error-index { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
-    .error-message { font-size: 13px; color: var(--text-normal); }
+
+    .error-index {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .error-message {
+      font-size: 13px;
+      color: var(--text-normal);
+    }
   }
 }
 
+// 底部状态栏
 .editor-footer {
-  @include flex-between;
-  height: 28px; padding: 0 16px;
-  background: var(--bg-secondary); border-top: 1px solid var(--border-default);
-  font-size: 12px; color: var(--text-muted); flex-shrink: 0;
-  .footer-left, .footer-center, .footer-right { display: flex; align-items: center; gap: 8px; }
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 28px;
+  padding: 0 16px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border-default);
+  font-size: 12px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+
+  .footer-left, .footer-center, .footer-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .save-time {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--text-secondary);
+
+    .icon {
+      width: 14px;
+      height: 14px;
+      color: var(--success);
+    }
+  }
+
+  .error-indicator {
+    color: var(--danger);
+    cursor: pointer;
+    &:hover { text-decoration: underline; }
+  }
+
+  .settings-btn {
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s;
+
+    svg { width: 16px; height: 16px; }
+
+    &:hover {
+      background: var(--bg-tertiary);
+      color: var(--text-normal);
+    }
+  }
+
   .divider { color: var(--border-default); }
-  .error-indicator { color: var(--danger); cursor: pointer; &:hover { text-decoration: underline; } }
 }
 </style>
