@@ -7,6 +7,7 @@
           v-if="processingTask"
           :key="processingTask.job_id"
           :task="processingTask"
+          :currentJobId="currentJobId"
           variant="processing"
         />
       </TransitionGroup>
@@ -14,7 +15,9 @@
       <!-- 无任务时的空状态 -->
       <div v-if="!processingTask && !hasAnyTasks" class="empty-state">
         <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+          <path
+            d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"
+          />
         </svg>
         <p>暂无后台任务</p>
       </div>
@@ -25,7 +28,7 @@
       <!-- SSE 断开警告 -->
       <div v-if="!sseConnected" class="sse-alert">
         <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/>
+          <path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z" />
         </svg>
         <span>实时连接已断开，正在尝试重连...</span>
       </div>
@@ -38,11 +41,14 @@
         variant="danger"
         :defaultCollapsed="true"
       >
-        <TaskCard
-          v-for="task in failedTasks"
-          :key="task.job_id"
-          :task="task"
-        />
+        <TransitionGroup name="list">
+          <TaskCard
+            v-for="task in failedTasks"
+            :key="task.job_id"
+            :task="task"
+            :currentJobId="currentJobId"
+          />
+        </TransitionGroup>
       </TaskGroup>
 
       <!-- 排队中（可拖动） -->
@@ -64,7 +70,7 @@
           @end="handleDragEnd"
         >
           <template #item="{ element }">
-            <TaskCard :task="element" :draggable="true" />
+            <TaskCard :task="element" :draggable="true" :currentJobId="currentJobId" />
           </template>
         </Draggable>
       </TaskGroup>
@@ -77,11 +83,14 @@
         variant="warning"
         :defaultCollapsed="true"
       >
-        <TaskCard
-          v-for="task in pausedTasks"
-          :key="task.job_id"
-          :task="task"
-        />
+        <TransitionGroup name="list">
+          <TaskCard
+            v-for="task in pausedTasks"
+            :key="task.job_id"
+            :task="task"
+            :currentJobId="currentJobId"
+          />
+        </TransitionGroup>
       </TaskGroup>
 
       <!-- 最近完成 -->
@@ -97,13 +106,12 @@
             v-for="task in recentFinishedTasks"
             :key="task.job_id"
             :task="task"
+            :currentJobId="currentJobId"
             :class="{ 'newly-finished': task.isNewlyFinished }"
           />
         </TransitionGroup>
 
-        <div class="view-more" @click="openHistoryPage">
-          查看全部历史记录 >
-        </div>
+        <div class="view-more" @click="openHistoryPage">查看全部历史记录 ></div>
       </TaskGroup>
     </div>
 
@@ -123,77 +131,75 @@
  * - 拖动排序（仅队列任务）
  * - SSE 心跳检测
  */
-import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
-import { useRouter } from 'vue-router'
-import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
-import Draggable from 'vuedraggable'
-import TaskGroup from './TaskGroup.vue'
-import TaskCard from './TaskCard.vue'
+import { computed, ref, onMounted, onUnmounted, watch } from "vue";
+import { useRouter } from "vue-router";
+import { useUnifiedTaskStore } from "@/stores/unifiedTaskStore";
+import Draggable from "vuedraggable";
+import TaskGroup from "./TaskGroup.vue";
+import TaskCard from "./TaskCard.vue";
 
 const props = defineProps({
-  currentJobId: { type: String, default: '' }
-})
+  currentJobId: { type: String, default: "" },
+});
 
-const router = useRouter()
-const taskStore = useUnifiedTaskStore()
+const router = useRouter();
+const taskStore = useUnifiedTaskStore();
 
 // 从 store 获取数据
-const processingTask = computed(() => taskStore.processingTask)
-const queuedTasks = computed(() => taskStore.queuedTasks)
-const failedTasks = computed(() => taskStore.failedTasks)
-const pausedTasks = computed(() => taskStore.pausedTasks)
-const recentFinishedTasks = computed(() => taskStore.recentFinishedTasks)
-const sseConnected = computed(() => taskStore.sseConnected)
+const processingTask = computed(() => taskStore.processingTask);
+const queuedTasks = computed(() => taskStore.queuedTasks);
+const failedTasks = computed(() => taskStore.failedTasks);
+const pausedTasks = computed(() => taskStore.pausedTasks);
+const recentFinishedTasks = computed(() => taskStore.recentFinishedTasks);
+const sseConnected = computed(() => taskStore.sseConnected);
 
-const hasAnyTasks = computed(() =>
-  taskStore.tasks.length > 0
-)
+const hasAnyTasks = computed(() => taskStore.tasks.length > 0);
 
 // 本地可拖动任务列表
-const queuedTasksLocal = ref([])
+const queuedTasksLocal = ref([]);
 
 // 监听 store 的 queuedTasks 变化，更新本地列表
 watch(
   () => queuedTasks.value,
   (newTasks) => {
-    queuedTasksLocal.value = [...newTasks]
+    queuedTasksLocal.value = [...newTasks];
   },
   { immediate: true, deep: true }
-)
+);
 
 // 拖动结束处理
 async function handleDragEnd(event) {
-  if (event.oldIndex === event.newIndex) return
+  if (event.oldIndex === event.newIndex) return;
 
-  const newOrder = queuedTasksLocal.value.map(t => t.job_id)
+  const newOrder = queuedTasksLocal.value.map((t) => t.job_id);
   try {
-    await taskStore.reorderQueue(newOrder)
+    await taskStore.reorderQueue(newOrder);
   } catch (error) {
-    console.error('[TaskMonitor] 队列重排失败:', error)
+    console.error("[TaskMonitor] 队列重排失败:", error);
     // 恢复原顺序
-    queuedTasksLocal.value = [...queuedTasks.value]
+    queuedTasksLocal.value = [...queuedTasks.value];
   }
 }
 
 // 打开历史记录页面
 function openHistoryPage() {
   // TODO: 实现历史记录页面
-  console.log('[TaskMonitor] 打开历史记录页面')
+  console.log("[TaskMonitor] 打开历史记录页面");
 }
 
 // SSE 心跳检测
-let heartbeatTimer = null
+let heartbeatTimer = null;
 onMounted(() => {
   heartbeatTimer = setInterval(() => {
-    taskStore.checkSSEConnection()
-  }, 5000)
-})
+    taskStore.checkSSEConnection();
+  }, 5000);
+});
 
 onUnmounted(() => {
   if (heartbeatTimer) {
-    clearInterval(heartbeatTimer)
+    clearInterval(heartbeatTimer);
   }
-})
+});
 </script>
 
 <style lang="scss" scoped>
@@ -203,24 +209,38 @@ onUnmounted(() => {
   height: 100%;
   background: var(--bg-secondary);
   position: relative;
+  user-select: none; // 禁止文本选择，避免出现文本光标
+  cursor: default; // 默认光标，不是文本光标
 }
 
 .monitor-header {
   flex-shrink: 0;
-  background: var(--bg-primary);
-  border-bottom: 1px solid var(--border-default);
+  background: var(--bg-secondary);
   max-height: 300px;
   overflow-y: auto;
-  padding: 12px;
-  box-shadow: var(--shadow-sm);
+  padding: 5px; // 移除默认 padding，由内部元素控制间距
   z-index: 10;
+
+  // 当有 processing 任务时，添加底部边距
+  &:has(.task-card) {
+    padding: 12px;
+    padding-bottom: 8px; // 减小与 monitor-body 的间距
+  }
+
+  // 空状态时的 padding
+  &:has(.empty-state) {
+    padding: 12px;
+  }
 }
 
 .monitor-body {
-  flex: 1;
+  flex: 0 1 auto;  // 自动伸缩，不强制占满所有空间
+  max-height: 500px;  // 设置最大高度，防止过度伸展
   overflow-y: auto;
   padding: 12px;
-  padding-bottom: 64px;  // 为渐变遮罩留空间
+  padding-top: 4px;  // 减小与 monitor-header 的间距
+  padding-bottom: 24px;  // 缩小为渐变遮罩留的空间
+  scrollbar-gutter: stable;  // 为滚动条预留空间，防止滚动条出现时宽度变化
 
   &::-webkit-scrollbar {
     width: 8px;
@@ -236,9 +256,18 @@ onUnmounted(() => {
   bottom: 0;
   left: 0;
   right: 0;
-  height: 48px;
+  height: 24px; // 缩小渐变高度
   background: linear-gradient(to top, var(--bg-secondary), transparent);
   pointer-events: none;
+  // 仅在内容超过最大高度时显示
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+
+// 当 body 有滚动时显示渐变遮罩
+.task-monitor:has(.monitor-body::-webkit-scrollbar-thumb) .gradient-mask,
+.monitor-body[data-has-scroll="true"] + .gradient-mask {
+  opacity: 1;
 }
 
 .sse-alert {
@@ -291,22 +320,29 @@ onUnmounted(() => {
   }
 }
 
-// Vue TransitionGroup 动画
-.list-move,
+// Vue TransitionGroup 动画（改进版，不使用 absolute 定位）
 .list-enter-active,
 .list-leave-active {
   transition: all 0.3s ease;
 }
 
-.list-enter-from,
-.list-leave-to {
+.list-enter-from {
   opacity: 0;
   transform: translateY(-10px);
 }
 
-.list-leave-active {
-  position: absolute;
-  width: 100%;
+.list-leave-to {
+  opacity: 0;
+  transform: translateY(-10px);
+  // 移除 position: absolute，让其他元素等待动画结束
+  height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.list-move {
+  transition: transform 0.3s ease;
 }
 
 // 新完成任务高亮
@@ -315,8 +351,13 @@ onUnmounted(() => {
 }
 
 @keyframes highlight {
-  0%, 100% { background: transparent; }
-  50% { background: rgba(63, 185, 80, 0.15); }
+  0%,
+  100% {
+    background: transparent;
+  }
+  50% {
+    background: rgba(63, 185, 80, 0.15);
+  }
 }
 
 // 拖动占位符样式

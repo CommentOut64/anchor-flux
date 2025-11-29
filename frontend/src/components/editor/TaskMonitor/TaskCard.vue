@@ -3,11 +3,16 @@
     class="task-card"
     :class="[
       `variant-${variant}`,
-      { 'is-draggable': draggable }
+      {
+        'is-draggable': draggable,
+        'is-clickable': true,  // 所有状态的卡片都可点击
+        'is-current': task.job_id === currentJobId  // 当前正在编辑器打开的任务
+      }
     ]"
+    @click="handleCardClick"
   >
     <!-- 拖动手柄 -->
-    <div v-if="draggable" class="drag-handle" title="拖动排序">
+    <div v-if="draggable" class="drag-handle" title="拖动排序" @click.stop>
       <svg viewBox="0 0 24 24" fill="currentColor">
         <path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/>
       </svg>
@@ -59,7 +64,7 @@
     </div>
 
     <!-- 操作按钮 -->
-    <div class="task-actions">
+    <div class="task-actions" @click.stop>
       <button
         v-if="task.status === 'processing'"
         class="action-btn"
@@ -92,17 +97,6 @@
           <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
         </svg>
       </button>
-
-      <button
-        v-if="task.status === 'finished'"
-        class="action-btn action-btn--primary"
-        @click="openEditor"
-        title="打开编辑器"
-      >
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
-        </svg>
-      </button>
     </div>
   </div>
 </template>
@@ -116,7 +110,8 @@ import { PHASE_CONFIG, STATUS_CONFIG, formatProgress } from '@/constants/taskPha
 const props = defineProps({
   task: { type: Object, required: true },
   variant: { type: String, default: 'default' },
-  draggable: { type: Boolean, default: false }
+  draggable: { type: Boolean, default: false },
+  currentJobId: { type: String, default: '' }  // 当前正在编辑器打开的任务ID
 })
 
 const router = useRouter()
@@ -124,6 +119,12 @@ const router = useRouter()
 const showProgress = computed(() =>
   ['processing', 'queued', 'paused'].includes(props.task.status)
 )
+
+// 处理卡片点击事件
+function handleCardClick() {
+  // 所有状态的任务都可以点击跳转到编辑器
+  openEditor()
+}
 
 // 获取阶段样式
 function getPhaseStyle(task) {
@@ -183,18 +184,50 @@ function formatTime(timestamp) {
   display: flex;
   gap: 12px;
   padding: 12px;
-  background: var(--bg-primary);
-  border: 1px solid var(--border-default);
+  background: rgba(255, 255, 255, 0.03);  // 更浅的灰色，能与背景区分
+  border: 1px solid transparent;
   border-radius: 6px;
   margin-bottom: 8px;
-  transition: all 0.2s;
+  transition: border-color 0.2s;
+  user-select: none;  // 禁止文本选择
 
+  // hover 时只改变边框颜色
   &:hover {
-    background: var(--bg-elevated);
+    border-color: #028AC5;
+  }
+
+  // 正在运行的任务使用浅绿色边框
+  &.variant-processing {
+    border-color: rgba(63, 185, 80, 0.5);
   }
 
   &.is-draggable {
     cursor: move;
+  }
+
+  // 可点击的卡片（已完成任务）
+  &.is-clickable {
+    cursor: pointer;
+
+    .task-info {
+      cursor: pointer;
+    }
+  }
+
+  // 当前正在编辑器打开的任务 - 呼吸灯效果
+  &.is-current {
+    animation: breathing-border 3s ease-in-out infinite;
+  }
+}
+
+// 呼吸灯动画 - 边框颜色从透明到 #028AC5 再到透明
+@keyframes breathing-border {
+  0%, 100% {
+    border-color: transparent;
+  }
+  50% {
+    border-color: #028AC5;
+    box-shadow: 0 0 8px rgba(2, 138, 197, 0.4);
   }
 }
 
@@ -206,6 +239,7 @@ function formatTime(timestamp) {
   color: var(--text-muted);
   cursor: grab;
   opacity: 0.5;
+  user-select: none;  // 禁止文本选择
 
   &:hover {
     opacity: 1;
@@ -218,6 +252,7 @@ function formatTime(timestamp) {
   svg {
     width: 16px;
     height: 16px;
+    pointer-events: none;  // 防止 SVG 阻止拖拽
   }
 }
 
