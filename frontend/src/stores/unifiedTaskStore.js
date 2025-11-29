@@ -38,9 +38,51 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   const activeTaskId = ref(null)
   const currentTask = ref(null)
 
+  // 队列顺序索引（单一事实来源）
+  const queueOrder = ref([])
+
+  // SSE 连接状态
+  const sseConnected = ref(false)
+  const lastHeartbeat = ref(Date.now())
+
   // ========== 计算属性 ==========
   // 将 Map 转换为数组供组件使用
   const tasks = computed(() => Array.from(tasksMap.value.values()))
+
+  // Processing 任务（单例，最多1个）
+  const processingTask = computed(() => {
+    const processing = tasks.value.filter(t => t.status === 'processing')
+    return processing.length > 0 ? processing[0] : null
+  })
+
+  // 排队任务（严格按 queueOrder 排序）
+  const queuedTasks = computed(() => {
+    return queueOrder.value
+      .map(id => tasksMap.value.get(id))
+      .filter(t => t && t.status === 'queued')
+  })
+
+  // 失败任务（按失败时间倒序）
+  const failedTasks = computed(() =>
+    tasks.value
+      .filter(t => t.status === 'failed')
+      .sort((a, b) => (b.failed_at || b.updatedAt) - (a.failed_at || a.updatedAt))
+  )
+
+  // 暂停任务（按暂停时间倒序）
+  const pausedTasks = computed(() =>
+    tasks.value
+      .filter(t => t.status === 'paused')
+      .sort((a, b) => (b.paused_at || b.updatedAt) - (a.paused_at || a.updatedAt))
+  )
+
+  // 最近完成任务（最多 20 条）
+  const recentFinishedTasks = computed(() =>
+    tasks.value
+      .filter(t => t.status === 'finished')
+      .sort((a, b) => (b.completed_at || b.updatedAt) - (a.completed_at || a.updatedAt))
+      .slice(0, 20)
+  )
 
   // 活跃任务数量
   const activeCount = computed(() =>
@@ -91,17 +133,21 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       status: taskData.status || TaskStatus.CREATED,
       phase: taskData.phase || TaskPhase.UPLOADING,
       progress: taskData.progress || 0,
-      phase_percent: taskData.phase_percent || 0,  // 新增：阶段内进度 (0-100)
+      phase_percent: taskData.phase_percent || 0,  // 阶段内进度 (0-100)
       message: taskData.message || '',
       settings: taskData.settings || null,
-      language: taskData.language || null,  // 新增：语言
-      processed: taskData.processed || 0,   // 新增：已处理数
-      total: taskData.total || 0,           // 新增：总数
+      language: taskData.language || null,
+      processed: taskData.processed || 0,
+      total: taskData.total || 0,
       createdAt: taskData.createdAt || Date.now(),
       updatedAt: Date.now(),
+      completed_at: taskData.completed_at || null,  // 完成时间
+      paused_at: taskData.paused_at || null,        // 暂停时间
+      failed_at: taskData.failed_at || null,        // 失败时间
       isDirty: false,
-      sseConnected: false,  // 新增：SSE连接状态
-      lastError: null       // 新增：最后错误信息
+      sseConnected: false,
+      lastError: null,
+      isNewlyFinished: false  // 刚完成标记（用于高亮）
     }
 
     tasksMap.value.set(task.job_id, task)
@@ -172,6 +218,24 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   }
 
   /**
+   * 检查 SSE 连接状态
+   */
+  function checkSSEConnection() {
+    if (Date.now() - lastHeartbeat.value > 30000) {  // 30 秒无心跳
+      sseConnected.value = false
+      console.warn('[UnifiedTaskStore] SSE 连接超时')
+    }
+  }
+
+  /**
+   * 更新 SSE 心跳
+   */
+  function updateSSEHeartbeat() {
+    lastHeartbeat.value = Date.now()
+    sseConnected.value = true
+  }
+
+  /**
    * 更新任务消息
    */
   function updateTaskMessage(jobId, message) {
@@ -187,11 +251,35 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
    */
   function updateTask(jobId, updates) {
     const task = tasksMap.value.get(jobId)
-    if (task) {
-      Object.assign(task, updates, { updatedAt: Date.now() })
-      saveTasks()
-      console.log(`[UnifiedTaskStore] 任务已更新: ${jobId}`, updates)
+    if (!task) return
+
+    // 检测任务是否刚完成
+    if (updates.status === 'finished' && task.status !== 'finished') {
+      updates.isNewlyFinished = true
+      updates.completed_at = Date.now()
+
+      // 2 秒后移除高亮
+      setTimeout(() => {
+        const t = tasksMap.value.get(jobId)
+        if (t) {
+          t.isNewlyFinished = false
+        }
+      }, 2000)
     }
+
+    // 更新暂停时间戳
+    if (updates.status === 'paused' && task.status !== 'paused') {
+      updates.paused_at = Date.now()
+    }
+
+    // 更新失败时间戳
+    if (updates.status === 'failed' && task.status !== 'failed') {
+      updates.failed_at = Date.now()
+    }
+
+    Object.assign(task, updates, { updatedAt: Date.now() })
+    saveTasks()
+    console.log(`[UnifiedTaskStore] 任务已更新: ${jobId}`, updates)
   }
 
   /**
@@ -244,8 +332,39 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
    */
   function deleteTask(jobId) {
     tasksMap.value.delete(jobId)
+    // 同时从队列顺序中删除
+    queueOrder.value = queueOrder.value.filter(id => id !== jobId)
     saveTasks()
     console.log(`[UnifiedTaskStore] 任务已删除: ${jobId}`)
+  }
+
+  /**
+   * 重新排序队列
+   */
+  async function reorderQueue(newOrder) {
+    const oldOrder = [...queueOrder.value]
+
+    // 乐观更新
+    queueOrder.value = newOrder
+
+    try {
+      const transcriptionApi = (await import('@/services/api/transcriptionApi')).default
+      const result = await transcriptionApi.reorderQueue(newOrder)
+
+      if (!result.reordered) {
+        // 恢复原顺序
+        queueOrder.value = oldOrder
+        console.error('[UnifiedTaskStore] 队列重排失败')
+      } else {
+        // 持久化新顺序
+        saveTasks()
+      }
+    } catch (error) {
+      // 恢复原顺序
+      queueOrder.value = oldOrder
+      console.error('[UnifiedTaskStore] 队列重排请求失败:', error)
+      throw error
+    }
   }
 
   /**
@@ -325,6 +444,12 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
         }
       }
 
+      // 4. 更新队列顺序
+      if (response.queue) {
+        queueOrder.value = response.queue
+        console.log(`[UnifiedTaskStore] 队列顺序已同步: ${queueOrder.value.length} 个任务`)
+      }
+
       console.log(`[UnifiedTaskStore] 任务同步完成: ${updatedCount} 个更新, ${addedCount} 个新增, ${deletedCount} 个删除`)
       saveTasks()
       return true
@@ -373,6 +498,8 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     try {
       const tasksArray = Array.from(tasksMap.value.values())
       localStorage.setItem('task-list', JSON.stringify(tasksArray))
+      // 保存队列顺序
+      localStorage.setItem('queue-order', JSON.stringify(queueOrder.value))
     } catch (error) {
       console.error('[UnifiedTaskStore] 保存任务列表失败:', error)
     }
@@ -388,6 +515,13 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
         const tasksArray = JSON.parse(saved)
         tasksMap.value = new Map(tasksArray.map(t => [t.job_id, t]))
         console.log(`[UnifiedTaskStore] 已恢复 ${tasksArray.length} 个任务`)
+      }
+
+      // 恢复队列顺序
+      const savedOrder = localStorage.getItem('queue-order')
+      if (savedOrder) {
+        queueOrder.value = JSON.parse(savedOrder)
+        console.log(`[UnifiedTaskStore] 已恢复队列顺序: ${queueOrder.value.length} 个任务`)
       }
     } catch (error) {
       console.error('[UnifiedTaskStore] 恢复任务列表失败:', error)
@@ -445,8 +579,16 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     tasksMap,
     activeTaskId,
     currentTask,
+    queueOrder,
+    sseConnected,
+    lastHeartbeat,
 
     // 计算属性
+    processingTask,
+    queuedTasks,
+    failedTasks,
+    pausedTasks,
+    recentFinishedTasks,
     activeCount,
     hasRunningTask,
     recentTasks,
@@ -462,9 +604,14 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     loadTask,
     saveCurrentTask,
     deleteTask,
+    reorderQueue,
     syncTasksFromBackend,
     clearAllTasks,
     cleanupOldTasks,
+
+    // SSE 相关
+    checkSSEConnection,
+    updateSSEHeartbeat,
 
     // 批量操作
     updateMultipleTasks,

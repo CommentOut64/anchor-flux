@@ -38,6 +38,8 @@ class FFmpegManager:
         self.logger = logging.getLogger(__name__)
         self.ffmpeg_dir = config.FFMPEG_DIR
         self.ffmpeg_exe = config.FFMPEG_EXE
+        # 也记录预期的 ffprobe 路径
+        self.ffprobe_exe = self.ffmpeg_dir / "ffprobe.exe"
         self.download_attempts = 0
 
     def check_ffmpeg(self) -> Tuple[bool, str]:
@@ -49,17 +51,30 @@ class FFmpegManager:
         """
         # 首先检查项目目录中的FFmpeg
         if self.ffmpeg_exe.exists():
-            if self._test_ffmpeg(str(self.ffmpeg_exe)):
-                self.logger.info(f"发现项目内FFmpeg: {self.ffmpeg_exe}")
-                return True, str(self.ffmpeg_exe)
+            # 如果项目内同时包含 ffprobe.exe，则优先验证两者
+            if self.ffprobe_exe.exists():
+                ffmpeg_ok = self._test_ffmpeg(str(self.ffmpeg_exe))
+                ffprobe_ok = self._test_ffmpeg(str(self.ffprobe_exe))
+                if ffmpeg_ok and ffprobe_ok:
+                    self.logger.info(f"发现项目内FFmpeg与ffprobe: {self.ffmpeg_exe}, {self.ffprobe_exe}")
+                    return True, str(self.ffmpeg_exe)
+                else:
+                    self.logger.warning(f"⚠️ 项目内FFmpeg或ffprobe不可用: ffmpeg_ok={ffmpeg_ok}, ffprobe_ok={ffprobe_ok}")
+                    # 继续尝试系统环境或自动下载
             else:
-                self.logger.warning(f"⚠️ 项目内FFmpeg损坏: {self.ffmpeg_exe}")
-                return False, "项目内FFmpeg文件损坏"
+                self.logger.warning(f"⚠️ 项目内缺少 ffprobe.exe，期待位置: {self.ffprobe_exe}")
+                # 虽然项目内存在 ffmpeg.exe，但缺少 ffprobe，继续尝试系统路径或下载
 
-        # 检查系统环境变量中的FFmpeg
-        if self._test_ffmpeg("ffmpeg"):
-            self.logger.info("发现系统FFmpeg")
+        # 检查系统环境变量中的FFmpeg和ffprobe
+        sys_ffmpeg_ok = self._test_ffmpeg("ffmpeg")
+        sys_ffprobe_ok = self._test_ffmpeg("ffprobe")
+        if sys_ffmpeg_ok and sys_ffprobe_ok:
+            self.logger.info("发现系统FFmpeg与ffprobe")
             return True, "ffmpeg (系统环境变量)"
+        if sys_ffmpeg_ok and not sys_ffprobe_ok:
+            self.logger.warning("系统已安装 ffmpeg，但未检测到 ffprobe（或不可执行）")
+        if not sys_ffmpeg_ok and sys_ffprobe_ok:
+            self.logger.warning("检测到系统 ffprobe，但未检测到 ffmpeg")
 
         # FFmpeg不可用
         self.logger.warning("❌ 未找到可用的FFmpeg")
