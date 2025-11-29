@@ -72,7 +72,8 @@ class SSEChannelManager extends EventEmitter {
         handlers.onConnected?.(data)
       },
       ping: () => {
-        // 心跳，不处理
+        // 心跳事件，用于保持连接活跃
+        handlers.onPing?.()
       }
     })
   }
@@ -151,7 +152,8 @@ class SSEChannelManager extends EventEmitter {
         handlers.onConnected?.(data)
       },
       ping: () => {
-        // 心跳，不处理
+        // 心跳事件，用于保持连接活跃
+        handlers.onPing?.()
       }
     })
   }
@@ -183,7 +185,8 @@ class SSEChannelManager extends EventEmitter {
         handlers.onConnected?.(data)
       },
       ping: () => {
-        // 心跳，不处理
+        // 心跳事件，用于保持连接活跃
+        handlers.onPing?.()
       }
     })
   }

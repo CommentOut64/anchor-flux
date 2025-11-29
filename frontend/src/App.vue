@@ -41,6 +41,15 @@ onMounted(async () => {
     onInitialState(state) {
       console.log('[App] 全局初始状态:', state)
 
+      // 更新心跳（收到任何事件都说明连接正常）
+      taskStore.updateSSEHeartbeat()
+
+      // 同步队列顺序
+      if (state.queue && Array.isArray(state.queue)) {
+        taskStore.queueOrder = state.queue
+        console.log(`[App] 初始队列顺序已同步: ${state.queue.length} 个任务`)
+      }
+
       // 同步任务列表到 store（第二阶段修复：实时更新）
       if (state.jobs && Array.isArray(state.jobs)) {
         state.jobs.forEach(job => {
@@ -73,11 +82,22 @@ onMounted(async () => {
 
     onQueueUpdate(queue) {
       console.log('[App] 队列更新:', queue)
-      // 可以在这里更新队列顺序
+
+      // 更新心跳
+      taskStore.updateSSEHeartbeat()
+
+      // 更新队列顺序到 store
+      if (Array.isArray(queue)) {
+        taskStore.queueOrder = queue
+        console.log(`[App] 队列顺序已更新: ${queue.length} 个任务`)
+      }
     },
 
     onJobStatus(jobId, status, data) {
       console.log(`[App] 任务 ${jobId} 状态变化:`, status, data)
+
+      // 更新心跳
+      taskStore.updateSSEHeartbeat()
 
       // 更新 store 中的任务状态
       const task = taskStore.getTask(jobId)
@@ -108,6 +128,9 @@ onMounted(async () => {
     onJobProgress(jobId, percent, data) {
       console.log(`[App] 任务 ${jobId} 进度:`, percent)
 
+      // 更新心跳
+      taskStore.updateSSEHeartbeat()
+
       // 更新 store 中的任务进度（实时更新卡片），传递完整数据
       taskStore.updateTaskProgress(jobId, percent, data.status, {
         phase: data.phase,
@@ -121,12 +144,21 @@ onMounted(async () => {
 
     onConnected(data) {
       console.log('[App] 全局 SSE 连接成功:', data)
+
+      // 更新心跳
+      taskStore.updateSSEHeartbeat()
+
       // 标记所有 processing 状态的任务为 SSE 已连接
       taskStore.tasks.forEach(task => {
         if (task.status === 'processing') {
           taskStore.updateTaskSSEStatus(task.job_id, true)
         }
       })
+    },
+
+    onPing() {
+      // 收到心跳 ping，更新心跳时间戳
+      taskStore.updateSSEHeartbeat()
     }
   })
 })
