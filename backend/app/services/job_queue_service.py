@@ -94,8 +94,9 @@ class JobQueueService:
 
         logger.info(f"任务已加入队列: {job.job_id} (队列长度: {len(self.queue)})")
 
-        # 保存队列状态
+        # 保存队列状态和任务元信息
         self._save_state()
+        self.transcription_service.save_job_meta(job)
 
         # 推送全局SSE通知
         self._notify_queue_change()
@@ -123,6 +124,7 @@ class JobQueueService:
             if job_id == self.running_job_id:
                 # 正在执行的任务：设置暂停标志（pipeline会自己检测并保存checkpoint）
                 job.paused = True
+                job.status = "paused"  # 立即更新状态，确保SSE推送正确的状态
                 job.message = "暂停中..."
                 logger.info(f"设置暂停标志: {job_id}")
             elif job_id in self.queue:
@@ -132,12 +134,62 @@ class JobQueueService:
                 job.message = "已暂停（未开始）"
                 logger.info(f"从队列移除: {job_id}")
 
-        # 保存队列状态
+        # 保存队列状态和任务元信息
         self._save_state()
+        self.transcription_service.save_job_meta(job)
 
         # 推送全局SSE通知
         self._notify_queue_change()
         self._notify_job_status(job_id, job.status)
+
+        # 同时推送到单任务频道，确保 EditorView 能收到
+        self._notify_job_signal(job_id, "job_paused")
+
+        return True
+
+    def resume_job(self, job_id: str) -> bool:
+        """
+        恢复暂停的任务（重新加入队列）
+
+        与 restore_job 不同：
+        - resume_job: 恢复暂停的任务，重新加入队列尾部
+        - restore_job: 从 checkpoint 断点续传
+
+        Args:
+            job_id: 任务ID
+
+        Returns:
+            bool: 是否成功
+        """
+        job = self.jobs.get(job_id)
+        if not job:
+            return False
+
+        if job.status != "paused":
+            logger.warning(f"任务未暂停，无法恢复: {job_id}, status={job.status}")
+            return False
+
+        with self.lock:
+            # 重新加入队列
+            if job_id not in self.queue:
+                self.queue.append(job_id)
+
+            job.status = "queued"
+            job.paused = False
+            job.message = f"已恢复，排队中 (位置: {len(self.queue)})"
+            logger.info(f"恢复暂停任务: {job_id}")
+
+        # 保存队列状态和任务元信息
+        self._save_state()
+        self.transcription_service.save_job_meta(job)
+
+        # 推送全局SSE通知
+        self._notify_queue_change()
+        self._notify_job_status(job_id, job.status)
+
+        # 同时推送到单任务频道
+        self._notify_job_signal(job_id, "job_resumed")
+
         return True
 
     def cancel_job(self, job_id: str, delete_data: bool = False) -> bool:
@@ -183,6 +235,8 @@ class JobQueueService:
             result = self.transcription_service.cancel_job(job_id, delete_data=True)
         else:
             result = True
+            # 不删除数据时，保存任务元信息
+            self.transcription_service.save_job_meta(job)
 
         # 保存队列状态
         self._save_state()
@@ -190,6 +244,10 @@ class JobQueueService:
         # 推送全局SSE通知
         self._notify_queue_change()
         self._notify_job_status(job_id, job.status)
+
+        # 同时推送到单任务频道，确保 EditorView 能收到
+        self._notify_job_signal(job_id, "job_canceled")
+
         return result
 
     def _worker_loop(self):
@@ -242,6 +300,10 @@ class JobQueueService:
                 # 任务开始执行前保存状态（确保断电后能恢复 running 任务）
                 if self.running_job_id:
                     self._save_state()
+                    # 同时保存任务元信息（记录 processing 状态）
+                    job = self.jobs.get(self.running_job_id)
+                    if job:
+                        self.transcription_service.save_job_meta(job)
 
                 # 2. 如果没有任务，休眠后继续
                 if self.running_job_id is None:
@@ -282,6 +344,9 @@ class JobQueueService:
 
                     # 资源大清洗
                     self._cleanup_resources()
+
+                    # 保存任务最终状态到 job_meta.json
+                    self.transcription_service.save_job_meta(job)
 
                     # 推送任务结束信号（单任务频道）
                     self.sse_manager.broadcast_sync(
@@ -445,6 +510,31 @@ class JobQueueService:
 
         self.sse_manager.broadcast_sync("global", "job_progress", data)
 
+    def _notify_job_signal(self, job_id: str, signal: str):
+        """
+        推送关键信号到单任务SSE频道
+
+        用于暂停/取消/恢复等关键操作，确保 EditorView 能收到状态变更通知
+
+        Args:
+            job_id: 任务ID
+            signal: 信号类型 (job_paused, job_canceled, job_resumed)
+        """
+        job = self.jobs.get(job_id)
+        if not job:
+            return
+
+        data = {
+            "signal": signal,
+            "job_id": job_id,
+            "status": job.status,
+            "message": job.message,
+            "percent": round(job.progress, 1)
+        }
+
+        self.sse_manager.broadcast_sync(f"job:{job_id}", "signal", data)
+        logger.debug(f"[单任务SSE] 推送信号: {job_id[:8]}... -> {signal}")
+
     def _load_settings(self):
         """加载队列设置"""
         if not self.settings_file.exists():
@@ -513,14 +603,21 @@ class JobQueueService:
           "queue": ["job_id1", "job_id2"],
           "running": "job_id3",
           "interrupted": "job_id4",  // 被强制中断的任务
+          "paused": ["job_id5", "job_id6"],  // 暂停的任务列表
           "timestamp": 1234567890.0
         }
         """
         with self.lock:
+            # 收集所有暂停状态的任务
+            paused_jobs = [
+                job_id for job_id, job in self.jobs.items()
+                if job.status == "paused" or job.paused
+            ]
             state = {
                 "queue": list(self.queue),
                 "running": self.running_job_id,
                 "interrupted": self.interrupted_job_id,
+                "paused": paused_jobs,  # 新增：保存暂停的任务列表
                 "timestamp": time.time()
             }
 
@@ -539,15 +636,51 @@ class JobQueueService:
         except Exception as e:
             logger.error(f"保存队列状态失败: {e}")
 
+    def _load_job_for_recovery(self, job_id: str) -> Optional[JobState]:
+        """
+        加载任务用于恢复（优先从已有缓存获取，其次从 job_meta.json 加载，最后从 checkpoint 加载）
+
+        这是重启恢复的核心方法，确保能正确恢复任务状态
+
+        Args:
+            job_id: 任务ID
+
+        Returns:
+            Optional[JobState]: 恢复的任务状态对象
+        """
+        # 0. 优先检查 transcription_service.jobs（可能已经被 _load_all_jobs_from_disk 加载）
+        if job_id in self.transcription_service.jobs:
+            job = self.transcription_service.jobs[job_id]
+            logger.info(f"从 transcription_service 缓存获取任务: {job_id}")
+            return job
+
+        # 1. 从 job_meta.json 加载（包含完整的任务元信息）
+        job = self.transcription_service.load_job_meta(job_id)
+        if job:
+            logger.info(f"从 job_meta.json 恢复任务: {job_id}")
+            return job
+
+        # 2. 降级：从 checkpoint 恢复（兼容旧版本）
+        job = self.transcription_service.restore_job_from_checkpoint(job_id)
+        if job:
+            logger.info(f"从 checkpoint 恢复任务（旧版兼容）: {job_id}")
+            # 同时保存 job_meta.json 以便下次直接加载
+            self.transcription_service.save_job_meta(job)
+            return job
+
+        logger.warning(f"无法恢复任务: {job_id}")
+        return None
+
     def _load_state(self):
         """
         启动时恢复队列状态
 
         恢复逻辑:
-        1. 读取queue_state.json
-        2. 如果有running任务，恢复并自动加入队列继续执行
-        3. 恢复队列中的其他任务
-        4. 恢复interrupted任务（被强制中断的任务）
+        1. 读取 queue_state.json
+        2. 优先从 job_meta.json 恢复任务（包含完整状态）
+        3. 如果有 running 任务，自动加入队列头部继续执行
+        4. 恢复队列中的其他任务
+        5. 恢复 interrupted 任务（被强制中断的任务）
         """
         if not self.queue_file.exists():
             logger.info("无队列状态文件，从空队列启动")
@@ -559,20 +692,22 @@ class JobQueueService:
 
             logger.info(f"加载队列状态: {state}")
 
-            # 1. 恢复running任务（如果有）
+            # 1. 恢复 running 任务（如果有）- 意外断电/崩溃场景
             running_id = state.get("running")
             if running_id:
-                # 尝试从checkpoint恢复
-                job = self.transcription_service.restore_job_from_checkpoint(running_id)
+                job = self._load_job_for_recovery(running_id)
                 if job:
                     # 自动恢复：设为 queued 状态，放队列头部继续执行
                     job.status = "queued"
+                    job.paused = False
                     job.message = "程序重启，任务自动恢复"
                     self.jobs[running_id] = job
                     self.queue.appendleft(running_id)  # 放队头
+                    # 同步到 transcription_service.jobs（确保 SSE 路由能找到任务）
+                    self.transcription_service.jobs[running_id] = job
+                    # 更新 job_meta.json 中的状态
+                    self.transcription_service.save_job_meta(job)
                     logger.info(f"恢复中断任务到队头（自动继续）: {running_id}")
-                else:
-                    logger.warning(f"无法恢复running任务: {running_id}")
 
             # 2. 恢复队列中的任务
             for job_id in state.get("queue", []):
@@ -580,30 +715,57 @@ class JobQueueService:
                 if job_id == running_id:
                     continue
 
-                # 尝试恢复任务
-                job = self.transcription_service.restore_job_from_checkpoint(job_id)
+                job = self._load_job_for_recovery(job_id)
                 if job:
-                    self.jobs[job_id] = job
                     job.status = "queued"
+                    job.paused = False
                     job.message = f"排队中 (位置: {len(self.queue) + 1})"
+                    self.jobs[job_id] = job
                     self.queue.append(job_id)
+                    # 同步到 transcription_service.jobs（确保 SSE 路由能找到任务）
+                    self.transcription_service.jobs[job_id] = job
+                    # 更新 job_meta.json 中的状态
+                    self.transcription_service.save_job_meta(job)
                     logger.info(f"恢复排队任务: {job_id}")
-                else:
-                    logger.warning(f"跳过无效任务: {job_id}")
 
-            # 3. 恢复interrupted任务（被强制中断的任务）
+            # 3. 恢复 interrupted 任务（被强制中断的任务）
             interrupted_id = state.get("interrupted")
             if interrupted_id and interrupted_id not in self.jobs:
-                job = self.transcription_service.restore_job_from_checkpoint(interrupted_id)
+                job = self._load_job_for_recovery(interrupted_id)
                 if job:
-                    # 被中断的任务也自动恢复到队列
                     job.status = "queued"
+                    job.paused = False
                     job.message = "程序重启，被中断任务自动恢复"
                     self.jobs[interrupted_id] = job
                     self.queue.append(interrupted_id)
+                    # 同步到 transcription_service.jobs（确保 SSE 路由能找到任务）
+                    self.transcription_service.jobs[interrupted_id] = job
+                    # 更新 job_meta.json 中的状态
+                    self.transcription_service.save_job_meta(job)
                     logger.info(f"恢复被中断任务到队列: {interrupted_id}")
 
-            logger.info(f"队列恢复完成: {len(self.queue)}个任务")
+            # 4. 恢复暂停的任务（保持暂停状态）
+            for job_id in state.get("paused", []):
+                # 避免重复（可能已经被前面的逻辑处理过）
+                if job_id in self.jobs:
+                    continue
+
+                job = self._load_job_for_recovery(job_id)
+                if job:
+                    # 保持暂停状态，不加入队列
+                    job.status = "paused"
+                    job.paused = True
+                    job.message = "程序重启，暂停任务已恢复"
+                    self.jobs[job_id] = job
+                    # 同步到 transcription_service.jobs（确保 SSE 路由能找到任务）
+                    self.transcription_service.jobs[job_id] = job
+                    # 更新 job_meta.json 中的状态
+                    self.transcription_service.save_job_meta(job)
+                    logger.info(f"恢复暂停任务（保持暂停）: {job_id}")
+
+            # 统计恢复情况
+            paused_count = len([j for j in self.jobs.values() if j.status == "paused"])
+            logger.info(f"队列恢复完成: {len(self.queue)}个排队任务, {paused_count}个暂停任务")
 
         except Exception as e:
             logger.error(f"恢复队列状态失败: {e}")

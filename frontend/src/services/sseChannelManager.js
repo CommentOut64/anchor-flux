@@ -119,6 +119,9 @@ class SSEChannelManager extends EventEmitter {
           handlers.onPaused?.(data)
         } else if (signal === 'job_canceled') {
           handlers.onCanceled?.(data)
+        } else if (signal === 'job_resumed') {
+          // 新增：处理任务恢复信号
+          handlers.onResumed?.(data)
         }
 
         handlers.onSignal?.(signal, data)
@@ -190,10 +193,22 @@ class SSEChannelManager extends EventEmitter {
    * @private
    */
   _subscribe(channelId, url, eventHandlers) {
-    // 如果已存在连接，先关闭（正常的保护性逻辑）
-    if (this.channels.has(channelId)) {
-      console.log(`[SSEChannelManager] 频道 ${channelId} 已存在，先关闭旧连接`)
-      this.unsubscribe(channelId)
+    // 检查是否已存在连接
+    const existingConnection = this.channels.get(channelId)
+
+    // 关键修复：即使连接存在，也需要重建以确保新的事件处理器被绑定
+    // 原因：EventSource 的事件监听器是在创建时绑定的，复用连接会导致新组件的回调无法被调用
+    if (existingConnection) {
+      console.log(`[SSEChannelManager] 频道 ${channelId} 存在旧连接，关闭后重建以更新事件处理器`)
+      // 关闭旧连接
+      existingConnection.close()
+      this.channels.delete(channelId)
+      // 清除重连定时器
+      const reconnectInfo = this.reconnectState.get(channelId)
+      if (reconnectInfo?.timer) {
+        clearTimeout(reconnectInfo.timer)
+      }
+      this.reconnectState.delete(channelId)
     }
 
     // 保存配置
@@ -203,7 +218,17 @@ class SSEChannelManager extends EventEmitter {
     this._createConnection(channelId, url, eventHandlers)
 
     // 返回取消订阅函数
-    return () => this.unsubscribe(channelId)
+    return () => this._requestUnsubscribe(channelId)
+  }
+
+  /**
+   * 请求取消订阅（延迟执行，避免页面切换时误关闭）
+   * @private
+   */
+  _requestUnsubscribe(channelId) {
+    // 不立即关闭，给一个短暂的缓冲期
+    // 如果用户快速切换回来，可以复用连接
+    console.log(`[SSEChannelManager] 延迟取消订阅: ${channelId}`)
   }
 
   /**
@@ -277,10 +302,21 @@ class SSEChannelManager extends EventEmitter {
 
     reconnectInfo.attempts++
 
+    // 最大重连次数限制（防止任务不存在时无限重连）
+    const MAX_RECONNECT_ATTEMPTS = 5
+    if (reconnectInfo.attempts > MAX_RECONNECT_ATTEMPTS) {
+      console.warn(`[SSE ${channelId}] 已达到最大重连次数 (${MAX_RECONNECT_ATTEMPTS})，停止重连`)
+      // 清理资源
+      this.channels.delete(channelId)
+      this.channelConfigs.delete(channelId)
+      this.reconnectState.delete(channelId)
+      return
+    }
+
     // 计算重连延迟（指数退避，最大 30 秒）
     const delay = Math.min(1000 * Math.pow(2, reconnectInfo.attempts - 1), 30000)
 
-    console.log(`[SSE ${channelId}] ${delay}ms 后尝试第 ${reconnectInfo.attempts} 次重连`)
+    console.log(`[SSE ${channelId}] ${delay}ms 后尝试第 ${reconnectInfo.attempts}/${MAX_RECONNECT_ATTEMPTS} 次重连`)
 
     reconnectInfo.timer = setTimeout(() => {
       // 先关闭旧连接

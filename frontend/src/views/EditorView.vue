@@ -16,6 +16,7 @@
       @undo="undo"
       @redo="redo"
       @pause="pauseTranscription"
+      @resume="resumeTranscription"
       @cancel="cancelTranscription"
     />
 
@@ -319,6 +320,18 @@ async function loadProject() {
     if (restored && projectStore.subtitles.length > 0) {
       console.log('[EditorView] 从本地存储恢复成功')
       isTranscribing.value = false
+
+      // 即使从本地恢复，如果任务仍在处理中或暂停，也需要订阅SSE以接收实时更新
+      if (['processing', 'queued'].includes(jobStatus.status)) {
+        console.log('[EditorView] 任务仍在处理中，需要订阅SSE')
+        isTranscribing.value = true
+        subscribeSSE()
+        startProgressPolling()
+      } else if (jobStatus.status === 'paused') {
+        // 暂停状态也需要订阅SSE，以便接收恢复信号
+        console.log('[EditorView] 任务已暂停，订阅SSE以接收恢复信号')
+        subscribeSSE()
+      }
       return
     }
 
@@ -328,10 +341,18 @@ async function loadProject() {
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
       isTranscribing.value = true
       await loadTranscribingSegments()
+      // 订阅SSE获取实时更新
       subscribeSSE()
       startProgressPolling()
+    } else if (jobStatus.status === 'paused') {
+      // 暂停状态：加载已有的 segments，并订阅 SSE 以便接收恢复信号
+      isTranscribing.value = false
+      await loadTranscribingSegments()
+      // 订阅SSE，以便用户点击恢复后能收到状态变更
+      subscribeSSE()
     } else if (jobStatus.status === 'created') {
       isTranscribing.value = true
+      // 任务刚创建，订阅SSE等待开始
       subscribeSSE()
     } else if (jobStatus.status === 'failed') {
       await loadTranscribingSegments()
@@ -418,12 +439,19 @@ function formatSRTTime(seconds) {
 // ========== SSE 实时更新 ==========
 
 function subscribeSSE() {
+  // 如果已经订阅，先取消避免重复订阅
+  if (sseUnsubscribe) {
+    console.log('[EditorView] 已存在SSE订阅，先取消')
+    sseUnsubscribe()
+    sseUnsubscribe = null
+  }
+
   console.log('[EditorView] 订阅任务 SSE:', props.jobId)
 
   // 使用 sseChannelManager 订阅单任务频道
   sseUnsubscribe = sseChannelManager.subscribeJob(props.jobId, {
     onInitialState(data) {
-      console.log('[EditorView] 初始状态:', data)
+      console.log('[EditorView] SSE 初始状态:', data)
       if (data.percent !== undefined) {
         taskProgress.value = data.percent
       }
@@ -436,6 +464,7 @@ function subscribeSSE() {
     },
 
     onProgress(data) {
+      console.log('[EditorView] SSE 进度更新:', data.percent, data.phase)
       taskProgress.value = data.percent || 0
       taskStatus.value = data.status || taskStatus.value
       taskPhase.value = data.phase || taskPhase.value
@@ -458,6 +487,8 @@ function subscribeSSE() {
       taskStore.updateTaskStatus(props.jobId, 'finished')
       await loadCompletedSRT()
       stopProgressPolling()
+      // 任务完成后关闭SSE连接
+      cleanupSSE()
     },
 
     onFailed(data) {
@@ -467,13 +498,72 @@ function subscribeSSE() {
       taskStore.updateTaskStatus(props.jobId, 'failed')
       taskStore.updateTaskSSEStatus(props.jobId, true, data.message || '转录失败')
       stopProgressPolling()
+      // 任务失败后关闭SSE连接
+      cleanupSSE()
+    },
+
+    onPaused(data) {
+      console.log('[EditorView] 任务已暂停:', data)
+      taskStatus.value = 'paused'
+      isTranscribing.value = false
+      taskStore.updateTaskStatus(props.jobId, 'paused')
+      // 保持SSE连接和进度显示
+    },
+
+    onCanceled(data) {
+      console.log('[EditorView] 任务已取消:', data)
+      taskStatus.value = 'canceled'
+      isTranscribing.value = false
+      taskStore.updateTaskStatus(props.jobId, 'canceled')
+      stopProgressPolling()
+      cleanupSSE()
+    },
+
+    onResumed(data) {
+      // 新增：处理任务恢复信号
+      console.log('[EditorView] 任务已恢复:', data)
+      taskStatus.value = data.status || 'queued'
+      isTranscribing.value = data.status === 'processing'
+      taskStore.updateTaskStatus(props.jobId, data.status || 'queued')
     },
 
     onConnected() {
       console.log('[EditorView] SSE 连接成功')
       taskStore.updateTaskSSEStatus(props.jobId, true)
+      // 连接成功后，主动刷新一次进度状态
+      refreshTaskProgress()
     }
   })
+}
+
+// 清理SSE连接
+function cleanupSSE() {
+  if (sseUnsubscribe) {
+    console.log('[EditorView] 清理SSE连接:', props.jobId)
+    sseUnsubscribe()
+    sseUnsubscribe = null
+  }
+}
+
+// 刷新任务进度（用于SSE重连后的状态同步）
+async function refreshTaskProgress() {
+  try {
+    const jobStatus = await transcriptionApi.getJobStatus(props.jobId, true)
+    console.log('[EditorView] 刷新任务进度:', jobStatus)
+
+    taskStatus.value = jobStatus.status
+    taskPhase.value = jobStatus.phase || 'pending'
+    taskProgress.value = jobStatus.progress || 0
+
+    // 同步到store
+    taskStore.updateTaskProgress(props.jobId, jobStatus.progress || 0, jobStatus.status, {
+      phase: jobStatus.phase,
+      phase_percent: jobStatus.phase_percent,
+      message: jobStatus.message
+    })
+  } catch (error) {
+    console.warn('[EditorView] 刷新任务进度失败:', error)
+  }
 }
 
 function startProgressPolling() {
@@ -526,8 +616,30 @@ async function pauseTranscription() {
     await transcriptionApi.pauseJob(props.jobId)
     taskStatus.value = 'paused'
     isTranscribing.value = false
+    // 更新本地store状态
+    taskStore.updateTaskStatus(props.jobId, 'paused')
+    // 暂停后保留SSE连接，以便恢复时能继续接收更新
+    console.log('[EditorView] 任务已暂停，保留SSE连接')
   } catch (error) {
     console.error('暂停任务失败:', error)
+  }
+}
+
+async function resumeTranscription() {
+  try {
+    // 使用新的 resumeJob API，恢复暂停的任务（重新加入队列）
+    const result = await transcriptionApi.resumeJob(props.jobId)
+
+    // 根据后端返回值设置状态（应该是 queued，而不是 processing）
+    taskStatus.value = result.status || 'queued'
+    isTranscribing.value = result.status === 'processing'
+
+    // 更新本地store状态
+    taskStore.updateTaskStatus(props.jobId, result.status || 'queued')
+
+    console.log('[EditorView] 任务已恢复，状态:', result.status, '队列位置:', result.queue_position)
+  } catch (error) {
+    console.error('恢复任务失败:', error)
   }
 }
 
@@ -537,6 +649,11 @@ async function cancelTranscription() {
     await transcriptionApi.cancelJob(props.jobId, false)
     taskStatus.value = 'canceled'
     isTranscribing.value = false
+    // 更新本地store状态
+    taskStore.updateTaskStatus(props.jobId, 'canceled')
+    // 取消后关闭SSE连接
+    cleanupSSE()
+    stopProgressPolling()
   } catch (error) {
     console.error('取消任务失败:', error)
   }
@@ -810,7 +927,11 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  if (sseUnsubscribe) sseUnsubscribe()
+  // 注意：不在这里关闭SSE连接，以支持页面切换时保持连接
+  // SSE连接会在任务完成/失败时自动关闭，或由sseChannelManager统一管理
+  console.log('[EditorView] 组件卸载，保留SSE连接以支持后台任务')
+
+  // 停止轮询（轮询仅是备用方案）
   stopProgressPolling()
 })
 

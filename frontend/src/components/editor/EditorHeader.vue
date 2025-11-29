@@ -21,24 +21,32 @@
 
     <!-- 中间：动态进度区 -->
     <div class="header-center">
-      <!-- 场景1: 当前任务转录中 -->
+      <!-- 场景1: 当前任务转录中或已暂停 -->
       <el-popover
-        v-if="isCurrentTaskTranscribing"
+        v-if="showCurrentTaskProgress"
         trigger="hover"
-        :width="220"
+        :width="240"
         popper-class="control-popover-dark"
         :show-after="200"
         placement="bottom"
       >
         <template #reference>
-          <div class="progress-capsule">
+          <div class="progress-capsule" :class="{ paused: isPaused }">
             <div class="progress-track">
               <div class="progress-fill" :style="{ width: currentTaskProgress + '%' }"></div>
             </div>
-            <!-- 显示阶段和进度 -->
+            <!-- 显示阶段标签和进度 -->
             <span class="capsule-text">
-              <span class="phase-label" :style="{ color: phaseColor }">{{ phaseLabel }}</span>
-              {{ formatProgress(currentTaskProgress) }}%
+              <span
+                class="phase-tag"
+                :style="{
+                  background: phaseStyle.bgColor,
+                  color: phaseStyle.color
+                }"
+              >
+                {{ phaseLabel }}
+              </span>
+              <span class="progress-percent">{{ formatProgress(currentTaskProgress) }}%</span>
             </span>
           </div>
         </template>
@@ -46,11 +54,18 @@
         <div class="hover-controls">
           <div class="label">当前任务控制</div>
           <div class="btn-group">
-            <el-button circle size="small" @click="$emit('pause')">
+            <!-- 暂停/恢复按钮 -->
+            <el-button v-if="!isPaused" circle size="small" @click="$emit('pause')">
               <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
                 <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
               </svg>
             </el-button>
+            <el-button v-else circle size="small" type="success" @click="$emit('resume')">
+              <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
+                <path d="M8 5v14l11-7z"/>
+              </svg>
+            </el-button>
+            <!-- 取消按钮 -->
             <el-button circle size="small" type="danger" plain @click="$emit('cancel')">
               <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
                 <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
@@ -154,12 +169,12 @@
  */
 import { computed } from 'vue'
 import TaskMonitor from './TaskMonitor/index.vue'
-import { PHASE_CONFIG, formatProgress } from '@/constants/taskPhases'
+import { PHASE_CONFIG, STATUS_CONFIG, formatProgress } from '@/constants/taskPhases'
 
 const props = defineProps({
   jobId: { type: String, required: true },
   taskName: { type: String, default: '未命名项目' },
-  currentTaskStatus: { type: String, default: 'idle' },      // 'processing', 'queued', 'finished', etc.
+  currentTaskStatus: { type: String, default: 'idle' },      // 'processing', 'queued', 'paused', 'finished', etc.
   currentTaskPhase: { type: String, default: 'pending' },    // 任务阶段（transcribe, align, etc.）
   currentTaskProgress: { type: Number, default: 0 },         // 0-100
   queueCompleted: { type: Number, default: 0 },              // 已完成任务数
@@ -170,11 +185,14 @@ const props = defineProps({
   lastSaved: { type: [Number, null], default: null }         // 上次保存时间戳
 })
 
-defineEmits(['undo', 'redo', 'export', 'pause', 'cancel'])
+defineEmits(['undo', 'redo', 'export', 'pause', 'resume', 'cancel'])
 
-// 是否正在转录
-const isCurrentTaskTranscribing = computed(() =>
-  ['processing', 'queued'].includes(props.currentTaskStatus)
+// 是否暂停状态
+const isPaused = computed(() => props.currentTaskStatus === 'paused')
+
+// 是否显示当前任务进度（转录中、排队中、或已暂停）
+const showCurrentTaskProgress = computed(() =>
+  ['processing', 'queued', 'paused'].includes(props.currentTaskStatus)
 )
 
 // 队列进度百分比
@@ -184,14 +202,17 @@ const queueProgressPercent = computed(() =>
 
 // 状态点样式
 const statusClass = computed(() => {
-  if (isCurrentTaskTranscribing.value) return 'processing'
+  if (showCurrentTaskProgress.value) return 'processing'
   if (queueProgressPercent.value === 100 && props.queueTotal > 0) return 'complete'
   return 'idle'
 })
 
 // 元信息文字
 const metaText = computed(() => {
-  if (isCurrentTaskTranscribing.value) {
+  if (isPaused.value) {
+    return `已暂停 ${props.currentTaskProgress}%`
+  }
+  if (showCurrentTaskProgress.value) {
     return `转录中 ${props.currentTaskProgress}%`
   }
   if (props.lastSaved) {
@@ -202,14 +223,36 @@ const metaText = computed(() => {
   return '准备就绪'
 })
 
-// 阶段标签
-const phaseLabel = computed(() => {
-  return PHASE_CONFIG[props.currentTaskPhase]?.label || '处理中'
+// 获取阶段样式（与TaskMonitor保持一致）
+const phaseStyle = computed(() => {
+  // 如果任务暂停，使用暂停状态样式
+  if (isPaused.value) {
+    return STATUS_CONFIG.paused || {
+      bgColor: 'rgba(210, 153, 34, 0.15)',
+      color: '#d29922',
+      label: '已暂停'
+    }
+  }
+  // 如果任务正在处理且有阶段信息，使用阶段样式
+  if (props.currentTaskStatus === 'processing' && props.currentTaskPhase) {
+    return PHASE_CONFIG[props.currentTaskPhase] || PHASE_CONFIG.pending
+  }
+  // 其他情况使用状态样式
+  return STATUS_CONFIG[props.currentTaskStatus] || STATUS_CONFIG.created
 })
 
-// 阶段颜色
-const phaseColor = computed(() => {
-  return PHASE_CONFIG[props.currentTaskPhase]?.color || '#58a6ff'
+// 阶段标签
+const phaseLabel = computed(() => {
+  // 如果任务暂停，显示"已暂停"
+  if (isPaused.value) {
+    return '已暂停'
+  }
+  // 如果任务正在处理且有阶段信息，显示阶段标签
+  if (props.currentTaskStatus === 'processing' && props.currentTaskPhase) {
+    return PHASE_CONFIG[props.currentTaskPhase]?.label || '处理中'
+  }
+  // 其他情况显示状态标签
+  return STATUS_CONFIG[props.currentTaskStatus]?.label || props.currentTaskStatus
 })
 
 // 处理导出
@@ -334,6 +377,10 @@ $header-h: 56px;
     transform: scale(1.02);
   }
 
+  &.paused {
+    opacity: 0.85;
+  }
+
   .progress-track {
     width: 120px;
     height: 4px;
@@ -349,13 +396,23 @@ $header-h: 56px;
   }
 
   .capsule-text {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     font-size: 12px;
-    color: var(--text-secondary);
     white-space: nowrap;
 
-    .phase-label {
+    .phase-tag {
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 10px;
       font-weight: 600;
-      margin-right: 4px;
+      white-space: nowrap;
+    }
+
+    .progress-percent {
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
     }
   }
 }

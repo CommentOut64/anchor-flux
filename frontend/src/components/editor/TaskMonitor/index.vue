@@ -34,7 +34,7 @@
           </div>
 
           <!-- 进度条 -->
-          <div v-if="['processing', 'queued'].includes(task.status)" class="task-progress">
+          <div v-if="['processing', 'queued', 'paused'].includes(task.status)" class="task-progress">
             <div class="progress-bar">
               <div class="progress-fill" :style="{ width: task.progress + '%' }"></div>
             </div>
@@ -86,9 +86,21 @@
             </svg>
           </button>
 
-          <!-- 取消按钮（处理中或排队中） -->
+          <!-- 恢复按钮（仅暂停任务） -->
           <button
-            v-if="['processing', 'queued'].includes(task.status)"
+            v-if="task.status === 'paused'"
+            class="action-btn action-btn--success"
+            @click="resumeTask(task.job_id)"
+            title="恢复"
+          >
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M8 5v14l11-7z"/>
+            </svg>
+          </button>
+
+          <!-- 取消按钮（处理中、排队中或暂停） -->
+          <button
+            v-if="['processing', 'queued', 'paused'].includes(task.status)"
             class="action-btn action-btn--danger"
             @click="cancelTask(task.job_id)"
             title="取消"
@@ -218,6 +230,19 @@ async function pauseTask(jobId) {
     taskStore.updateTaskStatus(jobId, 'paused')
   } catch (error) {
     console.error('暂停任务失败:', error)
+  }
+}
+
+// 恢复任务
+async function resumeTask(jobId) {
+  try {
+    // 使用新的 resumeJob API，恢复暂停的任务（重新加入队列）
+    const result = await transcriptionApi.resumeJob(jobId)
+    // 根据后端返回值设置状态（应该是 queued，而不是 processing）
+    taskStore.updateTaskStatus(jobId, result.status || 'queued')
+    console.log('[TaskMonitor] 任务已恢复，状态:', result.status, '队列位置:', result.queue_position)
+  } catch (error) {
+    console.error('恢复任务失败:', error)
   }
 }
 
@@ -513,6 +538,13 @@ function formatTime(timestamp) {
       color: var(--primary);
       &:hover {
         background: rgba(88, 166, 255, 0.15);
+      }
+    }
+
+    &--success {
+      color: var(--success);
+      &:hover {
+        background: rgba(63, 185, 80, 0.15);
       }
     }
 

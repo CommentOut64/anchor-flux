@@ -246,8 +246,73 @@ class TranscriptionService:
         # 添加文件路径到任务ID的映射
         self.job_index.add_mapping(src_path, job_id)
 
+        # 持久化任务元信息（重启后可恢复）
+        self.save_job_meta(job)
+
         self.logger.info(f"任务已创建: {job_id} - {filename}")
         return job
+
+    def save_job_meta(self, job: JobState) -> bool:
+        """
+        保存任务元信息到 job_meta.json（用于重启后恢复）
+
+        使用原子写入确保断电安全：先写临时文件，再rename替换
+
+        Args:
+            job: 任务状态对象
+
+        Returns:
+            bool: 是否成功保存
+        """
+        job_dir = Path(job.dir)
+        meta_file = job_dir / "job_meta.json"
+
+        try:
+            job_dir.mkdir(parents=True, exist_ok=True)
+
+            # 原子写入：先写临时文件，再rename替换
+            temp_file = meta_file.with_suffix(".tmp")
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(job.to_meta_dict(), f, indent=2, ensure_ascii=False)
+
+            # 原子替换
+            temp_file.replace(meta_file)
+            self.logger.debug(f"任务元信息已保存: {job.job_id}")
+            return True
+        except Exception as e:
+            self.logger.error(f"保存任务元信息失败 {job.job_id}: {e}")
+            return False
+
+    def load_job_meta(self, job_id: str) -> Optional[JobState]:
+        """
+        从 job_meta.json 加载任务元信息
+
+        Args:
+            job_id: 任务ID
+
+        Returns:
+            Optional[JobState]: 恢复的任务状态对象
+        """
+        job_dir = self.jobs_root / job_id
+        meta_file = job_dir / "job_meta.json"
+
+        if not meta_file.exists():
+            return None
+
+        try:
+            with open(meta_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            job = JobState.from_meta_dict(data)
+
+            # 确保 dir 路径正确（可能因为项目迁移而改变）
+            job.dir = str(job_dir)
+
+            self.logger.debug(f"从 job_meta.json 加载任务: {job_id}")
+            return job
+        except Exception as e:
+            self.logger.error(f"加载任务元信息失败 {job_id}: {e}")
+            return None
 
     def get_job(self, job_id: str) -> Optional[JobState]:
         """
@@ -270,6 +335,16 @@ class TranscriptionService:
             return None
 
         try:
+            # 优先从 job_meta.json 加载（包含完整的任务状态）
+            job = self.load_job_meta(job_id)
+            if job:
+                # 缓存到内存
+                with self.lock:
+                    self.jobs[job_id] = job
+                self.logger.info(f"从 job_meta.json 恢复任务: {job_id}")
+                return job
+
+            # 降级：从目录文件推断状态（兼容旧版本）
             # 尝试找到原始文件
             filename = "未知文件"
             input_path = None
@@ -321,7 +396,10 @@ class TranscriptionService:
             with self.lock:
                 self.jobs[job_id] = job
 
-            self.logger.info(f"从磁盘恢复任务: {job_id}")
+            # 同时保存 job_meta.json 以便下次直接加载
+            self.save_job_meta(job)
+
+            self.logger.info(f"从磁盘恢复任务（旧版兼容）: {job_id}")
             return job
 
         except Exception as e:
@@ -873,6 +951,10 @@ class TranscriptionService:
             # 2. 原子替换（Windows/Linux/macOS 均支持）
             # 如果程序在这里崩溃，checkpoint.json 依然是旧版本，不会损坏
             os.replace(temp_path, checkpoint_path)
+
+            # 3. 同步保存任务元信息（用于重启后恢复任务状态）
+            # 这样每次保存检查点时，任务的进度和状态都会被持久化
+            self.save_job_meta(job)
 
         except Exception as e:
             self.logger.error(f"保存检查点失败: {e}")

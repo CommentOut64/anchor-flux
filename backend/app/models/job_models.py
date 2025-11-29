@@ -66,6 +66,81 @@ class JobState:
         d.pop('segments', None)  # 不透出内部详情
         return d
 
+    def to_meta_dict(self) -> dict:
+        """
+        转换为元信息字典格式，用于持久化到 job_meta.json
+        只保存恢复任务所需的核心信息，不包含 segments 等大数据
+        """
+        import time
+        return {
+            "job_id": self.job_id,
+            "filename": self.filename,
+            "title": self.title,
+            "dir": self.dir,
+            "input_path": self.input_path,
+            "status": self.status,
+            "phase": self.phase,
+            "progress": self.progress,
+            "phase_percent": self.phase_percent,
+            "message": self.message,
+            "error": self.error,
+            "processed": self.processed,
+            "total": self.total,
+            "language": self.language,
+            "srt_path": self.srt_path,
+            "canceled": self.canceled,
+            "paused": self.paused,
+            "settings": {
+                "model": self.settings.model,
+                "compute_type": self.settings.compute_type,
+                "device": self.settings.device,
+                "batch_size": self.settings.batch_size,
+                "word_timestamps": self.settings.word_timestamps,
+            },
+            "updated_at": time.time()
+        }
+
+    @classmethod
+    def from_meta_dict(cls, data: dict) -> "JobState":
+        """
+        从元信息字典恢复 JobState 对象
+
+        Args:
+            data: job_meta.json 中的数据
+
+        Returns:
+            JobState: 恢复的任务状态对象
+        """
+        settings_data = data.get("settings", {})
+        settings = JobSettings(
+            model=settings_data.get("model", "medium"),
+            compute_type=settings_data.get("compute_type", "float16"),
+            device=settings_data.get("device", "cuda"),
+            batch_size=settings_data.get("batch_size", 16),
+            word_timestamps=settings_data.get("word_timestamps", False),
+        )
+
+        return cls(
+            job_id=data["job_id"],
+            filename=data.get("filename", "unknown"),
+            title=data.get("title", ""),
+            dir=data.get("dir", ""),
+            input_path=data.get("input_path", ""),
+            settings=settings,
+            status=data.get("status", "queued"),
+            phase=data.get("phase", "pending"),
+            progress=data.get("progress", 0.0),
+            phase_percent=data.get("phase_percent", 0.0),
+            message=data.get("message", ""),
+            error=data.get("error"),
+            processed=data.get("processed", 0),
+            total=data.get("total", 0),
+            language=data.get("language"),
+            srt_path=data.get("srt_path"),
+            canceled=data.get("canceled", False),
+            paused=data.get("paused", False),
+        )
+
     def update_media_status(self, job_dir: str):
         """
         更新媒体状态（检查各类资源文件是否就绪）

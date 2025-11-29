@@ -96,6 +96,20 @@ class TranscriptionAPI {
   }
 
   /**
+   * 恢复暂停的任务（重新加入队列）
+   *
+   * 与 restoreJob 不同：
+   * - resumeJob: 恢复暂停的任务，重新加入队列尾部，状态变为 queued
+   * - restoreJob: 从 checkpoint 断点续传
+   *
+   * @param {string} jobId - 任务ID
+   * @returns {Promise<{job_id: string, resumed: boolean, status: string, queue_position: number}>}
+   */
+  async resumeJob(jobId) {
+    return apiClient.post(`/api/resume/${jobId}`)
+  }
+
+  /**
    * 任务插队
    * @param {string} jobId - 任务ID
    * @param {string} mode - 插队模式 ('gentle' | 'force')

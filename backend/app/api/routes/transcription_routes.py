@@ -331,6 +331,32 @@ def create_transcription_router(
             raise HTTPException(status_code=404, detail="任务未找到")
         return {"job_id": job_id, "paused": ok}
 
+    @router.post("/resume/{job_id}")
+    async def resume_job(job_id: str):
+        """
+        恢复暂停的任务（重新加入队列）
+
+        与 /restore-job 不同：
+        - /resume: 恢复暂停的任务，重新加入队列尾部，状态变为 queued
+        - /restore-job: 从 checkpoint 断点续传
+        """
+        queue_service = get_queue_service()
+        ok = queue_service.resume_job(job_id)
+        if not ok:
+            raise HTTPException(status_code=400, detail="无法恢复任务（任务未暂停或不存在）")
+
+        job = queue_service.get_job(job_id)
+        queue_position = 0
+        if job_id in queue_service.queue:
+            queue_position = list(queue_service.queue).index(job_id) + 1
+
+        return {
+            "job_id": job_id,
+            "resumed": True,
+            "status": job.status if job else "queued",
+            "queue_position": queue_position
+        }
+
     @router.post("/prioritize/{job_id}")
     async def prioritize_job(job_id: str, mode: Optional[str] = None):
         """
