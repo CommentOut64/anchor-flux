@@ -121,6 +121,15 @@ class ProjectConfig:
         self.SSE_MAX_QUEUE_SIZE = 1000     # 每个连接的消息队列大小
         self.SSE_MAX_CONNECTIONS_PER_CHANNEL = 10  # 每个频道最大连接数
 
+        # ========== 渐进式加载配置 ==========
+        self.ENABLE_PROGRESSIVE_LOADING = True   # 是否启用渐进式加载
+        self.PREVIEW_RESOLUTION = 360            # 预览视频分辨率（高度）
+        self.PROXY_RESOLUTION = 720              # 高质量代理视频分辨率
+        self.PREVIEW_QUALITY = 28                # 预览视频 CRF 质量（1-51，越低越好）
+        self.PROXY_QUALITY = 23                  # 高质量代理视频 CRF 质量
+        self.PREVIEW_PRESET = "ultrafast"        # 预览视频编码预设
+        self.PROXY_PRESET = "fast"               # 高质量视频编码预设
+
     def get_ffmpeg_command(self) -> str:
         """
         获取FFmpeg命令

@@ -48,8 +48,13 @@
             :job-id="jobId"
             :show-subtitle="true"
             :enable-keyboard="false"
+            :progressive-url="videoStatus.currentUrl.value"
+            :current-resolution="videoStatus.currentResolution.value"
+            :is-upgrading="videoStatus.isUpgrading.value"
+            :upgrade-progress="videoStatus.upgradeProgress.value"
             @loaded="handleVideoLoaded"
             @error="handleVideoError"
+            @resolution-change="handleResolutionChange"
           />
         </div>
 
@@ -198,6 +203,7 @@ import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { mediaApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
+import { useVideoStatus } from '@/composables/useVideoStatus'
 
 // 组件导入
 import EditorHeader from '@/components/editor/EditorHeader.vue'
@@ -215,6 +221,9 @@ const props = defineProps({
 const router = useRouter()
 const projectStore = useProjectStore()
 const taskStore = useUnifiedTaskStore()
+
+// 渐进式视频加载状态
+const videoStatus = useVideoStatus(props.jobId)
 
 // Refs
 const videoStageRef = ref(null)
@@ -532,6 +541,18 @@ function subscribeSSE() {
       taskStore.updateTaskSSEStatus(props.jobId, true)
       // 连接成功后，主动刷新一次进度状态
       refreshTaskProgress()
+    },
+
+    // 新增：视频生成进度
+    onProxyProgress(data) {
+      console.log('[EditorView] Proxy生成进度:', data.progress)
+      videoStatus.handleProxyProgress(data)
+    },
+
+    // 新增：视频生成完成
+    onProxyComplete(data) {
+      console.log('[EditorView] Proxy生成完成:', data.video_url)
+      videoStatus.handleProxyComplete(data)
     }
   })
 }
@@ -763,6 +784,12 @@ function handleVideoLoaded(duration) {
 
 function handleVideoError(error) {
   console.error('视频加载错误:', error)
+}
+
+function handleResolutionChange(resolution) {
+  console.log('[EditorView] 视频分辨率变更:', resolution)
+  // 更新 projectStore 的视频信息
+  projectStore.meta.currentResolution = resolution
 }
 
 function handleWaveformReady() {

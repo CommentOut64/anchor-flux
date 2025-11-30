@@ -141,11 +141,11 @@ class SSEChannelManager extends EventEmitter {
       },
       proxy_progress: (data) => {
         console.log(`[SSE Job ${jobId}] Proxy 进度:`, data.progress)
-        handlers.onProxyProgress?.(data.progress)
+        handlers.onProxyProgress?.(data)  // 传递完整的data对象
       },
       proxy_complete: (data) => {
-        console.log(`[SSE Job ${jobId}] Proxy 完成`)
-        handlers.onProxyComplete?.()
+        console.log(`[SSE Job ${jobId}] Proxy 完成:`, data)
+        handlers.onProxyComplete?.(data)  // 传递data对象（包含video_url等）
       },
       connected: (data) => {
         console.log(`[SSE Job ${jobId}] 连接成功`)
