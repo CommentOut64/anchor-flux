@@ -688,13 +688,13 @@ async def get_audio(job_id: str, request: Request):
 
 
 @router.get("/{job_id}/peaks")
-async def get_audio_peaks(job_id: str, samples: int = 2000, method: str = "auto"):
+async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
     """
-    获取音频波形峰值数据
+    获取音频波形峰值数据（优化：动态采样密度）
 
     Args:
         job_id: 任务ID
-        samples: 采样点数（默认2000）
+        samples: 采样点数（0=自动计算，建议传0）
         method: 生成方法 - "auto"(自动选择), "ffmpeg"(FFmpeg加速), "wave"(Python原生)
 
     Returns:
@@ -702,6 +702,34 @@ async def get_audio_peaks(job_id: str, samples: int = 2000, method: str = "auto"
     """
     job_dir = config.JOBS_DIR / job_id
     audio_file = job_dir / "audio.wav"
+
+    # 【关键修改】获取音频时长，动态计算采样点
+    if samples <= 0:
+        # 获取视频/音频时长
+        video_file = _find_video_file(job_dir)
+        duration = 0.0
+
+        if video_file:
+            duration = await _get_video_duration(video_file)
+
+        # 如果从视频获取失败，尝试从音频获取
+        if duration <= 0 and audio_file.exists():
+            try:
+                # 先尝试用 FFmpeg 快速获取时长
+                duration = await _get_video_duration(audio_file)
+            except:
+                # 降级：使用默认值
+                duration = 60
+
+        if duration <= 0:
+            duration = 60  # 最终降级默认值
+
+        # 每秒20个采样点，保证放大后的连续性
+        # 上限100k（约800KB JSON），下限4k
+        target_samples = int(duration * 20)
+        samples = max(4000, min(target_samples, 100000))
+        print(f"[media] 动态采样：时长{duration:.1f}s → {samples}个采样点")
+
     peaks_cache_file = job_dir / f"peaks_{samples}.json"
 
     # 检查缓存
@@ -1228,13 +1256,12 @@ async def post_process_transcription(job_id: str):
         "proxy_needed": False
     }
 
-    # 1. 生成波形峰值
+    # 1. 生成波形峰值（使用动态采样）
     try:
         audio_file = job_dir / "audio.wav"
         if audio_file.exists():
-            peaks_cache = job_dir / "peaks_2000.json"
-            if not peaks_cache.exists():
-                await get_audio_peaks(job_id, 2000)
+            # 使用 samples=0 让后端自动计算采样点数
+            await get_audio_peaks(job_id, 0)
             results["peaks"] = True
     except Exception as e:
         print(f"[media] 波形生成失败: {e}")
@@ -1464,19 +1491,41 @@ async def get_media_info(job_id: str, retry_missing: bool = True):
 
 
 async def _auto_generate_peaks(job_id: str, audio_file: Path, peaks_cache: Path):
-    """自动生成波形数据（后台任务）"""
+    """自动生成波形数据（后台任务）- 使用动态采样"""
     try:
+        # 获取视频时长以计算动态采样点数
+        job_dir = config.JOBS_DIR / job_id
+        video_file = _find_video_file(job_dir)
+        duration = 0.0
+
+        if video_file:
+            duration = await _get_video_duration(video_file)
+
+        if duration <= 0 and audio_file.exists():
+            try:
+                duration = await _get_video_duration(audio_file)
+            except:
+                duration = 60
+
+        if duration <= 0:
+            duration = 60
+
+        # 动态计算采样点数：每秒20个点
+        target_samples = int(duration * 20)
+        samples = max(4000, min(target_samples, 100000))
+        print(f"[media] 自动生成波形：时长{duration:.1f}s → {samples}个采样点")
+
         file_size_mb = audio_file.stat().st_size / (1024 * 1024)
         use_ffmpeg = file_size_mb > 50
 
         if use_ffmpeg:
-            peaks, duration = _generate_peaks_with_ffmpeg(audio_file, 2000)
+            peaks, duration = _generate_peaks_with_ffmpeg(audio_file, samples)
         else:
-            peaks, duration = _generate_peaks_with_wave(audio_file, 2000)
+            peaks, duration = _generate_peaks_with_wave(audio_file, samples)
 
         # 如果FFmpeg失败，回退到wave
         if not peaks and use_ffmpeg:
-            peaks, duration = _generate_peaks_with_wave(audio_file, 2000)
+            peaks, duration = _generate_peaks_with_wave(audio_file, samples)
 
         if peaks:
             result = {

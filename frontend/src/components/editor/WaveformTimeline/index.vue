@@ -12,9 +12,9 @@
           <input
             type="range"
             :value="zoomLevel"
-            min="20"
-            max="500"
-            step="10"
+            :min="ZOOM_MIN"
+            :max="ZOOM_MAX"
+            :step="ZOOM_STEP"
             @input="handleZoomInput"
           />
         </div>
@@ -74,6 +74,14 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
 
+// ============ 缩放配置常量 ============
+const ZOOM_MIN = 20        // 最小缩放 20%
+const ZOOM_MAX = 200       // 最大缩放 200%（全局限制）
+const ZOOM_STEP = 5        // 滑块精度 5%
+const ZOOM_BUTTON_STEP = 10 // 按钮步进 10%
+const ZOOM_WHEEL_STEP = 5   // 滚轮步进 5%（更细腻）
+const ZOOM_BASE_PX_PER_SEC = 50  // 100%缩放时的基准：每秒50像素
+
 // Props
 const props = defineProps({
   audioUrl: String,
@@ -122,12 +130,45 @@ const audioSource = computed(() => {
 
 const peaksSource = computed(() => {
   if (props.peaksUrl) return props.peaksUrl
-  if (props.jobId) return `/api/media/${props.jobId}/peaks?samples=2000`
+  // 移除固定samples=2000，让后端自动计算（动态采样）
+  if (props.jobId) return `/api/media/${props.jobId}/peaks?samples=0`
   return projectStore.meta.peaksPath || ''
 })
 
 const currentTime = computed(() => projectStore.player.currentTime)
 const duration = computed(() => projectStore.meta.duration || 0)
+
+// 根据视频时长计算合适的波形配置
+function calculateWaveformConfig(videoDuration, containerWidth) {
+  // 【关键修改】使用固定基准，而非适应容器宽度
+  // 基准：每秒50px（100%缩放时），这样视频一定会超出容器产生滚动
+  const basePxPerSec = ZOOM_BASE_PX_PER_SEC  // 固定基准50px/s
+
+  // 计算建议的初始缩放级别（适应屏幕）
+  // 例如：60秒视频，800px容器 → 理想缩放 = (800/60/50)*100 ≈ 27%
+  const idealFitZoom = Math.round((containerWidth / videoDuration / basePxPerSec) * 100)
+  const suggestedZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, idealFitZoom))
+
+  // 根据视频时长选择柱子配置
+  let barConfig = {}
+  if (videoDuration < 60) {
+    // 短视频（<1分钟）：细柱子
+    barConfig = { barWidth: 2, barGap: 1, barRadius: 2 }
+  } else if (videoDuration < 300) {
+    // 中等视频（1-5分钟）：更细的柱子
+    barConfig = { barWidth: 1.5, barGap: 0.5, barRadius: 1 }
+  } else if (videoDuration < 1800) {
+    // 较长视频（5-30分钟）：最细柱子
+    barConfig = { barWidth: 1, barGap: 0.5, barRadius: 1 }
+  }
+  // 超过30分钟的视频使用线条模式（不设置 barWidth）
+
+  return {
+    basePxPerSec,      // 固定基准（50px/s）
+    suggestedZoom,     // 建议的初始缩放级别
+    barConfig
+  }
+}
 
 // 初始化 Wavesurfer
 async function initWavesurfer() {
@@ -152,6 +193,11 @@ async function initWavesurfer() {
       secondaryFontColor: '#6e7681'
     })
 
+    // 获取容器宽度和视频时长，计算最佳配置
+    const containerWidth = containerRef.value?.offsetWidth || 800
+    const estimatedDuration = projectStore.meta.duration || 60
+    const { basePxPerSec, suggestedZoom, barConfig } = calculateWaveformConfig(estimatedDuration, containerWidth)
+
     // 创建实例
     wavesurfer = WaveSurfer.create({
       container: waveformRef.value,
@@ -162,18 +208,23 @@ async function initWavesurfer() {
       normalize: true,
       backend: 'MediaElement',
       plugins: [regionsPlugin, timelinePlugin],
-      minPxPerSec: 50,
+      minPxPerSec: basePxPerSec,  // 使用固定基准50
       scrollParent: true,
-      fillParent: true,
-      barWidth: 2,
-      barGap: 1,
-      barRadius: 2,
+      fillParent: false,        // 改为 false，允许滚动
+      dragToSeek: true,         // 启用拖拽定位
+      autoScroll: true,         // 播放时自动滚动
+      autoCenter: true,         // 保持光标居中
+      hideScrollbar: false,     // 显示滚动条
+      ...barConfig,             // 动态柱子配置
       // 静音波形音频，避免与视频声音重叠
       media: document.createElement('audio'),
     })
-    
+
     // 确保 WaveSurfer 静音（音频由视频播放器控制）
     wavesurfer.setMuted(true)
+
+    // 初始化缩放级别为建议值（通常会适应屏幕）
+    zoomLevel.value = suggestedZoom
 
     // 设置事件监听
     setupWavesurferEvents()
@@ -197,6 +248,24 @@ function setupWavesurferEvents() {
     isLoading.value = false
     isReady.value = true
     retryCount.value = 0  // 成功加载后重置重试计数器
+
+    // 音频加载完成后，根据实际时长重新调整配置
+    const actualDuration = wavesurfer.getDuration()
+    const containerWidth = containerRef.value?.offsetWidth || 800
+    if (actualDuration > 0) {
+      const { basePxPerSec, suggestedZoom, barConfig } = calculateWaveformConfig(actualDuration, containerWidth)
+
+      // 应用建议的缩放级别
+      zoomLevel.value = suggestedZoom
+      const initialPxPerSec = basePxPerSec * (suggestedZoom / 100)
+      wavesurfer.zoom(initialPxPerSec)
+
+      // 应用柱子配置
+      if (Object.keys(barConfig).length > 0) {
+        wavesurfer.setOptions(barConfig)
+      }
+    }
+
     renderSubtitleRegions()
     emit('ready')
   })
@@ -205,19 +274,21 @@ function setupWavesurferEvents() {
   // WaveSurfer 只作为视觉组件，跟随 VideoStage 的状态
   // Store.isPlaying 由 VideoStage 和用户操作统一管理
 
-  wavesurfer.on('timeupdate', (time) => {
-    projectStore.player.currentTime = time
-  })
+  // 【关键修改】移除 timeupdate 的反向绑定，避免滚动触发时间跳转
+  // 不要监听 timeupdate 来更新 Store，保持单向数据流：Store → WaveSurfer
+  // WaveSurfer 的时间由外部 watch 同步（见第458-464行）
 
   wavesurfer.on('interaction', (time) => {
+    // 仅在用户主动点击波形时才跳转时间
     projectStore.seekTo(time)
     emit('seek', time)
   })
 
   wavesurfer.on('zoom', (minPxPerSec) => {
-    const newZoom = Math.round((minPxPerSec / 50) * 100)
-    zoomLevel.value = newZoom
-    emit('zoom', newZoom)
+    const newZoom = Math.round((minPxPerSec / ZOOM_BASE_PX_PER_SEC) * 100)
+    // 限制在全局范围内
+    zoomLevel.value = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZoom))
+    emit('zoom', zoomLevel.value)
   })
 
   wavesurfer.on('error', (error) => {
@@ -334,18 +405,20 @@ function handleZoomInput(e) {
 
 function setZoom(value) {
   if (!wavesurfer) return
-  zoomLevel.value = value
-  const minPxPerSec = (value / 100) * 50
+  // 使用全局常量限制范围
+  const clampedValue = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, value))
+  zoomLevel.value = clampedValue
+  const minPxPerSec = (clampedValue / 100) * ZOOM_BASE_PX_PER_SEC
   wavesurfer.zoom(minPxPerSec)
-  projectStore.view.zoomLevel = value
+  projectStore.view.zoomLevel = clampedValue
 }
 
 function zoomIn() {
-  setZoom(Math.min(500, zoomLevel.value + 20))
+  setZoom(zoomLevel.value + ZOOM_BUTTON_STEP)
 }
 
 function zoomOut() {
-  setZoom(Math.max(20, zoomLevel.value - 20))
+  setZoom(zoomLevel.value - ZOOM_BUTTON_STEP)
 }
 
 function fitToScreen() {
@@ -353,9 +426,21 @@ function fitToScreen() {
   const containerWidth = containerRef.value.offsetWidth - 32
   const audioDuration = wavesurfer.getDuration()
   if (audioDuration > 0) {
-    const minPxPerSec = containerWidth / audioDuration
-    wavesurfer.zoom(minPxPerSec)
-    zoomLevel.value = Math.round((minPxPerSec / 50) * 100)
+    // 计算适合屏幕的缩放级别
+    const idealZoom = Math.round((containerWidth / audioDuration / ZOOM_BASE_PX_PER_SEC) * 100)
+    // 限制在全局范围内
+    const fitZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, idealZoom))
+
+    setZoom(fitZoom)
+
+    // 根据时长动态调整柱子配置
+    const { barConfig } = calculateWaveformConfig(audioDuration, containerWidth)
+    if (Object.keys(barConfig).length > 0) {
+      wavesurfer.setOptions(barConfig)
+    } else {
+      // 长视频使用线条模式
+      wavesurfer.setOptions({ barWidth: 0, barGap: 0 })
+    }
   }
 }
 
@@ -420,8 +505,10 @@ watch(() => projectStore.view.selectedSubtitleId, () => {
 function handleWheel(e) {
   if (!e.ctrlKey) return
   e.preventDefault()
-  const delta = e.deltaY < 0 ? 20 : -20
-  setZoom(Math.max(20, Math.min(500, zoomLevel.value + delta)))
+
+  // 使用更细腻的滚轮步进
+  const delta = e.deltaY < 0 ? ZOOM_WHEEL_STEP : -ZOOM_WHEEL_STEP
+  setZoom(zoomLevel.value + delta)
 }
 
 onMounted(async () => {
@@ -487,6 +574,7 @@ onUnmounted(() => {
     width: 100px;
 
     input[type="range"] {
+      appearance: none;
       -webkit-appearance: none;
       width: 100%;
       height: 4px;
@@ -495,6 +583,7 @@ onUnmounted(() => {
       cursor: pointer;
 
       &::-webkit-slider-thumb {
+        appearance: none;
         -webkit-appearance: none;
         width: 12px;
         height: 12px;
@@ -540,7 +629,8 @@ onUnmounted(() => {
   flex: 1;
   position: relative;
   min-height: 128px;
-  overflow: hidden;
+  overflow-x: auto;   // 改为 auto，允许水平滚动
+  overflow-y: hidden;
 
   #waveform {
     height: 100%;
