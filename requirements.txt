@@ -196,3 +196,5 @@ python-multipart
 sse-starlette
 psutil
 silero-vad
+demucs>=4.0.0
+librosa
