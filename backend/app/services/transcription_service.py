@@ -48,11 +48,11 @@ class VADConfig:
     """
     method: VADMethod = VADMethod.SILERO  # 默认使用Silero
     hf_token: Optional[str] = None         # Pyannote需要的HF Token
-    onset: float = 0.65                    # 语音开始阈值（提升至0.65以过滤背景音乐）
-    offset: float = 0.45                   # 语音结束阈值（对应onset=0.65的调整）
+    onset: float = 0.7                     # 语音开始阈值（提升至0.7以更严格过滤）
+    offset: float = 0.5                    # 语音结束阈值（对应onset=0.7的调整）
     chunk_size: int = 30                   # 最大段长（秒）
-    min_speech_duration_ms: int = 400      # 最小语音段长度（毫秒，默认400ms）
-    min_silence_duration_ms: int = 400     # 最小静音长度（毫秒，默认400ms）
+    min_speech_duration_ms: int = 500      # 最小语音段长度（提升至500ms，过滤短噪音）
+    min_silence_duration_ms: int = 500     # 最小静音长度（提升至500ms，确保断句清晰）
 
     def validate(self) -> bool:
         """验证配置有效性"""
@@ -1245,10 +1245,12 @@ class TranscriptionService:
             vocals_path = None
 
             # 决策：何时执行全局分离
+            # 【优化】auto模式下，LIGHT和HEAVY级别都会触发全局分离
+            # 因为即使是轻微的BGM也可能影响VAD和转录精度
             should_separate_global = (
                 demucs_settings.enabled and (
                     demucs_settings.mode == "always" or
-                    (demucs_settings.mode == "auto" and bgm_level == BGMLevel.HEAVY)
+                    (demucs_settings.mode == "auto" and bgm_level in [BGMLevel.LIGHT, BGMLevel.HEAVY])
                 )
             )
 
@@ -1434,35 +1436,35 @@ class TranscriptionService:
                             audio_array=audio_array
                         )
 
-                # --- 更新内存状态 ---
-                if seg_result:
-                    unaligned_results.append(seg_result)
-                processed_indices.add(idx)
-                job.processed = len(processed_indices)
+                    # --- 更新内存状态 ---
+                    if seg_result:
+                        unaligned_results.append(seg_result)
+                    processed_indices.add(idx)
+                    job.processed = len(processed_indices)
 
-                # --- 更新进度条 ---
-                progress = len(processed_indices) / len(current_segments)
-                self._update_progress(
-                    job,
-                    'transcribe',
-                    progress,
-                    f'转录中 {len(processed_indices)}/{len(current_segments)}'
-                )
+                    # --- 更新进度条 ---
+                    progress = len(processed_indices) / len(current_segments)
+                    self._update_progress(
+                        job,
+                        'transcribe',
+                        progress,
+                        f'转录中 {len(processed_indices)}/{len(current_segments)}'
+                    )
 
-                # 【流式输出】立即推送单个segment的转录结果
-                if seg_result:
-                    self._push_sse_segment(job, seg_result, len(processed_indices), len(current_segments))
+                    # 【流式输出】立即推送单个segment的转录结果
+                    if seg_result:
+                        self._push_sse_segment(job, seg_result, len(processed_indices), len(current_segments))
 
-                # 【关键埋点2】每处理一段保存一次（保存未对齐结果）
-                checkpoint_data = {
-                    "job_id": job.job_id,
-                    "phase": "transcribe",
-                    "processing_mode": processing_mode.value,  # 保存模式信息
-                    "total_segments": len(current_segments),
-                    "processed_indices": list(processed_indices),  # set转list
-                    "segments": current_segments,
-                    "unaligned_results": unaligned_results  # 保存未对齐结果
-                }
+                    # 【关键埋点2】每处理一段保存一次（保存未对齐结果）
+                    checkpoint_data = {
+                        "job_id": job.job_id,
+                        "phase": "transcribe",
+                        "processing_mode": processing_mode.value,  # 保存模式信息
+                        "total_segments": len(current_segments),
+                        "processed_indices": list(processed_indices),  # set转list
+                        "segments": current_segments,
+                        "unaligned_results": unaligned_results  # 保存未对齐结果
+                    }
                     self._save_checkpoint(job_dir, checkpoint_data, job)
                     self.logger.debug(f"检查点已保存: {len(processed_indices)}/{len(current_segments)}")
 
@@ -1712,8 +1714,13 @@ class TranscriptionService:
         available_mb = mem_info.available / (1024 * 1024)
         total_mb = mem_info.total / (1024 * 1024)
 
-        # 安全阈值：至少保留系统总内存的20%或2GB（取较大值）
-        safety_reserve_mb = max(total_mb * 0.2, 2048)
+        # 安全阈值：动态计算，综合考虑多种因素
+        # 1. 基础保留：2GB（保证系统基本运行）
+        # 2. 动态保留：可用内存的10%（而非总内存的20%，避免过度保守）
+        # 3. 最大保留上限：4GB（避免在大内存系统上过度保留）
+        base_reserve_mb = 2048
+        dynamic_reserve_mb = available_mb * 0.1
+        safety_reserve_mb = min(base_reserve_mb + dynamic_reserve_mb, 4096)
         usable_mb = available_mb - safety_reserve_mb
 
         self.logger.info(f"内存评估:")
@@ -2187,11 +2194,15 @@ class TranscriptionService:
             sse_manager = get_sse_manager()
             channel_id = f"job:{job.job_id}"
 
+            # 将numpy类型转换为Python原生类型，避免JSON序列化错误
+            native_ratios = [float(r) for r in ratios] if ratios else []
+            max_ratio = float(max(ratios)) if ratios else 0.0
+
             # 构造事件数据
             event_data = {
                 "level": level.value,
-                "ratios": ratios,
-                "max_ratio": max(ratios) if ratios else 0,
+                "ratios": native_ratios,
+                "max_ratio": max_ratio,
                 "recommendation": self._get_demucs_recommendation(level)
             }
 
@@ -2557,7 +2568,7 @@ class TranscriptionService:
 
             # 智能寻找静音点（避免在句子中间分割）
             if end < length and (end - pos) > SILENCE_SEARCH_MS:
-                search_start = max(pos, endSILENCE_SEARCH_MS)
+                search_start = max(pos, end - SILENCE_SEARCH_MS)
                 search_chunk = audio[search_start:end]
 
                 try:
@@ -3378,15 +3389,44 @@ class TranscriptionService:
                         audio_array,
                         job.settings.device
                     )
-                    aligned_segments.extend(aligned_batch.get('segments', []))
-                    self.logger.debug(f"batch {batch_idx + 1}/{total_batches} completed")
+                    
+                    # 【新增】对齐结果边界校验，过滤异常结果
+                    valid_segments = []
+                    for seg in aligned_batch.get('segments', []):
+                        start = seg.get('start', 0)
+                        end = seg.get('end', 0)
+                        text = seg.get('text', '').strip()
+                        
+                        # 校验1：时间戳必须有效
+                        if start is None or end is None or start < 0 or end <= start:
+                            self.logger.warning(f"过滤无效时间戳: start={start}, end={end}, text={text[:20]}...")
+                            continue
+                        
+                        # 校验2：字幕时长不能过长（超过30秒可能是对齐错误）
+                        duration = end - start
+                        if duration > 30:
+                            self.logger.warning(f"过滤过长字幕({duration:.1f}s): {text[:30]}...")
+                            continue
+                        
+                        # 校验3：字幕时长不能过短（小于0.1秒可能是噪音）
+                        if duration < 0.1 and len(text) > 0:
+                            self.logger.warning(f"过滤过短字幕({duration:.2f}s): {text}")
+                            continue
+                        
+                        valid_segments.append(seg)
+                    
+                    aligned_segments.extend(valid_segments)
+                    self.logger.debug(f"batch {batch_idx + 1}/{total_batches} completed, {len(valid_segments)}/{len(aligned_batch.get('segments', []))} valid")
 
                 except Exception as e:
                     self.logger.error(f"batch {batch_idx + 1} alignment failed: {e}")
                     # 继续处理其他批次，不中断整体流程
                     continue
 
-            # 5. 完成
+            # 5. 【新增】字幕时间微调 - 修正"抢先出现"问题
+            aligned_segments = self._adjust_subtitle_timing(aligned_segments)
+
+            # 6. 完成
             self._update_progress(job, 'align', 1, 'alignment complete')
             self._push_sse_align_progress(job, total_batches, total_batches, total_segments, total_segments)
 
@@ -3402,6 +3442,73 @@ class TranscriptionService:
             if processing_mode == ProcessingMode.DISK:
                 del audio_array
                 gc.collect()
+
+    def _adjust_subtitle_timing(
+        self,
+        segments: List[Dict],
+        start_delay_ms: int = 25,
+        end_padding_ms: int = 25
+    ) -> List[Dict]:
+        """
+        字幕时间微调 - 修正对齐偏差
+
+        问题背景：
+        WhisperX对齐后的字幕常常"抢先出现"（开始时间过早），
+        这是因为VAD和对齐算法倾向于保守估计（宁早勿迟）。
+
+        解决方案：
+        1. 将字幕开始时间延后 start_delay_ms（默认25ms）
+        2. 将字幕结束时间延后 end_padding_ms（默认25ms，给一点余量）
+        3. 确保相邻字幕不重叠
+
+        Args:
+            segments: 对齐后的字幕列表
+            start_delay_ms: 开始时间延迟（毫秒），推荐20-50ms
+            end_padding_ms: 结束时间延长（毫秒），推荐20-50ms
+
+        Returns:
+            调整后的字幕列表
+        """
+        if not segments:
+            return segments
+
+        start_delay = start_delay_ms / 1000.0
+        end_padding = end_padding_ms / 1000.0
+
+        adjusted = []
+        for i, seg in enumerate(segments):
+            new_seg = seg.copy()
+            old_start = seg.get('start', 0)
+            old_end = seg.get('end', 0)
+
+            # 延迟开始时间
+            new_start = old_start + start_delay
+
+            # 延长结束时间
+            new_end = old_end + end_padding
+
+            # 确保开始时间不超过结束时间
+            if new_start >= new_end:
+                new_start = old_start  # 回退到原始开始时间
+
+            # 确保不与下一条字幕重叠
+            if i < len(segments) - 1:
+                next_start = segments[i + 1].get('start', float('inf'))
+                # 下一条也会被延迟，所以比较时要考虑
+                next_adjusted_start = next_start + start_delay
+                if new_end > next_adjusted_start:
+                    new_end = next_adjusted_start - 0.05  # 留50ms间隔
+
+            # 确保结束时间仍然有效
+            if new_end <= new_start:
+                new_end = old_end  # 回退到原始结束时间
+
+            new_seg['start'] = round(new_start, 3)
+            new_seg['end'] = round(new_end, 3)
+            adjusted.append(new_seg)
+
+        self.logger.info(f"字幕时间微调: 延迟开始25ms, 延长结束25ms")
+        return adjusted
 
     def _format_ts(self, sec: float) -> str:
         """

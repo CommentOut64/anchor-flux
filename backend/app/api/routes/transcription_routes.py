@@ -11,11 +11,22 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import json
 
-from models.job_models import JobSettings, JobState
+from models.job_models import JobSettings, JobState, DemucsSettings
 from services.transcription_service import TranscriptionService
 from services.file_service import FileManagementService
 from services.sse_service import get_sse_manager
 from services.job_queue_service import get_queue_service  # 新增导入
+
+
+class DemucsSettingsAPI(BaseModel):
+    """Demucs配置请求模型"""
+    enabled: bool = True
+    mode: str = "auto"  # auto/always/never/on_demand
+    retry_threshold_logprob: float = -0.8
+    retry_threshold_no_speech: float = 0.6
+    circuit_breaker_enabled: bool = True
+    consecutive_threshold: int = 3
+    ratio_threshold: float = 0.2
 
 
 class TranscribeSettings(BaseModel):
@@ -25,6 +36,7 @@ class TranscribeSettings(BaseModel):
     device: str = "cuda"
     batch_size: int = 16
     word_timestamps: bool = False
+    demucs: Optional[DemucsSettingsAPI] = None  # Demucs配置（可选）
 
 
 class UploadResponse(BaseModel):
@@ -57,6 +69,9 @@ def create_transcription_router(
         事件类型:
         - progress: 进度更新 (包含 percent, phase, message, status等)
         - signal: 关键节点信号 (job_complete, job_failed, job_canceled, job_paused)
+        - bgm_detected: BGM检测结果 (level, ratios, max_ratio, recommendation)
+        - circuit_breaker_triggered: 熔断触发事件 (triggered, reason, stats, action)
+        - segment: 单个段落转录完成 (包含text, start, end等)
         - ping: 心跳
         """
         # 验证任务是否存在
@@ -272,7 +287,16 @@ def create_transcription_router(
                     print(f"读取checkpoint设置失败: {e}")
 
             # 应用设置
-            job.settings = JobSettings(**settings_obj.dict())
+            settings_dict = settings_obj.model_dump()
+
+            # 转换 Demucs 配置
+            if settings_dict.get('demucs'):
+                settings_dict['demucs'] = DemucsSettings(**settings_dict['demucs'])
+            else:
+                # 移除 None 值，让 JobSettings 的 default_factory 生效
+                settings_dict.pop('demucs', None)
+
+            job.settings = JobSettings(**settings_dict)
 
             # 🔥 关键改动: 如果任务不在队列中，加入队列
             with queue_service.lock:

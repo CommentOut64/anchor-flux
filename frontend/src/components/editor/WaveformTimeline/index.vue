@@ -1,5 +1,5 @@
 <template>
-  <div class="waveform-timeline" ref="containerRef" tabindex="-1" @keydown.space.prevent="handleSpaceKey">
+  <div class="waveform-timeline" ref="containerRef" tabindex="-1">
     <!-- 缩放控制栏 -->
     <div class="timeline-header">
       <div class="zoom-controls">
@@ -327,11 +327,18 @@ function setupWavesurferEvents() {
     isReady.value = true;
     retryCount.value = 0; // 成功加载后重置重试计数器
 
-    // 【关键修复】防止 WaveSurfer 的 audio 元素获取焦点，导致空格键被浏览器拦截
-    // 为 audio 元素设置 tabIndex = -1，使其不可通过 Tab 键聚焦
+    // 【关键修复】防止 WaveSurfer 的 audio 元素获取焦点和响应空格键
     const audioElement = wavesurfer.getMediaElement();
     if (audioElement) {
+      // 禁止通过 Tab 键聚焦
       audioElement.setAttribute('tabindex', '-1');
+      // 阻止空格键的默认播放/暂停行为
+      audioElement.addEventListener('keydown', (e) => {
+        if (e.code === 'Space') {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      });
     }
 
     // 音频加载完成后，根据实际时长重新调整配置
@@ -803,13 +810,6 @@ function handleCursorDragEnd() {
 
   // 使用 PlaybackManager 结束拖拽
   playbackManager.stopDragging();
-}
-
-/**
- * 空格键处理：切换播放/暂停
- */
-function handleSpaceKey() {
-  playbackManager.togglePlay();
 }
 
 /**

@@ -1,6 +1,6 @@
 """
 Demucs 人声分离服务
-使用 Hybrid Transformer Demucs (htdemucs) 模型进行高质量人声提取
+支持多种Demucs模型进行高质量人声提取
 """
 
 import os
@@ -11,7 +11,7 @@ import hashlib
 from pathlib import Path
 from typing import Optional, Tuple, List
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import numpy as np
@@ -25,13 +25,22 @@ class BGMLevel(Enum):
     HEAVY = "heavy"    # 强背景音乐（全局分离）
 
 
+class DemucsModel(Enum):
+    """可用的Demucs模型"""
+    HTDEMUCS = "htdemucs"           # Hybrid Transformer (~80MB, 快速)
+    HTDEMUCS_FT = "htdemucs_ft"     # Fine-tuned版本 (~80MB, 人声更优)
+    MDX_EXTRA = "mdx_extra"         # MDX-Net (~100MB, 高质量)
+    MDX_EXTRA_Q = "mdx_extra_q"     # MDX-Net量化版 (~25MB, 较快)
+
+
 @dataclass
 class DemucsConfig:
     """Demucs配置"""
-    model_name: str = "htdemucs"          # 模型名称
+    # 模型选择 - 默认使用mdx_extra（高质量人声分离）
+    model_name: str = "mdx_extra"
     device: str = "cuda"                   # 设备 (cuda/cpu)
-    shifts: int = 1                        # 增强次数（1=快速，5=高质量）
-    overlap: float = 0.25                  # 分段重叠率
+    shifts: int = 2                        # 增强次数（1=快速，2=平衡，5=最高质量）
+    overlap: float = 0.5                   # 分段重叠率
     segment_length: int = 10               # 每段处理长度（秒）
 
     # 按需分离的缓冲区
@@ -39,13 +48,27 @@ class DemucsConfig:
 
     # BGM检测参数（分位数采样策略）
     bgm_sample_duration: float = 10.0      # 每个采样片段的长度（秒）
-    bgm_light_threshold: float = 0.2       # 轻微BGM阈值（BGM能量占比）
-    bgm_heavy_threshold: float = 0.6       # 强BGM阈值（只要有一处超过此值即为Heavy）
+    bgm_light_threshold: float = 0.02      # 轻微BGM阈值
+    bgm_heavy_threshold: float = 0.15      # 强BGM阈值
+
+    # 可用模型列表（供UI选择）
+    available_models: List[str] = field(default_factory=lambda: [
+        "mdx_extra",      # 默认推荐：高质量
+        "htdemucs",       # 快速模式
+        "htdemucs_ft",    # Fine-tuned
+        "mdx_extra_q",    # 量化版（小显存）
+    ])
 
 
 class DemucsService:
     """
     Demucs人声分离服务
+
+    支持多种模型：
+    - mdx_extra: 高质量人声分离（默认推荐）
+    - htdemucs: Hybrid Transformer，快速模式
+    - htdemucs_ft: Fine-tuned版本
+    - mdx_extra_q: 量化版，适合小显存
 
     支持三种使用模式：
     1. 全局分离：处理整个音频文件，返回纯人声
@@ -55,6 +78,7 @@ class DemucsService:
 
     _instance = None
     _model = None
+    _model_name_loaded = None  # 记录当前加载的模型名称
     _model_lock = None
 
     def __new__(cls):
@@ -70,36 +94,65 @@ class DemucsService:
         self._cache_dir = Path("models/demucs")
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
+    def set_model(self, model_name: str):
+        """
+        切换Demucs模型
+
+        Args:
+            model_name: 模型名称 (mdx_extra, htdemucs, htdemucs_ft, mdx_extra_q)
+        """
+        if model_name not in self.config.available_models:
+            raise ValueError(f"不支持的模型: {model_name}, 可选: {self.config.available_models}")
+
+        if model_name != self.config.model_name:
+            self.logger.info(f"切换Demucs模型: {self.config.model_name} → {model_name}")
+            self.config.model_name = model_name
+            # 卸载旧模型，下次使用时会加载新模型
+            self.unload_model()
+
     def _load_model(self, device: str = None):
         """
         懒加载Demucs模型
 
-        模型首次加载时会自动下载（~80MB）
+        模型首次加载时会自动下载
+        - mdx_extra: ~100MB
+        - htdemucs: ~80MB
+        - mdx_extra_q: ~25MB
         """
         if device:
             self.config.device = device
 
         with self._model_lock:
-            if self._model is not None:
+            # 检查是否需要重新加载（模型切换）
+            if self._model is not None and self._model_name_loaded == self.config.model_name:
                 return self._model
+
+            # 如果模型已加载但名称不同，先卸载
+            if self._model is not None:
+                self.logger.info(f"卸载旧模型: {self._model_name_loaded}")
+                del self._model
+                self._model = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             self.logger.info(f"加载Demucs模型: {self.config.model_name}")
 
             try:
                 from demucs.pretrained import get_model
-                from demucs.apply import apply_model
 
                 # 加载预训练模型
                 self._model = get_model(self.config.model_name)
+                self._model_name_loaded = self.config.model_name
 
                 # 移动到指定设备
                 if self.config.device == "cuda" and torch.cuda.is_available():
                     self._model.cuda()
-                    self.logger.info("Demucs模型已加载到GPU")
+                    self.logger.info(f"Demucs模型 {self.config.model_name} 已加载到GPU")
                 else:
                     self._model.cpu()
                     self.config.device = "cpu"
-                    self.logger.info("Demucs模型已加载到CPU")
+                    self.logger.info(f"Demucs模型 {self.config.model_name} 已加载到CPU")
 
                 self._model.eval()
                 return self._model
@@ -113,12 +166,14 @@ class DemucsService:
         """卸载模型释放显存"""
         with self._model_lock:
             if self._model is not None:
+                old_name = self._model_name_loaded
                 del self._model
                 self._model = None
+                self._model_name_loaded = None
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                self.logger.info("Demucs模型已卸载")
+                self.logger.info(f"Demucs模型 {old_name} 已卸载")
 
     def separate_vocals(
         self,
@@ -403,44 +458,41 @@ class DemucsService:
             return BGMLevel.NONE, ratios
 
     def _calculate_bgm_ratio(
-        self,
-        original: np.ndarray,
+        self, 
+        original: np.ndarray, 
         vocals: np.ndarray
     ) -> float:
         """
-        计算 BGM 能量占比
-
-        逻辑：(原音频能量 - 人声能量) / 原音频能量
-
-        注意：Demucs分离出的vocals能量可能与原始不完全一致，
-        这里使用RMS能量比作为近似估算。
-
-        Args:
-            original: 原始混合音频
-            vocals: 分离后的人声
-
-        Returns:
-            float: BGM能量占比 (0.0-1.0)，越高表示BGM越强
+        计算 BGM 能量占比（最终优化版）
+        逻辑：计算残差信号（Background）的 RMS 占原信号 RMS 的比例
         """
-        # 确保长度一致
+        # 1. 长度对齐
         min_len = min(len(original), len(vocals))
         original = original[:min_len]
         vocals = vocals[:min_len]
+        
+        # 2. 计算残差（即背景音）
+        # Demucs 的波形相位一致性很好，直接相减是物理意义上最准确的去人声方法
+        background = original - vocals
 
-        # 计算均方根能量 (RMS)
-        rms_orig = np.sqrt(np.mean(original ** 2))
-        rms_voc = np.sqrt(np.mean(vocals ** 2))
-
-        # 如果原音就很小（静音片段），返回0
-        if rms_orig < 0.01:
+        # 3. 计算 RMS (使用 float64 提高精度)
+        # mean(x^2) 是功率，sqrt(功率) 是 RMS
+        rms_orig = np.sqrt(np.mean(original.astype(np.float64) ** 2))
+        
+        # 4. 快速过滤：如果是静音或极低音量片段，直接返回 0
+        # 0.001 约等于 -60dB，低于此值通常是底噪，没有分析意义
+        if rms_orig < 1e-3:
             return 0.0
 
-        # 计算非人声部分的能量占比（近似背景音）
-        # 假设 Energy_Total ≈ Energy_Vocal + Energy_BGM
-        # BGM_ratio ≈ 1 - (Vocal_RMS / Total_RMS)
-        bgm_ratio = 1.0 - (rms_voc / (rms_orig + 1e-6))
+        rms_bgm = np.sqrt(np.mean(background.astype(np.float64) ** 2))
+        
+        # 5. 计算比例
+        # 加上一个极小值 eps 防止除零
+        bgm_ratio = rms_bgm / (rms_orig + 1e-8)
 
-        return max(0.0, min(1.0, bgm_ratio))  # 钳制在0-1范围
+        # 6. 结果钳制
+        # 理论上 background 不应大于 original，但因浮点误差可能略超 1.0
+        return float(max(0.0, min(1.0, bgm_ratio)))
 
     def _get_cache_key(self, audio_path: str, mode: str) -> str:
         """生成缓存键"""
