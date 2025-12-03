@@ -132,6 +132,144 @@ QUALITY_PRESETS = {
 }
 
 
+class SeparationStrategyResolver:
+    """
+    分离策略解析器
+
+    根据 BGM 检测结果和用户配置，决定使用哪个模型以及升级路径
+
+    策略矩阵：
+    ┌───────────┬─────────────────┬─────────────────┬──────────────┐
+    │ BGM Level │ mode=auto       │ mode=always     │ mode=never   │
+    ├───────────┼─────────────────┼─────────────────┼──────────────┤
+    │ NONE      │ 不分离          │ weak_model      │ 不分离        │
+    │ LIGHT     │ weak_model      │ weak_model      │ 不分离        │
+    │ HEAVY     │ strong_model    │ strong_model    │ 不分离        │
+    └───────────┴─────────────────┴─────────────────┴──────────────┘
+    """
+
+    def __init__(self, settings):
+        """
+        初始化策略解析器
+
+        Args:
+            settings: DemucsSettings 对象
+        """
+        self.settings = settings
+        self.logger = logging.getLogger(__name__)
+
+        # 如果使用质量预设，覆盖模型配置
+        self._apply_preset()
+
+    def _apply_preset(self):
+        """应用质量预设（如果用户未自定义模型）"""
+        preset = QUALITY_PRESETS.get(self.settings.quality_preset)
+        if preset:
+            # 检测是否使用默认值（通过判断是否等于 balanced 预设的值）
+            # 如果用户自定义了模型，则不应用预设
+            default_weak = "htdemucs_ft"
+            default_strong = "mdx_extra_q"
+            default_fallback = "mdx_extra"
+
+            if (self.settings.weak_model == default_weak and
+                self.settings.strong_model == default_strong and
+                self.settings.fallback_model == default_fallback):
+                # 用户未自定义，应用预设
+                self.settings.weak_model = preset["weak_model"]
+                self.settings.strong_model = preset["strong_model"]
+                self.settings.fallback_model = preset["fallback_model"]
+                self.logger.debug(
+                    f"应用质量预设 '{self.settings.quality_preset}': "
+                    f"weak={preset['weak_model']}, strong={preset['strong_model']}, "
+                    f"fallback={preset['fallback_model']}"
+                )
+
+    def resolve(self, bgm_level: BGMLevel) -> SeparationStrategy:
+        """
+        根据 BGM 级别解析分离策略
+
+        Args:
+            bgm_level: 检测到的 BGM 级别
+
+        Returns:
+            SeparationStrategy: 分离策略决策结果
+        """
+        mode = self.settings.mode
+
+        # mode=never: 始终不分离
+        if mode == "never":
+            return SeparationStrategy(
+                should_separate=False,
+                initial_model=None,
+                fallback_model=None,
+                reason="用户禁用人声分离",
+                bgm_level=bgm_level,
+                allow_escalation=False,
+            )
+
+        # mode=always: 始终分离（根据BGM级别选模型）
+        if mode == "always":
+            model = self.settings.strong_model if bgm_level == BGMLevel.HEAVY else self.settings.weak_model
+            return SeparationStrategy(
+                should_separate=True,
+                initial_model=model,
+                fallback_model=self.settings.fallback_model if self.settings.auto_escalation else None,
+                reason=f"始终分离模式，BGM={bgm_level.value}，使用 {model}",
+                bgm_level=bgm_level,
+                allow_escalation=self.settings.auto_escalation,
+            )
+
+        # mode=auto（默认）: 根据BGM级别决定
+        if bgm_level == BGMLevel.NONE:
+            return SeparationStrategy(
+                should_separate=False,
+                initial_model=None,
+                fallback_model=None,
+                reason="未检测到背景音乐，跳过人声分离",
+                bgm_level=bgm_level,
+                allow_escalation=False,
+            )
+
+        elif bgm_level == BGMLevel.LIGHT:
+            return SeparationStrategy(
+                should_separate=True,
+                initial_model=self.settings.weak_model,
+                fallback_model=self.settings.fallback_model if self.settings.auto_escalation else None,
+                reason=f"检测到轻微BGM，使用轻量模型 {self.settings.weak_model}",
+                bgm_level=bgm_level,
+                allow_escalation=self.settings.auto_escalation,
+            )
+
+        else:  # HEAVY
+            return SeparationStrategy(
+                should_separate=True,
+                initial_model=self.settings.strong_model,
+                fallback_model=self.settings.fallback_model if self.settings.auto_escalation else None,
+                reason=f"检测到强BGM，使用高质量模型 {self.settings.strong_model}",
+                bgm_level=bgm_level,
+                allow_escalation=self.settings.auto_escalation,
+            )
+
+    def get_escalation_model(self, current_model: str) -> Optional[str]:
+        """
+        获取升级后的模型
+
+        Args:
+            current_model: 当前模型名称
+
+        Returns:
+            新模型名称，如果无法升级则返回 None
+        """
+        if not self.settings.auto_escalation:
+            return None
+
+        # 已经是 fallback 模型，无法再升级
+        if current_model == self.settings.fallback_model:
+            return None
+
+        return self.settings.fallback_model
+
+
 class DemucsService:
     """
     Demucs人声分离服务
@@ -165,6 +303,9 @@ class DemucsService:
         self.config = DemucsConfig()
         self._cache_dir = Path("models/demucs")
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # 分级模型配置
+        self.tier_config = ModelTierConfig()
 
     def set_model(self, model_name: str):
         """
@@ -571,6 +712,70 @@ class DemucsService:
         path_hash = hashlib.md5(audio_path.encode()).hexdigest()[:16]
         mtime = int(os.path.getmtime(audio_path))
         return f"{path_hash}_{mtime}_{mode}"
+
+    # === Phase 2: 策略解析集成方法 ===
+
+    def resolve_strategy(self, bgm_level: BGMLevel, settings) -> SeparationStrategy:
+        """
+        根据 BGM 级别解析分离策略
+
+        Args:
+            bgm_level: 检测到的 BGM 级别
+            settings: DemucsSettings 用户配置
+
+        Returns:
+            SeparationStrategy: 分离策略
+        """
+        resolver = SeparationStrategyResolver(settings)
+        return resolver.resolve(bgm_level)
+
+    def set_model_for_strategy(self, strategy: SeparationStrategy):
+        """
+        根据策略设置模型
+
+        Args:
+            strategy: 分离策略
+        """
+        if strategy.should_separate and strategy.initial_model:
+            self.set_model(strategy.initial_model)
+            self._apply_quality_settings(strategy.initial_model)
+
+    def escalate_model(self, current_model: str, settings) -> Optional[str]:
+        """
+        升级到更好的模型
+
+        Args:
+            current_model: 当前模型名称
+            settings: DemucsSettings 用户配置
+
+        Returns:
+            新模型名称，如果无法升级则返回 None
+        """
+        resolver = SeparationStrategyResolver(settings)
+        new_model = resolver.get_escalation_model(current_model)
+
+        if new_model:
+            self.logger.info(f"模型升级: {current_model} -> {new_model}")
+            self.set_model(new_model)
+            self._apply_quality_settings(new_model)
+
+        return new_model
+
+    def _apply_quality_settings(self, model_name: str):
+        """
+        应用模型对应的质量参数
+
+        Args:
+            model_name: 模型名称
+        """
+        quality = self.tier_config.model_quality.get(model_name, {})
+        if quality:
+            self.config.shifts = quality.get("shifts", self.config.shifts)
+            self.config.overlap = quality.get("overlap", self.config.overlap)
+            self.logger.debug(
+                f"应用质量参数: model={model_name}, "
+                f"shifts={self.config.shifts}, overlap={self.config.overlap}"
+            )
 
 
 # 全局单例
