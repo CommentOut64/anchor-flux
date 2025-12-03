@@ -48,11 +48,11 @@ class VADConfig:
     """
     method: VADMethod = VADMethod.SILERO  # 默认使用Silero
     hf_token: Optional[str] = None         # Pyannote需要的HF Token
-    onset: float = 0.65                    # 语音开始阈值（提升至0.65以过滤背景音乐）
-    offset: float = 0.45                   # 语音结束阈值（对应onset=0.65的调整）
+    onset: float = 0.7                     # 语音开始阈值（提升至0.7以更严格过滤）
+    offset: float = 0.5                    # 语音结束阈值（对应onset=0.7的调整）
     chunk_size: int = 30                   # 最大段长（秒）
-    min_speech_duration_ms: int = 400      # 最小语音段长度（毫秒，默认400ms）
-    min_silence_duration_ms: int = 400     # 最小静音长度（毫秒，默认400ms）
+    min_speech_duration_ms: int = 500      # 最小语音段长度（提升至500ms，过滤短噪音）
+    min_silence_duration_ms: int = 500     # 最小静音长度（提升至500ms，确保断句清晰）
 
     def validate(self) -> bool:
         """验证配置有效性"""
@@ -61,6 +61,288 @@ class VADConfig:
         if not (0.0 <= self.onset <= 1.0) or not (0.0 <= self.offset <= 1.0):
             return False  # 阈值必须在0-1之间
         return True
+
+
+class BreakToGlobalSeparation(Exception):
+    """熔断异常：触发时需要升级为全局人声分离模式"""
+    pass
+
+
+@dataclass
+class CircuitBreakerState:
+    """
+    熔断器状态（支持模型升级）
+
+    用于监控转录质量，当大量段落需要重试时：
+    1. 优先尝试升级模型（如果允许且未达上限）
+    2. 无法升级时才触发熔断
+    """
+    consecutive_retries: int = 0        # 连续重试计数
+    total_retries: int = 0              # 总重试次数
+    total_segments: int = 0             # 总段落数
+    processed_segments: int = 0         # 已处理段落数
+
+    # === Phase 3: 升级跟踪 ===
+    escalation_count: int = 0                           # 已升级次数
+    current_model: Optional[str] = None                 # 当前使用的模型
+    escalation_history: List[str] = field(default_factory=list)  # 升级历史
+
+    def record_retry(self):
+        """记录一次重试"""
+        self.consecutive_retries += 1
+        self.total_retries += 1
+
+    def record_success(self):
+        """记录一次成功（重置连续计数）"""
+        self.consecutive_retries = 0
+        self.processed_segments += 1
+
+    def record_escalation(self, new_model: str):
+        """
+        记录一次模型升级
+
+        Args:
+            new_model: 升级后的模型名称
+        """
+        if self.current_model:
+            self.escalation_history.append(f"{self.current_model} -> {new_model}")
+        self.current_model = new_model
+        self.escalation_count += 1
+        # 升级后重置连续重试计数，给新模型机会
+        self.consecutive_retries = 0
+
+    def should_escalate(self, demucs_settings) -> bool:
+        """
+        判断是否应该升级模型（优先于熔断）
+
+        升级条件：
+        1. 允许自动升级 (auto_escalation=True)
+        2. 未达到最大升级次数
+        3. 满足熔断条件（连续重试或比例过高）
+
+        Args:
+            demucs_settings: Demucs配置对象
+
+        Returns:
+            bool: True表示应该升级模型
+        """
+        if not demucs_settings.auto_escalation:
+            return False
+
+        if self.escalation_count >= demucs_settings.max_escalations:
+            return False
+
+        # 满足熔断条件时，优先升级
+        return self._check_break_condition(demucs_settings)
+
+    def should_break(self, demucs_settings) -> bool:
+        """
+        判断是否应该触发熔断
+
+        注意：只有在无法升级时才触发熔断
+
+        Args:
+            demucs_settings: Demucs配置对象
+
+        Returns:
+            bool: True表示应该触发熔断
+        """
+        if not demucs_settings.circuit_breaker_enabled:
+            return False
+
+        # 如果还能升级，不触发熔断
+        if self.should_escalate(demucs_settings):
+            return False
+
+        return self._check_break_condition(demucs_settings)
+
+    def _check_break_condition(self, demucs_settings) -> bool:
+        """
+        检查是否满足熔断/升级条件
+
+        熔断条件（满足任一即触发）：
+        1. 连续 N 个 segment 都触发重试（默认N=3）
+        2. 总重试比例超过阈值（默认20%）
+
+        Args:
+            demucs_settings: Demucs配置对象
+
+        Returns:
+            bool: True表示满足熔断/升级条件
+        """
+        # 条件1：连续重试次数
+        if self.consecutive_retries >= demucs_settings.consecutive_threshold:
+            return True
+
+        # 条件2：总重试比例（至少处理5个segment后才检查）
+        if self.processed_segments >= 5:
+            retry_ratio = self.total_retries / self.processed_segments
+            if retry_ratio >= demucs_settings.ratio_threshold:
+                return True
+
+        return False
+
+    def get_stats(self) -> Dict:
+        """获取统计信息（扩展）"""
+        return {
+            "consecutive_retries": self.consecutive_retries,
+            "total_retries": self.total_retries,
+            "total_segments": self.total_segments,
+            "processed_segments": self.processed_segments,
+            "retry_ratio": self.total_retries / max(1, self.processed_segments),
+            # Phase 3 新增
+            "escalation_count": self.escalation_count,
+            "current_model": self.current_model,
+            "escalation_history": self.escalation_history,
+        }
+
+
+class CircuitBreakAction(Enum):
+    """熔断后的处理动作"""
+    CONTINUE = "continue"           # 继续处理，标记问题段落
+    FALLBACK_ORIGINAL = "fallback"  # 降级使用原始音频
+    FAIL = "fail"                   # 任务失败
+    PAUSE = "pause"                 # 暂停等待人工介入
+
+
+class CircuitBreakHandler:
+    """
+    熔断异常处理器
+
+    负责在熔断触发时执行用户配置的处理策略
+    """
+
+    def __init__(self, job: "JobState", settings):
+        """
+        初始化熔断处理器
+
+        Args:
+            job: 任务状态对象
+            settings: DemucsSettings 配置对象
+        """
+        self.job = job
+        self.settings = settings
+        self.logger = logging.getLogger(__name__)
+        self.problem_segments: List[int] = []  # 记录问题段落索引
+
+    def handle(
+        self,
+        breaker_state: CircuitBreakerState,
+        current_segment_idx: int,
+        sse_manager = None
+    ) -> CircuitBreakAction:
+        """
+        处理熔断异常
+
+        Args:
+            breaker_state: 熔断器状态
+            current_segment_idx: 当前段落索引
+            sse_manager: SSE管理器（用于推送事件）
+
+        Returns:
+            CircuitBreakAction: 处理动作
+        """
+        action_str = self.settings.on_break
+
+        # 解析处理动作
+        try:
+            action = CircuitBreakAction(action_str)
+        except ValueError:
+            # 如果配置值无效，默认使用 CONTINUE
+            self.logger.warning(f"无效的熔断处理策略: {action_str}，使用默认值 continue")
+            action = CircuitBreakAction.CONTINUE
+
+        # 记录问题段落
+        self.problem_segments.append(current_segment_idx)
+
+        # 推送 SSE 事件
+        if sse_manager:
+            self._push_circuit_break_event(breaker_state, action, sse_manager)
+
+        # 根据策略执行操作
+        if action == CircuitBreakAction.FAIL:
+            self.logger.error(
+                f"熔断触发，任务终止。问题段落: {self.problem_segments}"
+            )
+            raise BreakToGlobalSeparation(
+                f"熔断触发，任务终止。问题段落: {self.problem_segments}"
+            )
+
+        elif action == CircuitBreakAction.PAUSE:
+            self.logger.warning(
+                f"熔断触发，等待人工介入。问题段落: {self.problem_segments}"
+            )
+            self.job.paused = True
+            self.job.status = "paused"
+            self.job.message = f"熔断触发，等待人工介入。问题段落: {self.problem_segments}"
+            raise BreakToGlobalSeparation(self.job.message)
+
+        else:  # CONTINUE 或 FALLBACK_ORIGINAL
+            self.logger.warning(
+                f"熔断触发，采用 {action.value} 策略继续处理。"
+                f"问题段落: {self.problem_segments}"
+            )
+
+        return action
+
+    def get_problem_report(self) -> Dict:
+        """
+        获取问题报告
+
+        Returns:
+            包含问题统计和建议的字典
+        """
+        return {
+            "total_problem_segments": len(self.problem_segments),
+            "problem_indices": self.problem_segments,
+            "suggestion": self._get_suggestion()
+        }
+
+    def _get_suggestion(self) -> str:
+        """
+        根据问题段落数量给出建议
+
+        Returns:
+            建议文本
+        """
+        count = len(self.problem_segments)
+        if count == 0:
+            return "所有段落处理正常"
+        elif count <= 3:
+            return "少量段落可能需要手动调整时间轴"
+        elif count <= 10:
+            return "建议检查这些段落的字幕准确性"
+        else:
+            return "大量段落有问题，建议使用更高质量的模型重新处理"
+
+    def _push_circuit_break_event(
+        self,
+        state: CircuitBreakerState,
+        action: CircuitBreakAction,
+        sse_manager
+    ):
+        """
+        推送熔断处理事件
+
+        Args:
+            state: 熔断器状态
+            action: 处理动作
+            sse_manager: SSE管理器
+        """
+        try:
+            sse_manager.push_event(
+                self.job.job_id,
+                "circuit_breaker_handled",
+                {
+                    "action": action.value,
+                    "problem_segments": self.problem_segments,
+                    "stats": state.get_stats(),
+                    "suggestion": self._get_suggestion()
+                }
+            )
+        except Exception as e:
+            self.logger.debug(f"SSE推送失败（非致命）: {e}")
+
 
 from models.job_models import JobSettings, JobState
 from models.hardware_models import HardwareInfo, OptimizationConfig
@@ -947,8 +1229,25 @@ class TranscriptionService:
             "device": job.settings.device,
             "word_timestamps": job.settings.word_timestamps,
             "compute_type": job.settings.compute_type,
-            "batch_size": job.settings.batch_size
+            "batch_size": job.settings.batch_size,
+            "demucs": {
+                "enabled": job.settings.demucs.enabled,
+                "mode": job.settings.demucs.mode,
+            }
         }
+
+        # 确保 demucs 字段存在（向后兼容）
+        if "demucs" not in data:
+            data["demucs"] = {
+                "enabled": job.settings.demucs.enabled,
+                "mode": job.settings.demucs.mode,
+                "bgm_level": "none",
+                "bgm_ratios": [],
+                "global_separation_done": False,
+                "vocals_path": None,
+                "circuit_breaker": None,
+                "retry_triggered": False
+            }
 
         checkpoint_path = job_dir / "checkpoint.json"
         temp_path = checkpoint_path.with_suffix(".tmp")
@@ -996,7 +1295,8 @@ class TranscriptionService:
         job_dir: Path,
         job: JobState,
         segments: List[Dict],
-        processing_mode: ProcessingMode
+        processing_mode: ProcessingMode,
+        demucs_state: Dict = None
     ):
         """
         分段完成后强制刷新checkpoint（确保断点续传一致性）
@@ -1009,6 +1309,7 @@ class TranscriptionService:
             job: 任务状态对象
             segments: 分段元数据列表
             processing_mode: 当前处理模式
+            demucs_state: Demucs状态数据（可选）
         """
         import time
 
@@ -1022,6 +1323,10 @@ class TranscriptionService:
             "unaligned_results": [],
             "timestamp": time.time()  # 时间戳用于调试
         }
+
+        # 添加 demucs 状态（如果提供）
+        if demucs_state:
+            checkpoint_data["demucs"] = demucs_state
 
         # 强制同步写入（确保数据落盘）
         self._save_checkpoint(job_dir, checkpoint_data, job)
@@ -1125,7 +1430,77 @@ class TranscriptionService:
                 raise RuntimeError('任务已取消')
 
             # ==========================================
-            # 3. 阶段1.5: 智能模式决策（新增）
+            # 2. 阶段2: BGM检测（可选）
+            # ==========================================
+            from services.demucs_service import BGMLevel
+
+            bgm_level = BGMLevel.NONE
+            bgm_ratios = []
+            demucs_settings = job.settings.demucs
+
+            # 从checkpoint恢复BGM检测结果
+            if checkpoint and 'demucs' in checkpoint:
+                demucs_state = checkpoint['demucs']
+                bgm_level_str = demucs_state.get('bgm_level', 'none')
+                bgm_level = BGMLevel(bgm_level_str)
+                bgm_ratios = demucs_state.get('bgm_ratios', [])
+                self.logger.info(f"从检查点恢复BGM检测结果: {bgm_level.value}")
+            else:
+                # 执行BGM检测（如果启用且模式需要）
+                if demucs_settings.enabled and demucs_settings.mode in ["auto", "always"]:
+                    bgm_level, bgm_ratios = self._detect_bgm(str(audio_path), job)
+                    self.logger.info(f"BGM检测完成: {bgm_level.value}")
+
+            # ==========================================
+            # 3. 阶段3: 全局人声分离（使用分级策略）
+            # ==========================================
+            use_vocals = False
+            vocals_path = None
+            separation_strategy = None
+
+            # 只有启用 Demucs 时才生成分离策略
+            if demucs_settings.enabled:
+                # 【新增】使用策略解析器决定分离策略
+                from services.demucs_service import SeparationStrategyResolver, get_demucs_service
+                strategy_resolver = SeparationStrategyResolver(demucs_settings)
+                separation_strategy = strategy_resolver.resolve(bgm_level)
+
+                # 推送分离策略SSE事件
+                self._push_sse_separation_strategy(job, separation_strategy)
+
+                self.logger.info(
+                    f"分离策略: should_separate={separation_strategy.should_separate}, "
+                    f"model={separation_strategy.initial_model}, "
+                    f"reason={separation_strategy.reason}"
+                )
+
+            # 从checkpoint恢复分离状态
+            if checkpoint and 'demucs' in checkpoint:
+                demucs_state = checkpoint['demucs']
+                if demucs_state.get('global_separation_done'):
+                    vocals_path = demucs_state.get('vocals_path')
+                    use_vocals = True
+                    self.logger.info(f"从检查点恢复：使用已分离的人声 {vocals_path}")
+
+            # 如果策略要求分离且尚未完成
+            if separation_strategy and separation_strategy.should_separate and not use_vocals:
+                # 【关键】根据策略选择模型
+                from services.demucs_service import get_demucs_service
+                demucs_service = get_demucs_service()
+                demucs_service.set_model_for_strategy(separation_strategy)
+
+                vocals_path = self._separate_vocals_global(str(audio_path), job)
+                use_vocals = True
+                self.logger.info(f"全局人声分离完成: {vocals_path} (模型: {separation_strategy.initial_model})")
+
+            # 决定后续使用哪个音频文件
+            active_audio_path = Path(vocals_path) if use_vocals else audio_path
+
+            if job.canceled:
+                raise RuntimeError('任务已取消')
+
+            # ==========================================
+            # 4. 阶段1.5: 智能模式决策
             # ==========================================
             processing_mode = None
             audio_array = None  # 内存模式下的音频数组
@@ -1138,16 +1513,16 @@ class TranscriptionService:
 
             # 如果没有检查点或没有模式信息，进行智能决策
             if processing_mode is None:
-                processing_mode = self._decide_processing_mode(str(audio_path), job)
+                processing_mode = self._decide_processing_mode(str(active_audio_path), job)
                 self.logger.info(f"智能选择处理模式: {processing_mode.value}")
 
             # ==========================================
-            # 4. 阶段1.6: 音频加载（内存模式）
+            # 5. 阶段1.6: 音频加载（内存模式）
             # ==========================================
             if processing_mode == ProcessingMode.MEMORY:
-                # 内存模式：尝试加载完整音频到内存
+                # 内存模式：尝试加载完整音频到内存（使用可能分离后的音频）
                 try:
-                    audio_array = self._safe_load_audio(str(audio_path), job)
+                    audio_array = self._safe_load_audio(str(active_audio_path), job)
                     self.logger.info("音频已加载到内存（内存模式）")
                 except RuntimeError as e:
                     # 加载失败，降级到硬盘模式
@@ -1156,7 +1531,7 @@ class TranscriptionService:
                     audio_array = None
 
             # ==========================================
-            # 5. 阶段2: 智能分段（模式感知）
+            # 6. 阶段2: 智能分段（模式感知）
             # ==========================================
             # 如果检查点里没有分段信息，说明上次没跑到分段完成
             if not current_segments:
@@ -1173,9 +1548,9 @@ class TranscriptionService:
                         vad_config=VADConfig()  # 使用默认Silero VAD
                     )
                 else:
-                    # 硬盘模式：传统pydub分段
+                    # 硬盘模式：传统pydub分段（使用可能分离后的音频）
                     self.logger.info("使用硬盘分段（稳定模式）")
-                    current_segments = self._split_audio_to_disk(str(audio_path))
+                    current_segments = self._split_audio_to_disk(str(active_audio_path))
 
                 if job.canceled:
                     raise RuntimeError('任务已取消')
@@ -1184,21 +1559,32 @@ class TranscriptionService:
                 job.total = len(current_segments)
                 self._update_progress(job, 'split', 1, f'分段完成 共{job.total}段')
 
-                # 【关键埋点1】分段完成后强制刷新checkpoint（使用新方法）
+                # 【关键埋点1】分段完成后强制刷新checkpoint（使用新方法，包含demucs状态）
                 self._flush_checkpoint_after_split(
                     job_dir,
                     job,
                     current_segments,
-                    processing_mode
+                    processing_mode,
+                    demucs_state={
+                        "enabled": demucs_settings.enabled,
+                        "mode": demucs_settings.mode,
+                        "bgm_level": bgm_level.value,
+                        "bgm_ratios": bgm_ratios,
+                        "global_separation_done": use_vocals,
+                        "vocals_path": str(vocals_path) if vocals_path else None,
+                        "used_model": separation_strategy.initial_model if separation_strategy else None,
+                        "circuit_breaker": None,
+                        "retry_triggered": False
+                    }
                 )
-                self.logger.info("检查点已强制刷新: 分段完成")
+                self.logger.info("检查点已强制刷新: 分段完成（含demucs状态）")
             else:
                 self.logger.info(f"跳过分段，使用检查点数据（共{len(current_segments)}段）")
                 job.segments = current_segments  # 恢复到 job 对象
                 job.total = len(current_segments)
 
             # ==========================================
-            # 6. 阶段3: 转录处理（双模式统一循环）
+            # 6. 阶段3: 转录处理（双模式统一循环 + Demucs熔断）
             # ==========================================
             self._update_progress(job, 'transcribe', 0, '加载模型中')
             if job.canceled:
@@ -1215,78 +1601,198 @@ class TranscriptionService:
             self.logger.info(f"剩余 {len(todo_segments)}/{len(current_segments)} 段需要转录")
             self.logger.info(f"处理模式: {processing_mode.value}")
 
-            for idx, seg in enumerate(current_segments):
-                # 如果已经在 processed_indices 里，直接跳过
-                if idx in processed_indices:
-                    self.logger.debug(f"⏭️ 跳过已处理段 {idx}")
-                    continue
+            # 初始化熔断器（如果启用且处于按需分离模式）
+            circuit_breaker = None
+            demucs_settings = job.settings.demucs
+            if (demucs_settings.enabled and
+                demucs_settings.mode in ["auto", "on_demand"] and
+                not use_vocals):  # 只有在未进行全局分离时才启用熔断
+                circuit_breaker = CircuitBreakerState()
+                circuit_breaker.total_segments = len(current_segments)
+                self.logger.info("熔断机制已启用")
 
-                # 检查取消和暂停标志
-                if job.canceled:
-                    raise RuntimeError('任务已取消')
+            try:
+                for idx, seg in enumerate(current_segments):
+                    # 如果已经在 processed_indices 里，直接跳过
+                    if idx in processed_indices:
+                        self.logger.debug(f"⏭️ 跳过已处理段 {idx}")
+                        continue
 
-                if job.paused:
-                    raise RuntimeError('任务已暂停')
+                    # 检查取消和暂停标志
+                    if job.canceled:
+                        raise RuntimeError('任务已取消')
 
-                # 【内存监控】定期检查内存状态（每10段检查一次）
-                if idx % 10 == 0 and processing_mode == ProcessingMode.MEMORY:
-                    if not self._check_memory_during_transcription(job):
-                        # 内存严重不足，任务已暂停
-                        raise RuntimeError('内存不足，任务已暂停')
+                    if job.paused:
+                        raise RuntimeError('任务已暂停')
 
-                ratio = len(processed_indices) / max(1, len(current_segments))
-                self._update_progress(
-                    job,
-                    'transcribe',
-                    ratio,
-                    f'转录 {len(processed_indices)+1}/{len(current_segments)}'
-                )
+                    # 【内存监控】定期检查内存状态（每10段检查一次）
+                    if idx % 10 == 0 and processing_mode == ProcessingMode.MEMORY:
+                        if not self._check_memory_during_transcription(job):
+                            # 内存严重不足，任务已暂停
+                            raise RuntimeError('内存不足，任务已暂停')
 
-                # 确保segment有index字段
-                if 'index' not in seg:
-                    seg['index'] = idx
+                    ratio = len(processed_indices) / max(1, len(current_segments))
+                    self._update_progress(
+                        job,
+                        'transcribe',
+                        ratio,
+                        f'转录 {len(processed_indices)+1}/{len(current_segments)}'
+                    )
 
-                # 【统一入口】使用双模式转录（自动根据mode字段选择）
-                seg_result = self._transcribe_segment(
-                    seg,
-                    model,
-                    job,
-                    audio_array=audio_array  # 内存模式传数组，硬盘模式为None
-                )
+                    # 确保segment有index字段
+                    if 'index' not in seg:
+                        seg['index'] = idx
 
-                # --- 更新内存状态 ---
-                if seg_result:
-                    unaligned_results.append(seg_result)
-                processed_indices.add(idx)
-                job.processed = len(processed_indices)
+                    # 【统一入口】使用带重试的转录方法（支持熔断）
+                    if circuit_breaker:
+                        # 启用熔断模式：使用 _transcribe_segment_with_retry
+                        seg_result = self._transcribe_segment_with_retry(
+                            seg,
+                            model,
+                            job,
+                            audio_array=audio_array,
+                            circuit_breaker=circuit_breaker
+                        )
+                    else:
+                        # 未启用熔断：使用原始方法
+                        seg_result = self._transcribe_segment(
+                            seg,
+                            model,
+                            job,
+                            audio_array=audio_array
+                        )
 
-                # --- 更新进度条 ---
-                progress = len(processed_indices) / len(current_segments)
-                self._update_progress(
-                    job,
-                    'transcribe',
-                    progress,
-                    f'转录中 {len(processed_indices)}/{len(current_segments)}'
-                )
+                    # --- 更新内存状态 ---
+                    if seg_result:
+                        unaligned_results.append(seg_result)
+                    processed_indices.add(idx)
+                    job.processed = len(processed_indices)
 
-                # 【流式输出】立即推送单个segment的转录结果
-                if seg_result:
-                    self._push_sse_segment(job, seg_result, len(processed_indices), len(current_segments))
+                    # --- 更新进度条 ---
+                    progress = len(processed_indices) / len(current_segments)
+                    self._update_progress(
+                        job,
+                        'transcribe',
+                        progress,
+                        f'转录中 {len(processed_indices)}/{len(current_segments)}'
+                    )
 
-                # 【关键埋点2】每处理一段保存一次（保存未对齐结果）
-                checkpoint_data = {
-                    "job_id": job.job_id,
-                    "phase": "transcribe",
-                    "processing_mode": processing_mode.value,  # 保存模式信息
-                    "total_segments": len(current_segments),
-                    "processed_indices": list(processed_indices),  # set转list
-                    "segments": current_segments,
-                    "unaligned_results": unaligned_results  # 保存未对齐结果
-                }
-                self._save_checkpoint(job_dir, checkpoint_data, job)
-                self.logger.debug(f"检查点已保存: {len(processed_indices)}/{len(current_segments)}")
+                    # 【流式输出】立即推送单个segment的转录结果
+                    if seg_result:
+                        self._push_sse_segment(job, seg_result, len(processed_indices), len(current_segments))
 
-            self._update_progress(job, 'transcribe', 1, '转录完成')
+                    # 【关键埋点2】每处理一段保存一次（保存未对齐结果）
+                    checkpoint_data = {
+                        "job_id": job.job_id,
+                        "phase": "transcribe",
+                        "processing_mode": processing_mode.value,  # 保存模式信息
+                        "total_segments": len(current_segments),
+                        "processed_indices": list(processed_indices),  # set转list
+                        "segments": current_segments,
+                        "unaligned_results": unaligned_results  # 保存未对齐结果
+                    }
+                    self._save_checkpoint(job_dir, checkpoint_data, job)
+                    self.logger.debug(f"检查点已保存: {len(processed_indices)}/{len(current_segments)}")
+
+                self._update_progress(job, 'transcribe', 1, '转录完成')
+
+            except BreakToGlobalSeparation as e:
+                # 熔断触发：升级模型并执行全局人声分离
+                self.logger.warning(f"熔断触发: {e}")
+
+                # 推送 SSE 事件
+                self._push_sse_circuit_breaker_triggered(job, circuit_breaker)
+
+                # 【新增】检查是否允许模型升级
+                if separation_strategy and separation_strategy.allow_escalation:
+                    # 升级到 fallback 模型
+                    fallback = separation_strategy.fallback_model
+                    if fallback:
+                        self.logger.info(f"模型升级: {separation_strategy.initial_model} → {fallback}")
+                        from services.demucs_service import get_demucs_service
+                        demucs_service = get_demucs_service()
+                        demucs_service.set_model(fallback)
+
+                        # 推送模型升级事件
+                        self._push_sse_model_escalated(
+                            job,
+                            separation_strategy.initial_model,
+                            fallback,
+                            "熔断触发，升级到兜底模型",
+                            circuit_breaker
+                        )
+
+                # 执行全局人声分离（使用升级后的模型）
+                self.logger.info("开始执行全局人声分离（熔断升级）...")
+                vocals_path = self._separate_vocals_global(str(audio_path), job)
+
+                # 更新 active_audio_path
+                active_audio_path = Path(vocals_path)
+
+                # 重新加载分离后的音频
+                if processing_mode == ProcessingMode.MEMORY:
+                    self.logger.info("重新加载分离后的音频到内存...")
+                    audio_array = self._safe_load_audio(str(active_audio_path), job)
+
+                # 重置状态，继续处理剩余段落
+                self.logger.info("继续处理剩余段落（使用分离后的音频）...")
+
+                # 禁用熔断器（避免二次触发）
+                circuit_breaker = None
+
+                # 继续转录剩余段落
+                for idx, seg in enumerate(current_segments):
+                    if idx in processed_indices:
+                        continue
+
+                    if job.canceled:
+                        raise RuntimeError('任务已取消')
+
+                    if job.paused:
+                        raise RuntimeError('任务已暂停')
+
+                    # 确保segment有index字段
+                    if 'index' not in seg:
+                        seg['index'] = idx
+
+                    # 使用分离后的音频转录
+                    seg_result = self._transcribe_segment(
+                        seg,
+                        model,
+                        job,
+                        audio_array=audio_array
+                    )
+
+                    if seg_result:
+                        unaligned_results.append(seg_result)
+                    processed_indices.add(idx)
+                    job.processed = len(processed_indices)
+
+                    progress = len(processed_indices) / len(current_segments)
+                    self._update_progress(
+                        job,
+                        'transcribe',
+                        progress,
+                        f'转录中（已升级） {len(processed_indices)}/{len(current_segments)}'
+                    )
+
+                    if seg_result:
+                        self._push_sse_segment(job, seg_result, len(processed_indices), len(current_segments))
+
+                    # 保存checkpoint
+                    checkpoint_data = {
+                        "job_id": job.job_id,
+                        "phase": "transcribe",
+                        "processing_mode": processing_mode.value,
+                        "total_segments": len(current_segments),
+                        "processed_indices": list(processed_indices),
+                        "segments": current_segments,
+                        "unaligned_results": unaligned_results
+                    }
+                    self._save_checkpoint(job_dir, checkpoint_data, job)
+
+                self._update_progress(job, 'transcribe', 1, '转录完成（熔断后）')
+
             if job.canceled:
                 raise RuntimeError('任务已取消')
 
@@ -1453,8 +1959,13 @@ class TranscriptionService:
         available_mb = mem_info.available / (1024 * 1024)
         total_mb = mem_info.total / (1024 * 1024)
 
-        # 安全阈值：至少保留系统总内存的20%或2GB（取较大值）
-        safety_reserve_mb = max(total_mb * 0.2, 2048)
+        # 安全阈值：动态计算，综合考虑多种因素
+        # 1. 基础保留：2GB（保证系统基本运行）
+        # 2. 动态保留：可用内存的10%（而非总内存的20%，避免过度保守）
+        # 3. 最大保留上限：4GB（避免在大内存系统上过度保留）
+        base_reserve_mb = 2048
+        dynamic_reserve_mb = available_mb * 0.1
+        safety_reserve_mb = min(base_reserve_mb + dynamic_reserve_mb, 4096)
         usable_mb = available_mb - safety_reserve_mb
 
         self.logger.info(f"内存评估:")
@@ -1831,6 +2342,486 @@ class TranscriptionService:
         self.logger.info(f"能量检测分段完成: {len(segments_metadata)}段")
         return segments_metadata
 
+    # ==========================================
+    # Demucs 人声分离相关方法
+    # ==========================================
+
+    def _detect_bgm(self, audio_path: str, job: JobState):
+        """
+        执行BGM检测，更新进度
+
+        Args:
+            audio_path: 音频文件路径
+            job: 任务状态对象
+
+        Returns:
+            Tuple[BGMLevel, List[float]]: (BGM强度级别, 各采样点的BGM比例列表)
+        """
+        from services.demucs_service import get_demucs_service, BGMLevel
+
+        self._update_progress(job, 'bgm_detect', 0, 'BGM检测中...')
+
+        try:
+            demucs = get_demucs_service()
+
+            # 执行BGM检测
+            level, ratios = demucs.detect_background_music_level(audio_path)
+
+            self._update_progress(job, 'bgm_detect', 1, f'BGM检测完成: {level.value}')
+
+            # 推送SSE事件
+            self._push_sse_bgm_detected(job, level, ratios)
+
+            self.logger.info(
+                f"BGM检测结果: {level.value}, "
+                f"比例={ratios}, 最大={max(ratios) if ratios else 0:.2f}"
+            )
+
+            return level, ratios
+
+        except Exception as e:
+            self.logger.warning(f"BGM检测失败，将跳过Demucs: {e}")
+            # 失败时返回 NONE 级别，不影响主流程
+            from services.demucs_service import BGMLevel
+            return BGMLevel.NONE, []
+
+    def _separate_vocals_global(self, audio_path: str, job: JobState) -> str:
+        """
+        执行全局人声分离，更新进度
+
+        Args:
+            audio_path: 原始音频路径
+            job: 任务状态对象
+
+        Returns:
+            str: 分离后的人声文件路径
+        """
+        from services.demucs_service import get_demucs_service
+
+        self._update_progress(job, 'demucs_global', 0, '人声分离中...')
+
+        try:
+            demucs = get_demucs_service()
+
+            def progress_callback(progress: float, message: str):
+                """进度回调"""
+                self._update_progress(job, 'demucs_global', progress, message)
+
+            # 执行人声分离
+            vocals_path = demucs.separate_vocals(
+                audio_path,
+                progress_callback=progress_callback
+            )
+
+            self._update_progress(job, 'demucs_global', 1, '人声分离完成')
+            self.logger.info(f"全局人声分离完成: {vocals_path}")
+
+            return vocals_path
+
+        except Exception as e:
+            self.logger.error(f"人声分离失败: {e}")
+            # 分离失败时返回原始音频路径（降级处理）
+            self.logger.warning("人声分离失败，将使用原始音频继续处理")
+            return audio_path
+
+    def _push_sse_bgm_detected(self, job: JobState, level, ratios):
+        """
+        推送BGM检测结果事件
+
+        Args:
+            job: 任务状态对象
+            level: BGM强度级别
+            ratios: 各采样点的BGM比例列表
+        """
+        try:
+            from services.sse_service import get_sse_manager
+
+            sse_manager = get_sse_manager()
+            channel_id = f"job:{job.job_id}"
+
+            # 将numpy类型转换为Python原生类型，避免JSON序列化错误
+            native_ratios = [float(r) for r in ratios] if ratios else []
+            max_ratio = float(max(ratios)) if ratios else 0.0
+
+            # 构造事件数据
+            event_data = {
+                "level": level.value,
+                "ratios": native_ratios,
+                "max_ratio": max_ratio,
+                "recommendation": self._get_demucs_recommendation(level)
+            }
+
+            # 广播事件
+            sse_manager.broadcast_sync(channel_id, "bgm_detected", event_data)
+
+        except Exception as e:
+            # SSE推送失败不应影响主流程
+            self.logger.debug(f"SSE推送失败（非致命）: {e}")
+
+    def _push_sse_separation_strategy(self, job: JobState, strategy):
+        """
+        推送分离策略决策事件
+
+        Args:
+            job: 任务状态对象
+            strategy: SeparationStrategy 对象
+        """
+        try:
+            from services.sse_service import get_sse_manager
+
+            sse_manager = get_sse_manager()
+            channel_id = f"job:{job.job_id}"
+
+            # 使用 strategy.to_dict() 获取事件数据
+            event_data = strategy.to_dict()
+
+            # 广播事件
+            sse_manager.broadcast_sync(channel_id, "separation_strategy", event_data)
+
+            self.logger.debug(f"分离策略事件已推送: {strategy.reason}")
+
+        except Exception as e:
+            # SSE推送失败不应影响主流程
+            self.logger.debug(f"SSE推送失败（非致命）: {e}")
+
+    def _push_sse_model_escalated(
+        self,
+        job: JobState,
+        from_model: str,
+        to_model: str,
+        reason: str,
+        breaker_state: CircuitBreakerState
+    ):
+        """
+        推送模型升级事件
+
+        Args:
+            job: 任务状态对象
+            from_model: 原模型名称
+            to_model: 新模型名称
+            reason: 升级原因
+            breaker_state: 熔断器状态
+        """
+        try:
+            from services.sse_service import get_sse_manager
+
+            sse_manager = get_sse_manager()
+            channel_id = f"job:{job.job_id}"
+
+            # 构造事件数据
+            event_data = {
+                "from_model": from_model,
+                "to_model": to_model,
+                "reason": reason,
+                "escalation_count": breaker_state.escalation_count,
+                "max_escalations": job.settings.demucs.max_escalations,
+                "stats": breaker_state.get_stats()
+            }
+
+            # 广播事件
+            sse_manager.broadcast_sync(channel_id, "model_escalated", event_data)
+
+            self.logger.info(f"模型升级事件已推送: {from_model} -> {to_model}")
+
+        except Exception as e:
+            # SSE推送失败不应影响主流程
+            self.logger.debug(f"SSE推送失败（非致命）: {e}")
+
+    def _push_sse_circuit_breaker_triggered(
+        self,
+        job: JobState,
+        circuit_breaker: Optional[CircuitBreakerState]
+    ):
+        """
+        推送熔断触发事件（Phase 4: 扩展包含升级信息）
+
+        Args:
+            job: 任务状态对象
+            circuit_breaker: 熔断器状态对象
+        """
+        try:
+            from services.sse_service import get_sse_manager
+
+            sse_manager = get_sse_manager()
+            channel_id = f"job:{job.job_id}"
+
+            # 构造事件数据（扩展包含升级历史）
+            stats = circuit_breaker.get_stats() if circuit_breaker else {}
+            event_data = {
+                "triggered": True,
+                "reason": self._get_circuit_break_reason(circuit_breaker),
+                "stats": stats,
+                "action": "升级为全局人声分离模式"
+            }
+
+            # 广播事件
+            sse_manager.broadcast_sync(channel_id, "circuit_breaker_triggered", event_data)
+
+            self.logger.info("熔断事件已推送到前端")
+
+        except Exception as e:
+            # SSE推送失败不应影响主流程
+            self.logger.debug(f"SSE推送失败（非致命）: {e}")
+
+    def _get_circuit_break_reason(self, circuit_breaker: Optional[CircuitBreakerState]) -> str:
+        """
+        生成熔断原因描述
+
+        Args:
+            circuit_breaker: 熔断器状态
+
+        Returns:
+            熔断原因描述字符串
+        """
+        if not circuit_breaker:
+            return "转录质量低，触发熔断升级"
+
+        stats = circuit_breaker.get_stats()
+
+        # 如果有升级历史，说明已经尝试过升级
+        if circuit_breaker.escalation_count > 0:
+            return (
+                f"已升级 {circuit_breaker.escalation_count} 次模型仍未改善，触发熔断。"
+                f"升级历史: {', '.join(circuit_breaker.escalation_history)}"
+            )
+        else:
+            return (
+                f"连续 {stats['consecutive_retries']} 个段落重试失败，"
+                f"总重试率 {stats['retry_ratio']:.1%}，触发熔断"
+            )
+
+    def _get_demucs_recommendation(self, level) -> str:
+        """
+        根据BGM级别返回建议的处理模式
+
+        Args:
+            level: BGM强度级别
+
+        Returns:
+            str: 建议的处理模式描述
+        """
+        from services.demucs_service import BGMLevel
+
+        if level == BGMLevel.HEAVY:
+            return "全局分离"
+        elif level == BGMLevel.LIGHT:
+            return "按需分离"
+        else:
+            return "无需分离"
+
+    # ==========================================
+    # 按需分离与熔断机制相关方法
+    # ==========================================
+
+    def _check_transcription_confidence(
+        self,
+        result: Dict,
+        logprob_threshold: float,
+        no_speech_threshold: float
+    ) -> bool:
+        """
+        检查转录结果的置信度
+
+        Args:
+            result: 转录结果字典
+            logprob_threshold: logprob阈值（低于此值需要重试）
+            no_speech_threshold: no_speech_prob阈值（高于此值需要重试）
+
+        Returns:
+            bool: True表示置信度低，需要重试
+        """
+        segments = result.get('segments', [])
+
+        if not segments:
+            return True  # 没有识别出内容，需要重试
+
+        # 计算平均置信度
+        total_logprob = 0
+        total_no_speech = 0
+        count = 0
+
+        for seg in segments:
+            if 'avg_logprob' in seg:
+                total_logprob += seg['avg_logprob']
+                count += 1
+            if 'no_speech_prob' in seg:
+                total_no_speech += seg['no_speech_prob']
+
+        if count == 0:
+            return False  # 没有置信度信息，不重试
+
+        avg_logprob = total_logprob / count
+        avg_no_speech = total_no_speech / count if count > 0 else 0
+
+        # 判断是否需要重试
+        if avg_logprob < logprob_threshold:
+            self.logger.debug(f"avg_logprob={avg_logprob:.2f} < {logprob_threshold}, 需要重试")
+            return True
+
+        if avg_no_speech > no_speech_threshold:
+            self.logger.debug(f"no_speech_prob={avg_no_speech:.2f} > {no_speech_threshold}, 需要重试")
+            return True
+
+        return False
+
+    def _is_better_result(self, new_result: Dict, old_result: Dict) -> bool:
+        """
+        比较两个转录结果，判断新结果是否更好
+
+        Args:
+            new_result: 新的转录结果
+            old_result: 旧的转录结果
+
+        Returns:
+            bool: True表示新结果更好
+        """
+        new_segments = new_result.get('segments', [])
+        old_segments = old_result.get('segments', [])
+
+        # 如果新结果没有内容，旧的更好
+        if not new_segments:
+            return False
+
+        # 如果旧结果没有内容，新的更好
+        if not old_segments:
+            return True
+
+        # 比较平均logprob
+        def get_avg_logprob(segments):
+            logprobs = [s.get('avg_logprob', -1) for s in segments if 'avg_logprob' in s]
+            return np.mean(logprobs) if logprobs else -1
+
+        new_logprob = get_avg_logprob(new_segments)
+        old_logprob = get_avg_logprob(old_segments)
+
+        # 新结果的logprob更高（更接近0）则更好
+        return new_logprob > old_logprob
+
+    def _transcribe_segment_with_retry(
+        self,
+        seg_meta: Dict,
+        model,
+        job: JobState,
+        audio_array: Optional[np.ndarray] = None,
+        circuit_breaker: Optional[CircuitBreakerState] = None
+    ) -> Optional[Dict]:
+        """
+        带重试的转录方法（支持Demucs人声分离重试 + 动态熔断）
+
+        流程：
+        1. 首次转录（使用原始音频）
+        2. 检查置信度
+        3. 如果置信度低，使用Demucs分离人声后重试
+        4. 更新熔断器状态
+        5. 检查是否触发熔断
+        6. 返回置信度更高的结果
+
+        Args:
+            seg_meta: 段落元数据
+            model: Whisper模型
+            job: 任务状态对象
+            audio_array: 完整音频数组（内存模式）
+            circuit_breaker: 熔断器状态对象
+
+        Returns:
+            Optional[Dict]: 转录结果
+
+        Raises:
+            BreakToGlobalSeparation: 当触发熔断条件时抛出
+        """
+        demucs_settings = job.settings.demucs
+
+        # 首次转录
+        result = self._transcribe_segment(seg_meta, model, job, audio_array)
+
+        if not result or not demucs_settings.enabled:
+            if circuit_breaker:
+                circuit_breaker.record_success()
+            return result
+
+        # 检查是否需要重试
+        needs_retry = self._check_transcription_confidence(
+            result,
+            demucs_settings.retry_threshold_logprob,
+            demucs_settings.retry_threshold_no_speech
+        )
+
+        if not needs_retry:
+            # 不需要重试，记录成功
+            if circuit_breaker:
+                circuit_breaker.record_success()
+            return result
+
+        # ========== 需要重试的逻辑 ==========
+        self.logger.info(f"段落 {seg_meta['index']} 置信度低，尝试人声分离重试")
+
+        # 更新熔断器状态
+        if circuit_breaker:
+            circuit_breaker.record_retry()
+
+            # 检查是否触发熔断
+            if circuit_breaker.should_break(demucs_settings):
+                stats = circuit_breaker.get_stats()
+                self.logger.warning(
+                    f"触发熔断！连续重试={stats['consecutive_retries']}, "
+                    f"总重试比例={stats['retry_ratio']:.1%}"
+                )
+                raise BreakToGlobalSeparation(
+                    f"连续{stats['consecutive_retries']}段需要Demucs重试，"
+                    f"建议升级为全局人声分离模式"
+                )
+
+        # 尝试按需分离
+        try:
+            from services.demucs_service import get_demucs_service
+            demucs = get_demucs_service()
+
+            start_sec = seg_meta['start']
+            end_sec = seg_meta['end']
+
+            if audio_array is not None:
+                # 内存模式：分离人声
+                vocals = demucs.separate_vocals_segment(
+                    audio_array, sr=16000,
+                    start_sec=start_sec, end_sec=end_sec
+                )
+
+                # 构造临时seg_meta
+                retry_seg = seg_meta.copy()
+                retry_seg['start'] = 0  # 因为vocals已经是切片
+                retry_seg['end'] = len(vocals) / 16000
+
+                # 重新转录
+                retry_result = self._transcribe_segment_in_memory(
+                    vocals,
+                    retry_seg,
+                    model,
+                    job,
+                    is_vocals=True  # 标记是人声
+                )
+            else:
+                # 硬盘模式：暂不支持
+                self.logger.warning("硬盘模式暂不支持Demucs重试")
+                return result
+
+            if retry_result:
+                # 校正时间偏移（恢复到原始时间轴）
+                original_start = seg_meta['start']
+                for seg in retry_result.get('segments', []):
+                    seg['start'] += original_start
+                    seg['end'] += original_start
+
+                # 比较两次结果，返回更好的
+                if self._is_better_result(retry_result, result):
+                    self.logger.info(f"段落 {seg_meta['index']} 重试成功，使用分离后的结果")
+                    retry_result['used_demucs'] = True
+                    return retry_result
+
+        except Exception as e:
+            self.logger.warning(f"Demucs重试失败: {e}")
+
+        return result
+
     def _extract_audio(self, input_file: str, audio_out: str) -> bool:
         """
         使用FFmpeg提取音频
@@ -1919,7 +2910,7 @@ class TranscriptionService:
 
             # 智能寻找静音点（避免在句子中间分割）
             if end < length and (end - pos) > SILENCE_SEARCH_MS:
-                search_start = max(pos, endSILENCE_SEARCH_MS)
+                search_start = max(pos, end - SILENCE_SEARCH_MS)
                 search_chunk = audio[search_start:end]
 
                 try:
@@ -2350,7 +3341,8 @@ class TranscriptionService:
         audio_array: np.ndarray,
         seg_meta: Dict,
         model,
-        job: JobState
+        job: JobState,
+        is_vocals: bool = False
     ) -> Optional[Dict]:
         """
         从内存切片转录（Zero-copy，高性能）
@@ -2362,6 +3354,7 @@ class TranscriptionService:
             seg_meta: 分段元数据 {"index": 0, "start": 0.0, "end": 30.5, "mode": "memory"}
             model: Whisper模型
             job: 任务状态
+            is_vocals: 是否是Demucs分离后的人声（用于日志）
 
         Returns:
             Dict: 未对齐的转录结果
@@ -2738,15 +3731,44 @@ class TranscriptionService:
                         audio_array,
                         job.settings.device
                     )
-                    aligned_segments.extend(aligned_batch.get('segments', []))
-                    self.logger.debug(f"batch {batch_idx + 1}/{total_batches} completed")
+                    
+                    # 【新增】对齐结果边界校验，过滤异常结果
+                    valid_segments = []
+                    for seg in aligned_batch.get('segments', []):
+                        start = seg.get('start', 0)
+                        end = seg.get('end', 0)
+                        text = seg.get('text', '').strip()
+                        
+                        # 校验1：时间戳必须有效
+                        if start is None or end is None or start < 0 or end <= start:
+                            self.logger.warning(f"过滤无效时间戳: start={start}, end={end}, text={text[:20]}...")
+                            continue
+                        
+                        # 校验2：字幕时长不能过长（超过30秒可能是对齐错误）
+                        duration = end - start
+                        if duration > 30:
+                            self.logger.warning(f"过滤过长字幕({duration:.1f}s): {text[:30]}...")
+                            continue
+                        
+                        # 校验3：字幕时长不能过短（小于0.1秒可能是噪音）
+                        if duration < 0.1 and len(text) > 0:
+                            self.logger.warning(f"过滤过短字幕({duration:.2f}s): {text}")
+                            continue
+                        
+                        valid_segments.append(seg)
+                    
+                    aligned_segments.extend(valid_segments)
+                    self.logger.debug(f"batch {batch_idx + 1}/{total_batches} completed, {len(valid_segments)}/{len(aligned_batch.get('segments', []))} valid")
 
                 except Exception as e:
                     self.logger.error(f"batch {batch_idx + 1} alignment failed: {e}")
                     # 继续处理其他批次，不中断整体流程
                     continue
 
-            # 5. 完成
+            # 5. 【新增】字幕时间微调 - 修正"抢先出现"问题
+            aligned_segments = self._adjust_subtitle_timing(aligned_segments)
+
+            # 6. 完成
             self._update_progress(job, 'align', 1, 'alignment complete')
             self._push_sse_align_progress(job, total_batches, total_batches, total_segments, total_segments)
 
@@ -2762,6 +3784,73 @@ class TranscriptionService:
             if processing_mode == ProcessingMode.DISK:
                 del audio_array
                 gc.collect()
+
+    def _adjust_subtitle_timing(
+        self,
+        segments: List[Dict],
+        start_delay_ms: int = 25,
+        end_padding_ms: int = 25
+    ) -> List[Dict]:
+        """
+        字幕时间微调 - 修正对齐偏差
+
+        问题背景：
+        WhisperX对齐后的字幕常常"抢先出现"（开始时间过早），
+        这是因为VAD和对齐算法倾向于保守估计（宁早勿迟）。
+
+        解决方案：
+        1. 将字幕开始时间延后 start_delay_ms（默认25ms）
+        2. 将字幕结束时间延后 end_padding_ms（默认25ms，给一点余量）
+        3. 确保相邻字幕不重叠
+
+        Args:
+            segments: 对齐后的字幕列表
+            start_delay_ms: 开始时间延迟（毫秒），推荐20-50ms
+            end_padding_ms: 结束时间延长（毫秒），推荐20-50ms
+
+        Returns:
+            调整后的字幕列表
+        """
+        if not segments:
+            return segments
+
+        start_delay = start_delay_ms / 1000.0
+        end_padding = end_padding_ms / 1000.0
+
+        adjusted = []
+        for i, seg in enumerate(segments):
+            new_seg = seg.copy()
+            old_start = seg.get('start', 0)
+            old_end = seg.get('end', 0)
+
+            # 延迟开始时间
+            new_start = old_start + start_delay
+
+            # 延长结束时间
+            new_end = old_end + end_padding
+
+            # 确保开始时间不超过结束时间
+            if new_start >= new_end:
+                new_start = old_start  # 回退到原始开始时间
+
+            # 确保不与下一条字幕重叠
+            if i < len(segments) - 1:
+                next_start = segments[i + 1].get('start', float('inf'))
+                # 下一条也会被延迟，所以比较时要考虑
+                next_adjusted_start = next_start + start_delay
+                if new_end > next_adjusted_start:
+                    new_end = next_adjusted_start - 0.05  # 留50ms间隔
+
+            # 确保结束时间仍然有效
+            if new_end <= new_start:
+                new_end = old_end  # 回退到原始结束时间
+
+            new_seg['start'] = round(new_start, 3)
+            new_seg['end'] = round(new_end, 3)
+            adjusted.append(new_seg)
+
+        self.logger.info(f"字幕时间微调: 延迟开始25ms, 延长结束25ms")
+        return adjusted
 
     def _format_ts(self, sec: float) -> str:
         """

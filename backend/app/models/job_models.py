@@ -11,6 +11,42 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class DemucsSettings:
+    """Demucs人声分离配置（用户可配置）"""
+    # === 基础开关 ===
+    enabled: bool = True                        # 是否启用Demucs
+    mode: str = "auto"                          # 模式: auto/always/never/on_demand
+
+    # === 分级模型配置 ===
+    weak_model: str = "htdemucs"                # 弱BGM使用的模型（速度优先）
+    strong_model: str = "htdemucs"              # 强BGM使用的模型（质量优先）
+    fallback_model: str = "htdemucs"            # 兜底模型（熔断升级后使用）
+    auto_escalation: bool = True                # 是否允许自动升级模型
+    max_escalations: int = 1                    # 最大升级次数
+
+    # === BGM检测阈值 ===
+    bgm_light_threshold: float = 0.02           # 轻微BGM阈值
+    bgm_heavy_threshold: float = 0.15           # 强BGM阈值
+
+    # === 质量评估阈值 ===
+    retry_threshold_logprob: float = -0.8       # 重试阈值（avg_logprob）
+    retry_threshold_no_speech: float = 0.6      # 重试阈值（no_speech_prob）
+
+    # === 熔断配置 ===
+    circuit_breaker_enabled: bool = True        # 是否启用熔断机制
+    consecutive_threshold: int = 3              # 连续重试触发熔断的阈值
+    ratio_threshold: float = 0.2                # 总重试比例触发熔断的阈值（20%）
+
+    # === 熔断处理策略 ===
+    on_break: str = "continue"                  # 熔断后处理策略: continue/fallback/fail/pause
+    mark_problem_segments: bool = True          # 是否在结果中标记问题段落
+    problem_segment_suffix: str = "[?]"         # 问题段落的标记后缀
+
+    # === 质量预设（简化配置入口） ===
+    quality_preset: str = "balanced"            # 质量预设: fast/balanced/quality
+
+
+@dataclass
 class JobSettings:
     """转录任务设置"""
     model: str = "medium"
@@ -19,6 +55,7 @@ class JobSettings:
     batch_size: int = 16
     word_timestamps: bool = False
     cpu_affinity: Optional["CPUAffinityConfig"] = None  # 使用字符串形式的类型注解
+    demucs: DemucsSettings = field(default_factory=DemucsSettings)  # Demucs配置
 
 
 @dataclass
@@ -96,6 +133,32 @@ class JobState:
                 "device": self.settings.device,
                 "batch_size": self.settings.batch_size,
                 "word_timestamps": self.settings.word_timestamps,
+                "demucs": {
+                    "enabled": self.settings.demucs.enabled,
+                    "mode": self.settings.demucs.mode,
+                    # 分级模型配置
+                    "weak_model": self.settings.demucs.weak_model,
+                    "strong_model": self.settings.demucs.strong_model,
+                    "fallback_model": self.settings.demucs.fallback_model,
+                    "auto_escalation": self.settings.demucs.auto_escalation,
+                    "max_escalations": self.settings.demucs.max_escalations,
+                    # BGM检测阈值
+                    "bgm_light_threshold": self.settings.demucs.bgm_light_threshold,
+                    "bgm_heavy_threshold": self.settings.demucs.bgm_heavy_threshold,
+                    # 质量评估阈值
+                    "retry_threshold_logprob": self.settings.demucs.retry_threshold_logprob,
+                    "retry_threshold_no_speech": self.settings.demucs.retry_threshold_no_speech,
+                    # 熔断配置
+                    "circuit_breaker_enabled": self.settings.demucs.circuit_breaker_enabled,
+                    "consecutive_threshold": self.settings.demucs.consecutive_threshold,
+                    "ratio_threshold": self.settings.demucs.ratio_threshold,
+                    # 熔断处理策略
+                    "on_break": self.settings.demucs.on_break,
+                    "mark_problem_segments": self.settings.demucs.mark_problem_segments,
+                    "problem_segment_suffix": self.settings.demucs.problem_segment_suffix,
+                    # 质量预设
+                    "quality_preset": self.settings.demucs.quality_preset,
+                }
             },
             "updated_at": time.time()
         }
@@ -112,12 +175,44 @@ class JobState:
             JobState: 恢复的任务状态对象
         """
         settings_data = data.get("settings", {})
+
+        # 处理 Demucs 配置（向后兼容：如果没有则使用默认值）
+        demucs_data = settings_data.get("demucs", {})
+        demucs_settings = DemucsSettings(
+            # 基础配置
+            enabled=demucs_data.get("enabled", True),
+            mode=demucs_data.get("mode", "auto"),
+            # 分级模型配置
+            weak_model=demucs_data.get("weak_model", "htdemucs"),
+            strong_model=demucs_data.get("strong_model", "htdemucs"),
+            fallback_model=demucs_data.get("fallback_model", "htdemucs"),
+            auto_escalation=demucs_data.get("auto_escalation", True),
+            max_escalations=demucs_data.get("max_escalations", 1),
+            # BGM检测阈值
+            bgm_light_threshold=demucs_data.get("bgm_light_threshold", 0.02),
+            bgm_heavy_threshold=demucs_data.get("bgm_heavy_threshold", 0.15),
+            # 质量评估阈值
+            retry_threshold_logprob=demucs_data.get("retry_threshold_logprob", -0.8),
+            retry_threshold_no_speech=demucs_data.get("retry_threshold_no_speech", 0.6),
+            # 熔断配置
+            circuit_breaker_enabled=demucs_data.get("circuit_breaker_enabled", True),
+            consecutive_threshold=demucs_data.get("consecutive_threshold", 3),
+            ratio_threshold=demucs_data.get("ratio_threshold", 0.2),
+            # 熔断处理策略
+            on_break=demucs_data.get("on_break", "continue"),
+            mark_problem_segments=demucs_data.get("mark_problem_segments", True),
+            problem_segment_suffix=demucs_data.get("problem_segment_suffix", "[?]"),
+            # 质量预设
+            quality_preset=demucs_data.get("quality_preset", "balanced"),
+        )
+
         settings = JobSettings(
             model=settings_data.get("model", "medium"),
             compute_type=settings_data.get("compute_type", "float16"),
             device=settings_data.get("device", "cuda"),
             batch_size=settings_data.get("batch_size", 16),
             word_timestamps=settings_data.get("word_timestamps", False),
+            demucs=demucs_settings,
         )
 
         return cls(

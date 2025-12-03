@@ -78,18 +78,25 @@ class ProjectConfig:
         self.MIN_SILENCE_LEN_MS = 300        # 300毫秒
         self.SILENCE_THRESHOLD_DBFS = -40    # -40dB
 
+        # ========== Demucs配置 ==========
+        self.DEMUCS_ENABLED = True           # 全局开关
+        self.DEMUCS_MODEL = "htdemucs"       # 模型名称
+        self.DEMUCS_DEVICE = "cuda"          # 默认设备
+
         # ========== 进度权重配置 ==========
         # 核心流程权重（转录+对齐 = 100%）
         self.PHASE_WEIGHTS = {
-            "pending": 0,      # 等待开始
-            "extract": 5,      # 音频提取占5%
-            "split": 5,        # 音频分段占5%
-            "transcribe": 60,  # 转录处理占60%（降低，因对齐权重增加）
-            "align": 20,       # 对齐处理占20%（增加，因为是批次对齐）
-            "translate": 0,    # 翻译（预留，当前不启用）
-            "proofread": 0,    # 校对（预留，当前不启用）
-            "srt": 10,         # SRT生成占10%
-            "complete": 0      # 完成
+            "pending": 0,        # 等待开始
+            "extract": 5,        # 音频提取占5%
+            "bgm_detect": 2,     # BGM检测占2%
+            "demucs_global": 8,  # 全局人声分离占8%
+            "split": 5,          # 音频分段占5%
+            "transcribe": 50,    # 转录处理占50%（从60%降低，为Demucs让出空间）
+            "align": 20,         # 对齐处理占20%（增加，因为是批次对齐）
+            "translate": 0,      # 翻译（预留，当前不启用）
+            "proofread": 0,      # 校对（预留，当前不启用）
+            "srt": 10,           # SRT生成占10%
+            "complete": 0        # 完成
         }
         self.TOTAL_WEIGHT = sum(self.PHASE_WEIGHTS.values())  # 计算总和，保证为100
 

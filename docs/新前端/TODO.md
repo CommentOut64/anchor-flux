@@ -51,6 +51,12 @@
 
 - [ ] 导出菜单
 - [ ] 幽灵任务，队列完成后出现
+
+[media] FFprobe 成功获取时长: 60.000000秒
+[media] 动态采样：时长60.0s → 4000个采样点
+
+16:48:34.973 [ERROR] [transcription_service] 删除任务数据失败: [WinError 32] 另一个程序正在使用此文件，进程无法访问。: 'F:\\video_to_srt_gpu\\jobs\\83e074e836ef4681894f6d1798d8e002\\test_video.mp4'
+
 - [ ] 快捷键
 - [ ] 后端写入日志
 
