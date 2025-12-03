@@ -18,9 +18,9 @@ class DemucsSettings:
     mode: str = "auto"                          # 模式: auto/always/never/on_demand
 
     # === 分级模型配置 ===
-    weak_model: str = "htdemucs_ft"             # 弱BGM使用的模型（速度优先）
-    strong_model: str = "mdx_extra_q"           # 强BGM使用的模型（质量优先）
-    fallback_model: str = "mdx_extra"           # 兜底模型（熔断升级后使用）
+    weak_model: str = "htdemucs"                # 弱BGM使用的模型（速度优先）
+    strong_model: str = "htdemucs"              # 强BGM使用的模型（质量优先）
+    fallback_model: str = "htdemucs"            # 兜底模型（熔断升级后使用）
     auto_escalation: bool = True                # 是否允许自动升级模型
     max_escalations: int = 1                    # 最大升级次数
 
@@ -183,9 +183,9 @@ class JobState:
             enabled=demucs_data.get("enabled", True),
             mode=demucs_data.get("mode", "auto"),
             # 分级模型配置
-            weak_model=demucs_data.get("weak_model", "htdemucs_ft"),
-            strong_model=demucs_data.get("strong_model", "mdx_extra_q"),
-            fallback_model=demucs_data.get("fallback_model", "mdx_extra"),
+            weak_model=demucs_data.get("weak_model", "htdemucs"),
+            strong_model=demucs_data.get("strong_model", "htdemucs"),
+            fallback_model=demucs_data.get("fallback_model", "htdemucs"),
             auto_escalation=demucs_data.get("auto_escalation", True),
             max_escalations=demucs_data.get("max_escalations", 1),
             # BGM检测阈值

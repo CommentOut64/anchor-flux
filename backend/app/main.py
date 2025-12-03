@@ -38,6 +38,7 @@ from config.model_config import ModelPreloadConfig
 from api.routes import model_routes
 from api.routes import media_routes  # 新增：媒体资源路由
 from api.routes.transcription_routes import create_transcription_router
+from api.routes.demucs_routes import create_demucs_router  # 新增：Demucs配置路由
 from services.file_service import FileManagementService
 
 # 导入FFmpeg管理器
@@ -59,6 +60,10 @@ app.add_middleware(
 # 注册API路由
 app.include_router(model_routes.router)
 app.include_router(media_routes.router)  # 新增：媒体资源路由
+
+# 注册Demucs配置路由（需要在转录路由之前注册）
+demucs_router = create_demucs_router()
+app.include_router(demucs_router)
 
 @app.on_event("startup")
 async def startup_event():

@@ -1,0 +1,60 @@
+{
+  "version": "1.1",
+  "description": "Demucs分级模型配置 - 统一使用htdemucs",
+
+  "presets": {
+    "fast": {
+      "description": "速度优先，使用htdemucs统一模型",
+      "weak_model": "htdemucs",
+      "strong_model": "htdemucs",
+      "fallback_model": "htdemucs"
+    },
+    "balanced": {
+      "description": "平衡模式（默认推荐）",
+      "weak_model": "htdemucs",
+      "strong_model": "htdemucs",
+      "fallback_model": "htdemucs"
+    },
+    "quality": {
+      "description": "质量优先，使用htdemucs统一模型",
+      "weak_model": "htdemucs",
+      "strong_model": "htdemucs",
+      "fallback_model": "htdemucs"
+    }
+  },
+
+  "models": {
+    "htdemucs": {
+      "description": "Hybrid Transformer（默认，推荐）",
+      "size_mb": 80,
+      "quality_score": 5,
+      "speed_score": 5
+    },
+    "htdemucs_ft": {
+      "description": "Fine-tuned版本（需4文件，已弃用）",
+      "size_mb": 320,
+      "quality_score": 4,
+      "speed_score": 4
+    },
+    "mdx_extra_q": {
+      "description": "MDX-Net量化版（已弃用）",
+      "size_mb": 25,
+      "quality_score": 4,
+      "speed_score": 4
+    },
+    "mdx_extra": {
+      "description": "MDX-Net完整版（已弃用）",
+      "size_mb": 600,
+      "quality_score": 5,
+      "speed_score": 2
+    }
+  },
+
+  "defaults": {
+    "bgm_light_threshold": 0.02,
+    "bgm_heavy_threshold": 0.15,
+    "consecutive_threshold": 3,
+    "ratio_threshold": 0.2,
+    "max_escalations": 1
+  }
+}

@@ -36,8 +36,8 @@ class DemucsModel(Enum):
 @dataclass
 class DemucsConfig:
     """Demucs配置"""
-    # 模型选择 - 默认使用mdx_extra（高质量人声分离）
-    model_name: str = "mdx_extra"
+    # 模型选择 - 默认使用htdemucs（快速，只需1个文件）
+    model_name: str = "htdemucs"
     device: str = "cuda"                   # 设备 (cuda/cpu)
     shifts: int = 2                        # 增强次数（1=快速，2=平衡，5=最高质量）
     overlap: float = 0.5                   # 分段重叠率
@@ -53,9 +53,9 @@ class DemucsConfig:
 
     # 可用模型列表（供UI选择）
     available_models: List[str] = field(default_factory=lambda: [
-        "mdx_extra",      # 默认推荐：高质量
-        "htdemucs",       # 快速模式
-        "htdemucs_ft",    # Fine-tuned
+        "htdemucs",       # 【当前】快速模式，只需1个文件
+        "mdx_extra",      # 高质量
+        "htdemucs_ft",    # Fine-tuned（需4个文件）
         "mdx_extra_q",    # 量化版（小显存）
     ])
 
@@ -67,20 +67,20 @@ class ModelTierConfig:
     定义不同场景下使用的模型及其质量参数
     """
     # 弱BGM场景使用的模型（速度优先）
-    weak_model: str = "htdemucs_ft"
+    weak_model: str = "htdemucs"
 
     # 强BGM场景使用的模型（质量优先）
-    strong_model: str = "mdx_extra_q"
+    strong_model: str = "htdemucs"
 
     # 兜底模型（熔断升级后使用）
-    fallback_model: str = "mdx_extra"
+    fallback_model: str = "htdemucs"
 
     # 模型质量参数（按模型分别配置）
     model_quality: Dict[str, Dict] = field(default_factory=lambda: {
-        "htdemucs": {"shifts": 1, "overlap": 0.25},      # 最快
-        "htdemucs_ft": {"shifts": 1, "overlap": 0.25},   # 快速+人声优化
-        "mdx_extra_q": {"shifts": 2, "overlap": 0.5},    # 中等
-        "mdx_extra": {"shifts": 2, "overlap": 0.5},      # 最高质量
+        "htdemucs": {"shifts": 2, "overlap": 0.25},      # 快速 + 2次增强
+        "htdemucs_ft": {"shifts": 1, "overlap": 0.25},   # 快速+人声优化（已弃用）
+        "mdx_extra_q": {"shifts": 2, "overlap": 0.5},    # 中等（已弃用）
+        "mdx_extra": {"shifts": 2, "overlap": 0.5},      # 最高质量（已弃用）
     })
 
 
@@ -113,21 +113,21 @@ class SeparationStrategy:
 QUALITY_PRESETS = {
     "fast": {
         "weak_model": "htdemucs",
-        "strong_model": "htdemucs_ft",
-        "fallback_model": "mdx_extra_q",
-        "description": "速度优先，适合低配机器",
+        "strong_model": "htdemucs",
+        "fallback_model": "htdemucs",
+        "description": "速度优先，使用htdemucs统一模型",
     },
     "balanced": {
-        "weak_model": "htdemucs_ft",
-        "strong_model": "mdx_extra_q",
-        "fallback_model": "mdx_extra",
+        "weak_model": "htdemucs",
+        "strong_model": "htdemucs",
+        "fallback_model": "htdemucs",
         "description": "平衡模式（默认推荐）",
     },
     "quality": {
-        "weak_model": "mdx_extra_q",
-        "strong_model": "mdx_extra",
-        "fallback_model": "mdx_extra",
-        "description": "质量优先，处理时间较长",
+        "weak_model": "htdemucs",
+        "strong_model": "htdemucs",
+        "fallback_model": "htdemucs",
+        "description": "质量优先，使用htdemucs统一模型",
     },
 }
 
@@ -167,9 +167,9 @@ class SeparationStrategyResolver:
         if preset:
             # 检测是否使用默认值（通过判断是否等于 balanced 预设的值）
             # 如果用户自定义了模型，则不应用预设
-            default_weak = "htdemucs_ft"
-            default_strong = "mdx_extra_q"
-            default_fallback = "mdx_extra"
+            default_weak = "htdemucs"
+            default_strong = "htdemucs"
+            default_fallback = "htdemucs"
 
             if (self.settings.weak_model == default_weak and
                 self.settings.strong_model == default_strong and
@@ -331,6 +331,8 @@ class DemucsService:
         - mdx_extra: ~100MB
         - htdemucs: ~80MB
         - mdx_extra_q: ~25MB
+        
+        【优化】：自动使用国内镜像加速下载
         """
         if device:
             self.config.device = device
@@ -352,10 +354,8 @@ class DemucsService:
             self.logger.info(f"加载Demucs模型: {self.config.model_name}")
 
             try:
-                from demucs.pretrained import get_model
-
-                # 加载预训练模型
-                self._model = get_model(self.config.model_name)
+                # 【优化】使用国内镜像加速下载模型
+                self._load_model_with_mirror()
                 self._model_name_loaded = self.config.model_name
 
                 # 移动到指定设备
@@ -387,6 +387,144 @@ class DemucsService:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 self.logger.info(f"Demucs模型 {old_name} 已卸载")
+
+    def _load_model_with_mirror(self):
+        """
+        加载 Demucs 模型
+        
+        加载顺序：
+        1. 检查 torch 缓存目录是否已有模型
+        2. 如果没有，检查预置模型目录 (backend/models/pretrained/)
+        3. 如果有预置模型，复制到 torch 缓存目录
+        4. 调用 demucs 加载模型
+        
+        模型缓存位置：
+        - 项目: models/torch/hub/checkpoints/
+        - 预置: backend/models/pretrained/
+        
+        【优化】下载前会检查并清理残留的 .partial 文件
+        """
+        from demucs.pretrained import get_model
+        
+        model_name = self.config.model_name
+        
+        # 【新增】安装预置模型（如果需要）
+        self._install_pretrained_model(model_name)
+        
+        # 【新增】下载前清理残留文件
+        self._cleanup_partial_downloads(model_name)
+        
+        self.logger.info(f"加载模型: {model_name}")
+        self._model = get_model(model_name)
+        self.logger.info(f"✓ 模型加载成功: {model_name}")
+
+    def _install_pretrained_model(self, model_name: str):
+        """
+        安装预置模型到 torch 缓存目录
+        
+        检查 backend/models/pretrained/ 目录下是否有对应的预置模型，
+        如果有且 torch 缓存中没有，则复制过去。
+        
+        Args:
+            model_name: 模型名称
+        """
+        import os
+        import shutil
+        from pathlib import Path
+        
+        # 预置模型文件名映射
+        pretrained_file_mapping = {
+            'htdemucs': 'htdemucs.th',
+        }
+        
+        # torch 缓存文件名映射
+        cache_file_mapping = {
+            'htdemucs': '955717e8-8726e21a.th',
+            'htdemucs_ft': 'f7e0c4bc-ba3fe64a.th',
+            'mdx_extra': '0d19c1c6-0f06f20e.th',
+            'mdx_extra_q': '83fc094f-4a16d450.th',
+        }
+        
+        pretrained_file = pretrained_file_mapping.get(model_name)
+        cache_file = cache_file_mapping.get(model_name)
+        
+        if not pretrained_file or not cache_file:
+            return
+        
+        # 获取预置模型目录（backend/models/pretrained/）
+        pretrained_dir = Path(__file__).parent.parent.parent / 'models' / 'pretrained'
+        pretrained_path = pretrained_dir / pretrained_file
+        
+        if not pretrained_path.exists():
+            self.logger.debug(f"预置模型不存在: {pretrained_path}")
+            return
+        
+        # 获取 torch 缓存目录
+        torch_home = os.environ.get('TORCH_HOME', Path.home() / '.cache' / 'torch')
+        cache_dir = Path(torch_home) / 'hub' / 'checkpoints'
+        cache_path = cache_dir / cache_file
+        
+        # 如果缓存中已有，跳过
+        if cache_path.exists():
+            self.logger.debug(f"模型已在缓存中: {cache_path}")
+            return
+        
+        # 确保缓存目录存在
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 复制预置模型到缓存目录
+        self.logger.info(f"安装预置模型: {pretrained_file} -> {cache_file}")
+        try:
+            shutil.copy2(pretrained_path, cache_path)
+            self.logger.info(f"✓ 预置模型安装成功")
+        except Exception as e:
+            self.logger.warning(f"预置模型安装失败: {e}")
+            self.logger.info("将从网络下载模型...")
+
+    def _cleanup_partial_downloads(self, model_name: str):
+        """
+        清理残留的下载文件（.partial 文件）
+        
+        当下载中断时，PyTorch 会留下 .partial 文件，
+        这些文件可能导致后续下载失败或哈希校验错误。
+        
+        Args:
+            model_name: 模型名称
+        """
+        import os
+        from pathlib import Path
+        
+        # 模型文件名映射（模型名 -> 缓存文件名前缀）
+        model_file_mapping = {
+            'htdemucs': '955717e8-8726e21a',
+            'htdemucs_ft': 'f7e0c4bc-ba3fe64a',
+            'mdx_extra': '0d19c1c6-0f06f20e',
+            'mdx_extra_q': '83fc094f-4a16d450',
+        }
+        
+        file_prefix = model_file_mapping.get(model_name)
+        if not file_prefix:
+            return
+        
+        # 获取 PyTorch 缓存目录
+        torch_home = os.environ.get('TORCH_HOME', Path.home() / '.cache' / 'torch')
+        cache_dir = Path(torch_home) / 'hub' / 'checkpoints'
+        
+        if not cache_dir.exists():
+            return
+        
+        # 查找并清理 partial 文件
+        partial_files = list(cache_dir.glob(f"{file_prefix}*.partial"))
+        
+        if partial_files:
+            self.logger.warning(f"发现 {len(partial_files)} 个残留下载文件，正在清理...")
+            for pf in partial_files:
+                try:
+                    pf.unlink()
+                    self.logger.info(f"  已删除: {pf.name}")
+                except Exception as e:
+                    self.logger.warning(f"  删除失败: {pf.name} - {e}")
+            self.logger.info(f"✓ 残留文件清理完成")
 
     def separate_vocals(
         self,
@@ -487,7 +625,8 @@ class DemucsService:
         sr: int,
         start_sec: float,
         end_sec: float,
-        buffer_sec: float = None
+        buffer_sec: float = None,
+        shifts: int = 1  # BGM检测时使用1次，正常分离时使用配置值
     ) -> np.ndarray:
         """
         按需分离指定时间段的人声（内存模式）
@@ -498,6 +637,7 @@ class DemucsService:
             start_sec: 开始时间（秒）
             end_sec: 结束时间（秒）
             buffer_sec: 前后缓冲区（秒），默认使用配置值
+            shifts: 增强次数（默认1=快速模式用于检测）
 
         Returns:
             np.ndarray: 分离后的人声片段（不含缓冲区）
@@ -543,7 +683,7 @@ class DemucsService:
             sources = apply_model(
                 model,
                 wav,
-                shifts=1,  # 按需分离使用快速模式
+                shifts=shifts,  # 使用传入的 shifts 参数（检测时为1，正常分离时为配置值）
                 overlap=self.config.overlap,
                 progress=False,
                 device=self.config.device
@@ -586,6 +726,9 @@ class DemucsService:
         - 50%：捕获中间部分
         - 85%：捕获结尾前的部分
 
+        注意：BGM检测使用最快的 htdemucs 模型，检测完成后会卸载模型，
+        以便后续根据检测结果加载合适的模型进行分离。
+
         Args:
             audio_path: 音频文件路径
             audio_array: 音频数组（可选，用于内存模式）
@@ -595,6 +738,17 @@ class DemucsService:
         Returns:
             Tuple[BGMLevel, List[float]]: (背景音乐强度级别, 各采样点的BGM比例列表)
         """
+        # 【优化】BGM检测使用最快的模型，避免加载重型模型造成浪费
+        original_model = self.config.model_name
+        detection_model = "htdemucs"  # 快速模型，用于检测
+        
+        # 如果当前配置不是检测模型，且模型未加载，则临时切换到检测模型
+        need_restore = False
+        if self._model is None and original_model != detection_model:
+            self.logger.info(f"BGM检测使用快速模型: {detection_model}")
+            self.config.model_name = detection_model
+            need_restore = True
+
         self.logger.info("检测背景音乐强度（分位数采样）...")
 
         # 加载音频
@@ -631,7 +785,8 @@ class DemucsService:
                     audio_array, sr,
                     start_sec=start_time,
                     end_sec=start_time + sample_duration,
-                    buffer_sec=0.5  # 检测时用较短缓冲
+                    buffer_sec=0.5,  # 检测时用较短缓冲
+                    shifts=1  # BGM检测使用标准参数
                 )
 
                 # 获取原始片段
@@ -652,6 +807,11 @@ class DemucsService:
                 continue
 
         if not ratios:
+            # 【优化】检测完成后卸载模型并恢复配置
+            if need_restore:
+                self.unload_model()
+                self.config.model_name = original_model
+                self.logger.info(f"BGM检测完成，卸载检测模型，恢复配置: {original_model}")
             return BGMLevel.LIGHT, []  # 默认假设有轻微BGM
 
         # 决策逻辑：使用最大值判断（只要有一处BGM很重，就视为Heavy）
@@ -662,10 +822,16 @@ class DemucsService:
             f"BGM检测完成: 比例={ratios}, 平均={avg_ratio:.2f}, 最大={max_ratio:.2f}"
         )
 
+        # 【优化】检测完成后卸载模型并恢复配置，以便后续根据策略加载正确的模型
+        if need_restore:
+            self.unload_model()
+            self.config.model_name = original_model
+            self.logger.info(f"卸载检测模型，后续将根据策略加载: {original_model}")
+
         # 使用max_ratio作为主要判断依据
-        if max_ratio > self.config.bgm_heavy_threshold:  # 默认0.6
+        if max_ratio >= self.config.bgm_heavy_threshold:  # 默认0.15
             return BGMLevel.HEAVY, ratios
-        elif max_ratio > self.config.bgm_light_threshold:  # 默认0.2
+        elif max_ratio >= self.config.bgm_light_threshold:  # 默认0.02
             return BGMLevel.LIGHT, ratios
         else:
             return BGMLevel.NONE, ratios

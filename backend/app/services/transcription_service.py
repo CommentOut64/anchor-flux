@@ -71,15 +71,21 @@ class BreakToGlobalSeparation(Exception):
 @dataclass
 class CircuitBreakerState:
     """
-    熔断器状态（用于跟踪转录过程中的重试情况）
+    熔断器状态（支持模型升级）
 
-    用于监控转录质量，当大量段落需要重试时自动触发熔断，
-    停止当前流程并升级为全局人声分离模式。
+    用于监控转录质量，当大量段落需要重试时：
+    1. 优先尝试升级模型（如果允许且未达上限）
+    2. 无法升级时才触发熔断
     """
     consecutive_retries: int = 0        # 连续重试计数
     total_retries: int = 0              # 总重试次数
     total_segments: int = 0             # 总段落数
     processed_segments: int = 0         # 已处理段落数
+
+    # === Phase 3: 升级跟踪 ===
+    escalation_count: int = 0                           # 已升级次数
+    current_model: Optional[str] = None                 # 当前使用的模型
+    escalation_history: List[str] = field(default_factory=list)  # 升级历史
 
     def record_retry(self):
         """记录一次重试"""
@@ -91,13 +97,49 @@ class CircuitBreakerState:
         self.consecutive_retries = 0
         self.processed_segments += 1
 
+    def record_escalation(self, new_model: str):
+        """
+        记录一次模型升级
+
+        Args:
+            new_model: 升级后的模型名称
+        """
+        if self.current_model:
+            self.escalation_history.append(f"{self.current_model} -> {new_model}")
+        self.current_model = new_model
+        self.escalation_count += 1
+        # 升级后重置连续重试计数，给新模型机会
+        self.consecutive_retries = 0
+
+    def should_escalate(self, demucs_settings) -> bool:
+        """
+        判断是否应该升级模型（优先于熔断）
+
+        升级条件：
+        1. 允许自动升级 (auto_escalation=True)
+        2. 未达到最大升级次数
+        3. 满足熔断条件（连续重试或比例过高）
+
+        Args:
+            demucs_settings: Demucs配置对象
+
+        Returns:
+            bool: True表示应该升级模型
+        """
+        if not demucs_settings.auto_escalation:
+            return False
+
+        if self.escalation_count >= demucs_settings.max_escalations:
+            return False
+
+        # 满足熔断条件时，优先升级
+        return self._check_break_condition(demucs_settings)
+
     def should_break(self, demucs_settings) -> bool:
         """
         判断是否应该触发熔断
 
-        熔断条件（满足任一即熔断）：
-        1. 连续 N 个 segment 都触发重试（默认N=3）
-        2. 总重试比例超过阈值（默认20%）
+        注意：只有在无法升级时才触发熔断
 
         Args:
             demucs_settings: Demucs配置对象
@@ -108,6 +150,26 @@ class CircuitBreakerState:
         if not demucs_settings.circuit_breaker_enabled:
             return False
 
+        # 如果还能升级，不触发熔断
+        if self.should_escalate(demucs_settings):
+            return False
+
+        return self._check_break_condition(demucs_settings)
+
+    def _check_break_condition(self, demucs_settings) -> bool:
+        """
+        检查是否满足熔断/升级条件
+
+        熔断条件（满足任一即触发）：
+        1. 连续 N 个 segment 都触发重试（默认N=3）
+        2. 总重试比例超过阈值（默认20%）
+
+        Args:
+            demucs_settings: Demucs配置对象
+
+        Returns:
+            bool: True表示满足熔断/升级条件
+        """
         # 条件1：连续重试次数
         if self.consecutive_retries >= demucs_settings.consecutive_threshold:
             return True
@@ -121,14 +183,165 @@ class CircuitBreakerState:
         return False
 
     def get_stats(self) -> Dict:
-        """获取统计信息"""
+        """获取统计信息（扩展）"""
         return {
             "consecutive_retries": self.consecutive_retries,
             "total_retries": self.total_retries,
             "total_segments": self.total_segments,
             "processed_segments": self.processed_segments,
-            "retry_ratio": self.total_retries / max(1, self.processed_segments)
+            "retry_ratio": self.total_retries / max(1, self.processed_segments),
+            # Phase 3 新增
+            "escalation_count": self.escalation_count,
+            "current_model": self.current_model,
+            "escalation_history": self.escalation_history,
         }
+
+
+class CircuitBreakAction(Enum):
+    """熔断后的处理动作"""
+    CONTINUE = "continue"           # 继续处理，标记问题段落
+    FALLBACK_ORIGINAL = "fallback"  # 降级使用原始音频
+    FAIL = "fail"                   # 任务失败
+    PAUSE = "pause"                 # 暂停等待人工介入
+
+
+class CircuitBreakHandler:
+    """
+    熔断异常处理器
+
+    负责在熔断触发时执行用户配置的处理策略
+    """
+
+    def __init__(self, job: "JobState", settings):
+        """
+        初始化熔断处理器
+
+        Args:
+            job: 任务状态对象
+            settings: DemucsSettings 配置对象
+        """
+        self.job = job
+        self.settings = settings
+        self.logger = logging.getLogger(__name__)
+        self.problem_segments: List[int] = []  # 记录问题段落索引
+
+    def handle(
+        self,
+        breaker_state: CircuitBreakerState,
+        current_segment_idx: int,
+        sse_manager = None
+    ) -> CircuitBreakAction:
+        """
+        处理熔断异常
+
+        Args:
+            breaker_state: 熔断器状态
+            current_segment_idx: 当前段落索引
+            sse_manager: SSE管理器（用于推送事件）
+
+        Returns:
+            CircuitBreakAction: 处理动作
+        """
+        action_str = self.settings.on_break
+
+        # 解析处理动作
+        try:
+            action = CircuitBreakAction(action_str)
+        except ValueError:
+            # 如果配置值无效，默认使用 CONTINUE
+            self.logger.warning(f"无效的熔断处理策略: {action_str}，使用默认值 continue")
+            action = CircuitBreakAction.CONTINUE
+
+        # 记录问题段落
+        self.problem_segments.append(current_segment_idx)
+
+        # 推送 SSE 事件
+        if sse_manager:
+            self._push_circuit_break_event(breaker_state, action, sse_manager)
+
+        # 根据策略执行操作
+        if action == CircuitBreakAction.FAIL:
+            self.logger.error(
+                f"熔断触发，任务终止。问题段落: {self.problem_segments}"
+            )
+            raise BreakToGlobalSeparation(
+                f"熔断触发，任务终止。问题段落: {self.problem_segments}"
+            )
+
+        elif action == CircuitBreakAction.PAUSE:
+            self.logger.warning(
+                f"熔断触发，等待人工介入。问题段落: {self.problem_segments}"
+            )
+            self.job.paused = True
+            self.job.status = "paused"
+            self.job.message = f"熔断触发，等待人工介入。问题段落: {self.problem_segments}"
+            raise BreakToGlobalSeparation(self.job.message)
+
+        else:  # CONTINUE 或 FALLBACK_ORIGINAL
+            self.logger.warning(
+                f"熔断触发，采用 {action.value} 策略继续处理。"
+                f"问题段落: {self.problem_segments}"
+            )
+
+        return action
+
+    def get_problem_report(self) -> Dict:
+        """
+        获取问题报告
+
+        Returns:
+            包含问题统计和建议的字典
+        """
+        return {
+            "total_problem_segments": len(self.problem_segments),
+            "problem_indices": self.problem_segments,
+            "suggestion": self._get_suggestion()
+        }
+
+    def _get_suggestion(self) -> str:
+        """
+        根据问题段落数量给出建议
+
+        Returns:
+            建议文本
+        """
+        count = len(self.problem_segments)
+        if count == 0:
+            return "所有段落处理正常"
+        elif count <= 3:
+            return "少量段落可能需要手动调整时间轴"
+        elif count <= 10:
+            return "建议检查这些段落的字幕准确性"
+        else:
+            return "大量段落有问题，建议使用更高质量的模型重新处理"
+
+    def _push_circuit_break_event(
+        self,
+        state: CircuitBreakerState,
+        action: CircuitBreakAction,
+        sse_manager
+    ):
+        """
+        推送熔断处理事件
+
+        Args:
+            state: 熔断器状态
+            action: 处理动作
+            sse_manager: SSE管理器
+        """
+        try:
+            sse_manager.push_event(
+                self.job.job_id,
+                "circuit_breaker_handled",
+                {
+                    "action": action.value,
+                    "problem_segments": self.problem_segments,
+                    "stats": state.get_stats(),
+                    "suggestion": self._get_suggestion()
+                }
+            )
+        except Exception as e:
+            self.logger.debug(f"SSE推送失败（非致命）: {e}")
 
 
 from models.job_models import JobSettings, JobState
@@ -1239,20 +1452,27 @@ class TranscriptionService:
                     self.logger.info(f"BGM检测完成: {bgm_level.value}")
 
             # ==========================================
-            # 3. 阶段3: 全局人声分离（条件执行）
+            # 3. 阶段3: 全局人声分离（使用分级策略）
             # ==========================================
             use_vocals = False
             vocals_path = None
+            separation_strategy = None
 
-            # 决策：何时执行全局分离
-            # 【优化】auto模式下，LIGHT和HEAVY级别都会触发全局分离
-            # 因为即使是轻微的BGM也可能影响VAD和转录精度
-            should_separate_global = (
-                demucs_settings.enabled and (
-                    demucs_settings.mode == "always" or
-                    (demucs_settings.mode == "auto" and bgm_level in [BGMLevel.LIGHT, BGMLevel.HEAVY])
+            # 只有启用 Demucs 时才生成分离策略
+            if demucs_settings.enabled:
+                # 【新增】使用策略解析器决定分离策略
+                from services.demucs_service import SeparationStrategyResolver, get_demucs_service
+                strategy_resolver = SeparationStrategyResolver(demucs_settings)
+                separation_strategy = strategy_resolver.resolve(bgm_level)
+
+                # 推送分离策略SSE事件
+                self._push_sse_separation_strategy(job, separation_strategy)
+
+                self.logger.info(
+                    f"分离策略: should_separate={separation_strategy.should_separate}, "
+                    f"model={separation_strategy.initial_model}, "
+                    f"reason={separation_strategy.reason}"
                 )
-            )
 
             # 从checkpoint恢复分离状态
             if checkpoint and 'demucs' in checkpoint:
@@ -1262,11 +1482,16 @@ class TranscriptionService:
                     use_vocals = True
                     self.logger.info(f"从检查点恢复：使用已分离的人声 {vocals_path}")
 
-            # 如果需要分离且尚未完成
-            if should_separate_global and not use_vocals:
+            # 如果策略要求分离且尚未完成
+            if separation_strategy and separation_strategy.should_separate and not use_vocals:
+                # 【关键】根据策略选择模型
+                from services.demucs_service import get_demucs_service
+                demucs_service = get_demucs_service()
+                demucs_service.set_model_for_strategy(separation_strategy)
+
                 vocals_path = self._separate_vocals_global(str(audio_path), job)
                 use_vocals = True
-                self.logger.info(f"全局人声分离完成: {vocals_path}")
+                self.logger.info(f"全局人声分离完成: {vocals_path} (模型: {separation_strategy.initial_model})")
 
             # 决定后续使用哪个音频文件
             active_audio_path = Path(vocals_path) if use_vocals else audio_path
@@ -1347,6 +1572,7 @@ class TranscriptionService:
                         "bgm_ratios": bgm_ratios,
                         "global_separation_done": use_vocals,
                         "vocals_path": str(vocals_path) if vocals_path else None,
+                        "used_model": separation_strategy.initial_model if separation_strategy else None,
                         "circuit_breaker": None,
                         "retry_triggered": False
                     }
@@ -1471,13 +1697,32 @@ class TranscriptionService:
                 self._update_progress(job, 'transcribe', 1, '转录完成')
 
             except BreakToGlobalSeparation as e:
-                # 熔断触发：升级为全局人声分离模式
+                # 熔断触发：升级模型并执行全局人声分离
                 self.logger.warning(f"熔断触发: {e}")
 
                 # 推送 SSE 事件
                 self._push_sse_circuit_breaker_triggered(job, circuit_breaker)
 
-                # 执行全局人声分离
+                # 【新增】检查是否允许模型升级
+                if separation_strategy and separation_strategy.allow_escalation:
+                    # 升级到 fallback 模型
+                    fallback = separation_strategy.fallback_model
+                    if fallback:
+                        self.logger.info(f"模型升级: {separation_strategy.initial_model} → {fallback}")
+                        from services.demucs_service import get_demucs_service
+                        demucs_service = get_demucs_service()
+                        demucs_service.set_model(fallback)
+
+                        # 推送模型升级事件
+                        self._push_sse_model_escalated(
+                            job,
+                            separation_strategy.initial_model,
+                            fallback,
+                            "熔断触发，升级到兜底模型",
+                            circuit_breaker
+                        )
+
+                # 执行全局人声分离（使用升级后的模型）
                 self.logger.info("开始执行全局人声分离（熔断升级）...")
                 vocals_path = self._separate_vocals_global(str(audio_path), job)
 
@@ -2213,13 +2458,82 @@ class TranscriptionService:
             # SSE推送失败不应影响主流程
             self.logger.debug(f"SSE推送失败（非致命）: {e}")
 
+    def _push_sse_separation_strategy(self, job: JobState, strategy):
+        """
+        推送分离策略决策事件
+
+        Args:
+            job: 任务状态对象
+            strategy: SeparationStrategy 对象
+        """
+        try:
+            from services.sse_service import get_sse_manager
+
+            sse_manager = get_sse_manager()
+            channel_id = f"job:{job.job_id}"
+
+            # 使用 strategy.to_dict() 获取事件数据
+            event_data = strategy.to_dict()
+
+            # 广播事件
+            sse_manager.broadcast_sync(channel_id, "separation_strategy", event_data)
+
+            self.logger.debug(f"分离策略事件已推送: {strategy.reason}")
+
+        except Exception as e:
+            # SSE推送失败不应影响主流程
+            self.logger.debug(f"SSE推送失败（非致命）: {e}")
+
+    def _push_sse_model_escalated(
+        self,
+        job: JobState,
+        from_model: str,
+        to_model: str,
+        reason: str,
+        breaker_state: CircuitBreakerState
+    ):
+        """
+        推送模型升级事件
+
+        Args:
+            job: 任务状态对象
+            from_model: 原模型名称
+            to_model: 新模型名称
+            reason: 升级原因
+            breaker_state: 熔断器状态
+        """
+        try:
+            from services.sse_service import get_sse_manager
+
+            sse_manager = get_sse_manager()
+            channel_id = f"job:{job.job_id}"
+
+            # 构造事件数据
+            event_data = {
+                "from_model": from_model,
+                "to_model": to_model,
+                "reason": reason,
+                "escalation_count": breaker_state.escalation_count,
+                "max_escalations": job.settings.demucs.max_escalations,
+                "stats": breaker_state.get_stats()
+            }
+
+            # 广播事件
+            sse_manager.broadcast_sync(channel_id, "model_escalated", event_data)
+
+            self.logger.info(f"模型升级事件已推送: {from_model} -> {to_model}")
+
+        except Exception as e:
+            # SSE推送失败不应影响主流程
+            self.logger.debug(f"SSE推送失败（非致命）: {e}")
+
     def _push_sse_circuit_breaker_triggered(
         self,
         job: JobState,
         circuit_breaker: Optional[CircuitBreakerState]
     ):
         """
-        推送熔断触发事件
+        推送熔断触发事件（Phase 4: 扩展包含升级信息）
 
         Args:
             job: 任务状态对象
@@ -2231,11 +2545,12 @@ class TranscriptionService:
             sse_manager = get_sse_manager()
             channel_id = f"job:{job.job_id}"
 
-            # 构造事件数据
+            # 构造事件数据（扩展包含升级历史）
+            stats = circuit_breaker.get_stats() if circuit_breaker else {}
             event_data = {
                 "triggered": True,
-                "reason": "转录质量低，触发熔断升级",
-                "stats": circuit_breaker.get_stats() if circuit_breaker else {},
+                "reason": self._get_circuit_break_reason(circuit_breaker),
+                "stats": stats,
                 "action": "升级为全局人声分离模式"
             }
 
@@ -2247,6 +2562,33 @@ class TranscriptionService:
         except Exception as e:
             # SSE推送失败不应影响主流程
             self.logger.debug(f"SSE推送失败（非致命）: {e}")
+
+    def _get_circuit_break_reason(self, circuit_breaker: Optional[CircuitBreakerState]) -> str:
+        """
+        生成熔断原因描述
+
+        Args:
+            circuit_breaker: 熔断器状态
+
+        Returns:
+            熔断原因描述字符串
+        """
+        if not circuit_breaker:
+            return "转录质量低，触发熔断升级"
+
+        stats = circuit_breaker.get_stats()
+
+        # 如果有升级历史，说明已经尝试过升级
+        if circuit_breaker.escalation_count > 0:
+            return (
+                f"已升级 {circuit_breaker.escalation_count} 次模型仍未改善，触发熔断。"
+                f"升级历史: {', '.join(circuit_breaker.escalation_history)}"
+            )
+        else:
+            return (
+                f"连续 {stats['consecutive_retries']} 个段落重试失败，"
+                f"总重试率 {stats['retry_ratio']:.1%}，触发熔断"
+            )
 
     def _get_demucs_recommendation(self, level) -> str:
         """
