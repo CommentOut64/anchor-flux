@@ -1,581 +1,985 @@
-# Phase 3: 转录服务重构（修订版）
+# Phase 3: 转录服务重构（修订版 v2.1）
 
-> 目标：整合所有组件到转录服务，实现完整的 SenseVoice 转录流程
+> 目标：整合所有组件到转录服务，实现完整的时空解耦转录流程
 >
 > 工期：3-4天
+>
+> 版本更新：整合 [06_转录层深度优化_时空解耦架构](./06_转录层深度优化_时空解耦架构.md) 设计
 
 ---
 
 ## ⚠️ 重要修订
 
-- ❌ **删除**：不使用 `hardware_detector.py`（不存在）
+### v2.1 新增（VAD优先 + 频谱分诊 + 概念澄清）
+
+- ✅ **流程确认**：`音频提取 → VAD → 频谱分诊(Chunk级) → 按需分离 → 转录`
+- ✅ **组件更新**：使用 `AudioSpectrumClassifier` 替代原有 `AudioCircuitBreaker`
+- ✅ **新增**：Chunk级频谱分诊，每个VAD片段独立判断是否需要分离
+- ✅ **概念澄清**：熔断 ≠ Whisper补刀（详见下方说明）
+- ✅ **新增**：熔断回溯机制（保留原始音频，升级分离模型）
+- ✅ **新增**：后处理增强体系（Whisper补刀、LLM校对、翻译）
+
+### v2.0 新增（时空解耦架构）
+
+- ✅ **核心修改**：Whisper 补刀**仅取文本**，时间戳由 SenseVoice 确定
+- ✅ **新增**：WhisperX 强制对齐作为**可选模块**
+- ✅ **新增**：伪对齐算法集成（Phase 1 的 `pseudo_alignment.py`）
+- ✅ **新增**：字幕流式输出系统 `streaming_subtitle.py`
+- ✅ **新增**：智能进度追踪集成（Phase 1 的 `progress_tracker.py`）
+- ✅ **新增**：统一 SSE 事件 Tag 设计
+
+### v1.0 基础修订
+
+- ❌ **删除**：不使用 `hardware_detector.py`
 - ✅ **复用**：使用现有的 `hardware_service.py`
 - ✅ **修正**：SSE 推送使用 `get_sse_manager()` 和 `broadcast_sync()`
-- ✅ **修正**：模型预加载使用现有 `_global_lock`
 
 ---
 
-## 一、任务清单
+## 一、任务清单（扩展）
 
-| 任务 | 文件 | 优先级 |
-|------|------|--------|
-| VAD 物理切分重构 | `transcription_service.py` | P0 |
-| SenseVoice 转录流程 | `transcription_service.py` | P0 |
-| 分句集成 | `transcription_service.py` | P0 |
-| 熔断逻辑集成 | `transcription_service.py` | P0 |
-| 句级 SSE 推送 | `transcription_service.py` | P1 |
-| Whisper 补刀机制 | `transcription_service.py` | P1 |
-| 模型管理集成 | `model_preload_manager.py` | P1 |
+| 任务 | 文件 | 优先级 | 状态 |
+|------|------|--------|------|
+| VAD 物理切分重构 | `transcription_service.py` | P0 | 修改 |
+| **频谱分诊集成** | `transcription_service.py` | **P0** | **修改** |
+| **时空解耦补刀逻辑** | `transcription_service.py` | **P0** | **修改** |
+| **流式字幕输出系统** | `streaming_subtitle.py` | **P0** | **新建** |
+| **WhisperX 可选模块** | `whisperx_align_service.py` | **P2** | **新建** |
+| 时间戳偏移修正 | `transcription_service.py` | P0 | 修改 |
+| 熔断逻辑集成 | `transcription_service.py` | P0 | 修改 |
+| 句级 SSE 推送 | `transcription_service.py` | P1 | 修改 |
+| 模型管理集成 | `model_preload_manager.py` | P1 | 修改 |
 
 ---
 
-## 二、整体流程
+## 二、整体流程（VAD优先 + 时空解耦版 v2.1）
+
+### 2.1 概念澄清：熔断 vs 后处理增强
+
+> **重要**：熔断和后处理增强是两个不同的概念，发生在不同阶段
+
+| 概念 | 触发条件 | 发生时机 | 动作 |
+|------|----------|----------|------|
+| **熔断** | BGM/Noise标签 + 低置信度 | 单个Chunk转录后立即判断 | 回溯到原始音频，升级分离模型重做 |
+| **后处理增强** | 用户配置启用 + 低置信度 | 所有Chunk转录完成后 | Whisper补刀、LLM校对、翻译 |
+
+### 2.2 完整流程
 
 ```
-1. 音频提取
-   ↓
-2. VAD 物理切分（15-30s chunks）
-   ↓
-3. 频谱预判（AudioCircuitBreaker）
-   ↓
-4. 按需人声分离（Demucs）
-   ↓
-5. SenseVoice 转录
-   ↓
-6. 分句算法（SentenceSplitter）
-   ↓
-7. 句级 SSE 推送
-   ↓
-8. 置信度评估
-   ↓
-9. 熔断决策（FuseBreaker）
-   ↓
-10. [低置信度] → 升级分离 或 Whisper 补刀
-   ↓
-11. 生成字幕
+┌─────────────────────────────────────────────────────────────────┐
+│                    转录层完整流程（v2.1）                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. 音频提取                                                     │
+│     ↓                                                           │
+│  2. VAD 物理切分（15-30s chunks）                                │
+│     ↓                                                           │
+│  3. 频谱分诊（AudioSpectrumClassifier，Chunk级别）              │
+│     │  - 提取频谱特征（ZCR、谱质心、谐波比、能量方差）          │
+│     │  - 判断：CLEAN / MUSIC / NOISE / MIXED                    │
+│     │  - 推荐分离模型：htdemucs / mdx_extra / None              │
+│     ↓                                                           │
+│  4. 按需人声分离（仅对需要分离的Chunk）                         │
+│     │  【关键】保存原始音频到 ChunkProcessState.original_audio  │
+│     ↓                                                           │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │ 5. 逐Chunk处理循环（转录层核心）                            ││
+│  │    ┌─────────────────────────────────────────────────────┐  ││
+│  │    │ for each chunk:                                     │  ││
+│  │    │   5.1 SenseVoice 转录（时间领主）                    │  ││
+│  │    │   5.2 分句算法                                       │  ││
+│  │    │   5.3 置信度评估 + 检测事件标签（BGM/Noise等）       │  ││
+│  │    │   5.4 熔断决策（FuseBreaker.should_fuse）            │  ││
+│  │    │       │                                              │  ││
+│  │    │       ├─ 高置信度 或 无BGM标签 → ACCEPT → 继续下一个  │  ││
+│  │    │       │                                              │  ││
+│  │    │       └─ 低置信度 + BGM/Noise → UPGRADE_SEPARATION   │  ││
+│  │    │           │                                          │  ││
+│  │    │           ↓                                          │  ││
+│  │    │       ┌────────────────────────────────────────┐     │  ││
+│  │    │       │ 熔断回溯：                              │     │  ││
+│  │    │       │ 1. 检查 separation_level               │     │  ││
+│  │    │       │ 2. 取回 original_audio（分离前）        │     │  ││
+│  │    │       │ 3. 升级模型重新分离                     │     │  ││
+│  │    │       │ 4. 更新 current_audio                   │     │  ││
+│  │    │       │ 5. 回到 5.1 重新转录                    │     │  ││
+│  │    │       │ 6. fuse_retry_count++                   │     │  ││
+│  │    │       │ （止损点：max_retry=1）                 │     │  ││
+│  │    │       └────────────────────────────────────────┘     │  ││
+│  │    │                                                      │  ││
+│  │    │   5.5 句级 SSE 推送（流式输出）                       │  ││
+│  │    └─────────────────────────────────────────────────────┘  ││
+│  └─────────────────────────────────────────────────────────────┘│
+│     ↓                                                           │
+│     【所有Chunk转录完成】                                        │
+│     ↓                                                           │
+│  ═══════════════════════════════════════════════════════════════│
+│  │             后处理增强层（根据用户配置）                     ││
+│  ═══════════════════════════════════════════════════════════════│
+│     ↓                                                           │
+│  6. [可选] Whisper 补刀（仅对低置信度句子）                      │
+│     │  - 检查用户配置：enhancement != OFF                       │
+│     │  - 仅取文本，弃用时间戳                                   │
+│     │  - 应用伪对齐生成字级时间戳                               │
+│     ↓                                                           │
+│  7. [可选] WhisperX 强制对齐                                    │
+│     ↓                                                           │
+│  8. [可选] LLM 校对                                             │
+│     ↓                                                           │
+│  9. [可选] LLM 翻译                                             │
+│     ↓                                                           │
+│  10. 生成字幕文件                                               │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 三、核心修改：transcription_service.py
+## 三、流式字幕输出系统（新增）
 
-### 3.1 新增依赖导入（⚠️ 修订）
-
-在文件顶部添加：
+**路径**: `backend/app/services/streaming_subtitle.py`
 
 ```python
-from .sentence_splitter import SentenceSplitter
-from .audio_circuit_breaker import AudioCircuitBreaker
-from .fuse_breaker import FuseBreaker
-from .sensevoice_onnx_service import get_sensevoice_service
-# ❌ 错误：from .hardware_detector import get_hardware_capability
-# ✅ 正确：使用现有硬件服务
-from .hardware_service import get_hardware_detector, get_hardware_optimizer
-from .sse_service import get_sse_manager  # ✅ 修正：使用 SSE 管理器
+"""
+流式字幕管理系统
 
-from ..models.sensevoice_models import SentenceSegment
-from ..models.circuit_breaker_models import SeparationLevel
+核心职责：
+1. 管理字幕句子列表（支持原地更新）
+2. 协调 SSE 事件推送（统一 Tag）
+3. 支持多阶段增量更新（SV → Whisper → LLM）
+"""
+from typing import Dict, List, Optional
+from ..models.sensevoice_models import SentenceSegment, TextSource
+from .sse_service import get_sse_manager, push_subtitle_event, push_progress_event
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class StreamingSubtitleManager:
+    """流式字幕管理器"""
+
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+        self.sentences: Dict[int, SentenceSegment] = {}  # key = sentence_index
+        self.sentence_count = 0
+        self.sse_manager = get_sse_manager()
+
+    def add_sentence(self, sentence: SentenceSegment) -> int:
+        """
+        添加新句子（SenseVoice 阶段）
+
+        Args:
+            sentence: 句子段落
+
+        Returns:
+            int: 句子索引
+        """
+        index = self.sentence_count
+        self.sentences[index] = sentence
+        self.sentence_count += 1
+
+        # 推送 SSE 事件
+        push_subtitle_event(
+            self.sse_manager,
+            self.job_id,
+            "sv_sentence",
+            {
+                "index": index,
+                "sentence": sentence.to_dict(),
+                "source": "sensevoice"
+            }
+        )
+
+        logger.debug(f"添加句子 {index}: {sentence.text[:30]}...")
+        return index
+
+    def update_sentence(
+        self,
+        index: int,
+        new_text: str,
+        source: TextSource,
+        confidence: float = None,
+        perplexity: float = None
+    ):
+        """
+        更新已有句子（Whisper 补刀或 LLM 校对）
+
+        Args:
+            index: 句子索引
+            new_text: 新文本
+            source: 文本来源
+            confidence: 新置信度（可选）
+            perplexity: LLM 困惑度（可选）
+        """
+        if index not in self.sentences:
+            logger.warning(f"句子 {index} 不存在，无法更新")
+            return
+
+        sentence = self.sentences[index]
+
+        # 应用伪对齐
+        from .pseudo_alignment import PseudoAlignment
+        PseudoAlignment.apply_to_sentence(sentence, new_text, source)
+
+        # 更新置信度和困惑度
+        if confidence is not None:
+            sentence.confidence = confidence
+        if perplexity is not None:
+            sentence.perplexity = perplexity
+            sentence.warning_type = sentence.compute_warning_type()
+
+        # 推送 SSE 事件
+        event_type = {
+            TextSource.WHISPER_PATCH: "whisper_patch",
+            TextSource.WHISPERX_ALIGN: "whisper_patch",
+            TextSource.LLM_CORRECTION: "llm_proof",
+            TextSource.LLM_TRANSLATION: "llm_trans",
+        }.get(source, "batch_update")
+
+        push_subtitle_event(
+            self.sse_manager,
+            self.job_id,
+            event_type,
+            {
+                "index": index,
+                "sentence": sentence.to_dict(),
+                "source": source.value,
+                "is_update": True
+            }
+        )
+
+        logger.debug(f"更新句子 {index} ({source.value}): {new_text[:30]}...")
+
+    def set_translation(self, index: int, translation: str, confidence: float = None):
+        """
+        设置翻译结果
+
+        Args:
+            index: 句子索引
+            translation: 翻译文本
+            confidence: 翻译置信度
+        """
+        if index not in self.sentences:
+            return
+
+        sentence = self.sentences[index]
+        sentence.translation = translation
+        if confidence is not None:
+            sentence.translation_confidence = confidence
+
+        push_subtitle_event(
+            self.sse_manager,
+            self.job_id,
+            "llm_trans",
+            {
+                "index": index,
+                "translation": translation,
+                "confidence": confidence
+            }
+        )
+
+    def get_all_sentences(self) -> List[SentenceSegment]:
+        """获取所有句子（按时间排序）"""
+        sentences = list(self.sentences.values())
+        sentences.sort(key=lambda s: s.start)
+        return sentences
+
+    def get_context_window(self, index: int, window_size: int = 3) -> str:
+        """
+        获取上下文窗口（用于 LLM 校对）
+
+        Args:
+            index: 当前句子索引
+            window_size: 上下文窗口大小
+
+        Returns:
+            str: 上下文文本
+        """
+        context_indices = range(max(0, index - window_size), index)
+        context_texts = [
+            self.sentences[i].text
+            for i in context_indices
+            if i in self.sentences
+        ]
+        return " ".join(context_texts)
+
+
+# ========== 单例工厂 ==========
+
+_subtitle_managers: Dict[str, StreamingSubtitleManager] = {}
+
+
+def get_streaming_subtitle_manager(job_id: str) -> StreamingSubtitleManager:
+    """获取或创建流式字幕管理器"""
+    global _subtitle_managers
+    if job_id not in _subtitle_managers:
+        _subtitle_managers[job_id] = StreamingSubtitleManager(job_id)
+    return _subtitle_managers[job_id]
+
+
+def remove_streaming_subtitle_manager(job_id: str):
+    """移除流式字幕管理器"""
+    global _subtitle_managers
+    if job_id in _subtitle_managers:
+        del _subtitle_managers[job_id]
 ```
 
-### 3.2 初始化新组件（⚠️ 修订）
+---
 
-在 `TranscriptionService.__init__()` 中添加：
+## 四、熔断回溯机制（转录层核心）
+
+> **注意**：熔断仅指"升级分离模型"，发生在单个 Chunk 转录后。不是 Whisper 补刀。
+
+### 4.1 Chunk 状态管理
+
+每个 VAD Chunk 需要维护状态，关键是保留原始音频引用：
 
 ```python
-def __init__(self):
-    # ... 现有初始化代码 ...
+# 使用 Phase 2 定义的 ChunkProcessState
+from ..models.circuit_breaker_models import ChunkProcessState, SeparationLevel
 
-    # 新增：Phase 1-2 组件
-    self.sentence_splitter = SentenceSplitter()
-    self.circuit_breaker = AudioCircuitBreaker()
-    self.fuse_breaker = FuseBreaker()
+def _init_chunk_states(
+    self,
+    vad_segments: List[dict],
+    audio_array: np.ndarray
+) -> List[ChunkProcessState]:
+    """
+    初始化所有 Chunk 的处理状态
 
-    # ❌ 错误：硬件检测
-    # self.hardware_capability = get_hardware_capability()
+    关键：保存原始音频引用，用于熔断回溯
+    """
+    states = []
+    sr = 16000
 
-    # ✅ 正确：使用现有硬件服务
-    detector = get_hardware_detector()
-    self.hardware_info = detector.detect()
+    for i, seg in enumerate(vad_segments):
+        start_sample = int(seg['start'] * sr)
+        end_sample = int(seg['end'] * sr)
+        chunk_audio = audio_array[start_sample:end_sample]
 
-    optimizer = get_hardware_optimizer()
-    self.optimization_config = optimizer.get_optimization_config(self.hardware_info)
+        state = ChunkProcessState(
+            chunk_index=i,
+            start_time=seg['start'],
+            end_time=seg['end'],
+            original_audio=chunk_audio.copy(),  # 关键：保存原始音频副本
+            current_audio=chunk_audio,           # 当前使用的音频（可能被分离后替换）
+            separation_level=SeparationLevel.NONE
+        )
+        states.append(state)
 
-    self.logger.info(
-        f"硬件能力: GPU={self.hardware_info.cuda_available}, "
-        f"显存={max(self.hardware_info.gpu_memory_mb or [0])/1024:.1f}GB"
+    return states
+```
+
+### 4.2 单 Chunk 转录 + 熔断循环
+
+```python
+async def _transcribe_chunk_with_fusing(
+    self,
+    chunk_state: ChunkProcessState,
+    job: JobState,
+    subtitle_manager: StreamingSubtitleManager,
+    demucs_service
+) -> List[SentenceSegment]:
+    """
+    单个 Chunk 的转录流程（含熔断回溯）
+
+    流程：
+    1. 使用 current_audio 进行 SenseVoice 转录
+    2. 评估置信度和事件标签
+    3. 熔断决策
+    4. 如需熔断：回溯到 original_audio，升级分离，重新转录
+    5. 止损点：max_retry=1
+    """
+    from .fuse_breaker import get_fuse_breaker, execute_fuse_upgrade, FuseAction
+
+    fuse_breaker = get_fuse_breaker()
+
+    while True:
+        # 1. SenseVoice 转录
+        sv_result = await self._sensevoice_transcribe(chunk_state.current_audio, job)
+
+        # 2. 分句
+        sentences = self._split_sentences(sv_result, chunk_state.start_time)
+
+        # 3. 计算置信度和事件标签
+        avg_confidence = sum(s.confidence for s in sentences) / len(sentences) if sentences else 0.0
+        event_tag = sv_result.event  # SenseVoice 检测到的事件（BGM/Noise等）
+
+        # 4. 熔断决策
+        decision = fuse_breaker.should_fuse(
+            chunk_state=chunk_state,
+            confidence=avg_confidence,
+            event_tag=event_tag
+        )
+
+        self.logger.debug(
+            f"Chunk {chunk_state.chunk_index} 熔断决策: {decision.action.value}, "
+            f"置信度={avg_confidence:.2f}, 事件={event_tag}"
+        )
+
+        # 5. 处理决策
+        if decision.action == FuseAction.ACCEPT:
+            # 接受结果，推送 SSE，返回
+            for sent in sentences:
+                subtitle_manager.add_sentence(sent)
+            return sentences
+
+        elif decision.action == FuseAction.UPGRADE_SEPARATION:
+            # 熔断回溯：使用原始音频重新分离
+            self.logger.info(
+                f"Chunk {chunk_state.chunk_index} 触发熔断，"
+                f"升级分离: {chunk_state.separation_level.value} → {decision.next_separation_level.value}"
+            )
+
+            chunk_state = execute_fuse_upgrade(
+                chunk_state=chunk_state,
+                next_level=decision.next_separation_level,
+                demucs_service=demucs_service
+            )
+
+            # 继续循环，使用升级后的音频重新转录
+            continue
+
+        else:
+            # 未知动作，接受当前结果
+            for sent in sentences:
+                subtitle_manager.add_sentence(sent)
+            return sentences
+```
+
+### 4.3 熔断升级执行（Phase 2 定义）
+
+```python
+# 来自 Phase 2 的 fuse_breaker.py
+def execute_fuse_upgrade(
+    chunk_state: ChunkProcessState,
+    next_level: SeparationLevel,
+    demucs_service
+) -> ChunkProcessState:
+    """
+    执行熔断升级：使用原始音频重新分离
+
+    关键逻辑：
+    1. 取回 original_audio（分离前的原始音频）
+    2. 使用升级的模型进行分离
+    3. 更新 current_audio
+    4. 增加重试计数
+    """
+    logger.info(
+        f"Chunk {chunk_state.chunk_index} 熔断升级: "
+        f"{chunk_state.separation_level.value} → {next_level.value}"
     )
+
+    # 关键：使用原始音频（分离前）进行重新分离
+    original_audio = chunk_state.original_audio
+    if original_audio is None:
+        logger.error("熔断失败：原始音频引用丢失")
+        return chunk_state
+
+    # 选择模型
+    model_name = "htdemucs" if next_level == SeparationLevel.HTDEMUCS else "mdx_extra"
+
+    # 执行分离
+    separated_audio = demucs_service.separate_chunk(
+        audio=original_audio,
+        model=model_name
+    )
+
+    # 更新状态
+    chunk_state.current_audio = separated_audio
+    chunk_state.separation_level = next_level
+    chunk_state.separation_model_used = model_name
+    chunk_state.fuse_retry_count += 1
+
+    logger.info(f"Chunk {chunk_state.chunk_index} 熔断升级完成，重试次数: {chunk_state.fuse_retry_count}")
+
+    return chunk_state
 ```
 
-### 3.3 主处理流程（SenseVoice 模式）
+---
 
-新增方法（与原版基本相同，仅修改硬件检测部分）：
+## 五、后处理增强层（Whisper补刀等）
+
+> **注意**：本节内容发生在**所有 Chunk 转录完成后**，根据用户配置执行。
+
+### 5.1 Whisper 补刀（仅取文本 + 伪对齐）
+
+**修改位置**: `transcription_service.py`
+
+```python
+async def _whisper_text_patch(
+    self,
+    sentence: SentenceSegment,
+    sentence_index: int,
+    audio_array: np.ndarray,
+    job: JobState,
+    subtitle_manager: StreamingSubtitleManager
+) -> SentenceSegment:
+    """
+    Whisper 补刀（时空解耦版：仅取文本）
+
+    核心原则：
+    - SenseVoice 确定的时间轴（start/end）不可变
+    - 仅使用 Whisper 的文本结果
+    - 新文本使用伪对齐生成字级时间戳
+
+    Args:
+        sentence: 原始句子（由 SenseVoice 生成）
+        sentence_index: 句子索引
+        audio_array: 完整音频数组
+        job: 任务状态
+        subtitle_manager: 流式字幕管理器
+
+    Returns:
+        SentenceSegment: 更新后的句子
+    """
+    from .whisper_service import get_whisper_service
+
+    whisper_service = get_whisper_service()
+
+    # 提取对应时间段的音频（使用 SenseVoice 的时间窗口）
+    sr = 16000
+    start_sample = int(sentence.start * sr)
+    end_sample = int(sentence.end * sr)
+    audio_segment = audio_array[start_sample:end_sample]
+
+    # 获取上下文提示
+    context = subtitle_manager.get_context_window(sentence_index)
+
+    # Whisper 转录（仅取文本，弃用时间戳）
+    result = whisper_service.transcribe(
+        audio=audio_segment,
+        initial_prompt=context,
+        language=job.settings.language,
+        word_timestamps=False  # 不需要字级时间戳，使用伪对齐
+    )
+
+    whisper_text = result.get('text', '').strip()
+
+    if not whisper_text:
+        self.logger.warning(f"Whisper 补刀返回空文本，保留原结果")
+        return sentence
+
+    # 保存 Whisper 备选文本
+    sentence.whisper_alternative = whisper_text
+
+    # 使用伪对齐更新句子
+    subtitle_manager.update_sentence(
+        index=sentence_index,
+        new_text=whisper_text,
+        source=TextSource.WHISPER_PATCH,
+        confidence=self._estimate_whisper_confidence(result)
+    )
+
+    return self.sentences[sentence_index]
+
+
+def _estimate_whisper_confidence(self, result: dict) -> float:
+    """估算 Whisper 结果置信度"""
+    segments = result.get('segments', [])
+    if not segments:
+        return 0.7
+
+    # 基于 avg_logprob 和 no_speech_prob 计算
+    total_logprob = sum(s.get('avg_logprob', -0.5) for s in segments)
+    avg_logprob = total_logprob / len(segments)
+
+    avg_no_speech = sum(s.get('no_speech_prob', 0.1) for s in segments) / len(segments)
+
+    # 转换为 0-1 置信度
+    confidence = min(1.0, max(0.0, 1.0 + avg_logprob))  # logprob 越接近 0 越好
+    confidence *= (1.0 - avg_no_speech)  # no_speech 越低越好
+
+    return round(confidence, 3)
+```
+
+### 5.2 后处理增强调度
+
+```python
+async def _post_process_enhancement(
+    self,
+    sentences: List[SentenceSegment],
+    audio_array: np.ndarray,
+    job: JobState,
+    subtitle_manager: StreamingSubtitleManager,
+    solution_config: SolutionConfig
+) -> List[SentenceSegment]:
+    """
+    后处理增强层（所有 Chunk 转录完成后执行）
+
+    根据用户配置执行：
+    1. 低置信度句子 → Whisper 补刀（仅文本 + 伪对齐）
+    2. [可选] WhisperX 强制对齐
+    3. [可选] LLM 校对
+    4. [可选] LLM 翻译
+
+    注意：这不是熔断，熔断在转录阶段已经处理完成
+    """
+    from .progress_tracker import get_progress_tracker, ProcessPhase
+    from .solution_matrix import EnhancementMode, ProofreadMode, TranslateMode
+    from .thresholds import needs_whisper_patch
+
+    progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
+
+    # 1. 收集需要 Whisper 补刀的句子（根据用户配置）
+    patch_queue = []
+    if solution_config.enhancement != EnhancementMode.OFF:
+        for i, sentence in enumerate(sentences):
+            if needs_whisper_patch(sentence.confidence):
+                patch_queue.append((i, sentence))
+
+    # 2. Whisper 补刀阶段
+    if patch_queue:
+        progress_tracker.start_phase(ProcessPhase.WHISPER_PATCH, len(patch_queue), "Whisper 补刀中...")
+
+        for idx, (sent_idx, sentence) in enumerate(patch_queue):
+            await self._whisper_text_patch(
+                sentence, sent_idx, audio_array, job, subtitle_manager
+            )
+            progress_tracker.update_phase(ProcessPhase.WHISPER_PATCH, increment=1)
+
+        progress_tracker.complete_phase(ProcessPhase.WHISPER_PATCH)
+
+    # 3. [可选] WhisperX 强制对齐
+    if solution_config.enable_whisperx_align:
+        await self._apply_whisperx_alignment(sentences, audio_array, job, subtitle_manager)
+
+    # 4. [可选] LLM 校对
+    if solution_config.proofread != ProofreadMode.OFF:
+        await self._llm_proofread(sentences, job, subtitle_manager, solution_config)
+
+    # 5. [可选] LLM 翻译
+    if solution_config.translate != TranslateMode.OFF:
+        await self._llm_translate(sentences, job, subtitle_manager, solution_config)
+
+    return subtitle_manager.get_all_sentences()
+```
+
+---
+
+## 六、WhisperX 可选模块（新增）
+
+**路径**: `backend/app/services/whisperx_align_service.py`
+
+```python
+"""
+WhisperX 强制对齐服务（可选模块）
+
+使用场景：
+- 卡拉OK 字幕
+- 歌词同步
+- 其他需要极高精度时间轴的场景
+
+成本：较高（需要额外下载对齐模型）
+"""
+import logging
+from typing import List, Optional
+from ..models.sensevoice_models import SentenceSegment, WordTimestamp, TextSource
+
+logger = logging.getLogger(__name__)
+
+
+class WhisperXAlignService:
+    """WhisperX 强制对齐服务"""
+
+    def __init__(self):
+        self.model = None
+        self.align_model = None
+        self.metadata = None
+        self._is_loaded = False
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._is_loaded
+
+    def load_model(self, language: str = "zh"):
+        """加载对齐模型"""
+        if self._is_loaded:
+            return
+
+        try:
+            import whisperx
+            import torch
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            # 加载对齐模型
+            self.align_model, self.metadata = whisperx.load_align_model(
+                language_code=language,
+                device=device
+            )
+
+            self._is_loaded = True
+            logger.info(f"WhisperX 对齐模型已加载 (language={language})")
+
+        except ImportError:
+            logger.error("WhisperX 未安装，请运行: pip install whisperx")
+            raise
+        except Exception as e:
+            logger.error(f"加载 WhisperX 对齐模型失败: {e}")
+            raise
+
+    def unload_model(self):
+        """卸载对齐模型"""
+        if self.align_model is not None:
+            del self.align_model
+            self.align_model = None
+            self.metadata = None
+            self._is_loaded = False
+
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except:
+                pass
+
+            logger.info("WhisperX 对齐模型已卸载")
+
+    def align(
+        self,
+        audio_array,
+        sentence: SentenceSegment,
+        language: str = "zh"
+    ) -> List[WordTimestamp]:
+        """
+        执行强制对齐
+
+        Args:
+            audio_array: 音频数组
+            sentence: 句子段落
+            language: 语言代码
+
+        Returns:
+            List[WordTimestamp]: 精确的字级时间戳
+        """
+        if not self._is_loaded:
+            self.load_model(language)
+
+        try:
+            import whisperx
+
+            # 构造 WhisperX 期望的输入格式
+            segments = [{
+                "start": sentence.start,
+                "end": sentence.end,
+                "text": sentence.text
+            }]
+
+            # 执行对齐
+            result = whisperx.align(
+                segments,
+                self.align_model,
+                self.metadata,
+                audio_array,
+                device="cuda" if self.align_model.device.type == "cuda" else "cpu"
+            )
+
+            # 转换为 WordTimestamp
+            aligned_words = []
+            for seg in result.get("segments", []):
+                for word_info in seg.get("words", []):
+                    aligned_words.append(WordTimestamp(
+                        word=word_info.get("word", ""),
+                        start=word_info.get("start", sentence.start),
+                        end=word_info.get("end", sentence.end),
+                        confidence=word_info.get("score", 1.0),
+                        is_pseudo=False  # 强制对齐的结果
+                    ))
+
+            return aligned_words
+
+        except Exception as e:
+            logger.error(f"WhisperX 对齐失败: {e}")
+            # 返回原有时间戳
+            return sentence.words
+
+
+# ========== 单例访问 ==========
+
+_whisperx_service_instance = None
+
+
+def get_whisperx_align_service() -> WhisperXAlignService:
+    """获取 WhisperX 对齐服务单例"""
+    global _whisperx_service_instance
+    if _whisperx_service_instance is None:
+        _whisperx_service_instance = WhisperXAlignService()
+    return _whisperx_service_instance
+```
+
+---
+
+## 七、主处理流程（v2.1 概念澄清版）
 
 ```python
 async def _process_video_sensevoice(self, job: JobState):
     """
-    SenseVoice 主处理流程
+    SenseVoice 主处理流程（v2.1 概念澄清版）
 
-    Args:
-        job: 任务状态对象
+    流程说明：
+    1-4: 准备阶段（音频提取、VAD、频谱分诊、按需分离）
+    5: 转录阶段（逐Chunk转录 + 熔断回溯）
+    6-9: 后处理增强阶段（Whisper补刀、WhisperX、LLM校对/翻译）
+    10: 输出阶段（生成字幕）
     """
+    from .streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
+    from .progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
+    from .solution_matrix import SolutionConfig
+    from .audio_spectrum_classifier import get_spectrum_classifier
+    from .demucs_service import get_demucs_service
+
+    # 获取方案配置
+    preset_id = getattr(job.settings, 'preset_id', 'default')
+    solution_config = SolutionConfig.from_preset(preset_id)
+
+    # 初始化管理器
+    subtitle_manager = get_streaming_subtitle_manager(job.job_id)
+    progress_tracker = get_progress_tracker(job.job_id, preset_id)
+
     try:
         # 1. 音频提取
-        self._update_progress(job, 'extract', 0, '提取音频...')
+        progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "提取音频...")
         audio_path, audio_array = await self._extract_audio_with_array(job)
-        self._update_progress(job, 'extract', 1, '音频提取完成')
+        progress_tracker.complete_phase(ProcessPhase.EXTRACT)
 
         # 2. VAD 物理切分
-        self._update_progress(job, 'vad', 0, 'VAD 物理切分...')
+        progress_tracker.start_phase(ProcessPhase.VAD, 1, "VAD 切分...")
         vad_segments = await self._vad_physical_split(audio_path, audio_array, job)
-        self._update_progress(job, 'vad', 1, f'VAD 切分完成，{len(vad_segments)} 个片段')
+        progress_tracker.complete_phase(ProcessPhase.VAD)
 
-        # 3. 频谱预判
-        self._update_progress(job, 'bgm_detect', 0, 'BGM 智能检测...')
-        circuit_decisions = await self._spectral_analysis(vad_segments, audio_array, job)
-        segments_to_separate = sum(1 for d in circuit_decisions if d.should_separate)
-        self._update_progress(
-            job, 'bgm_detect', 1,
-            f'检测完成，{segments_to_separate}/{len(vad_segments)} 需分离'
+        # 3. 频谱分诊（Chunk级别）
+        progress_tracker.start_phase(ProcessPhase.BGM_DETECT, 1, "频谱分诊...")
+        spectrum_classifier = get_spectrum_classifier()
+        diagnoses = spectrum_classifier.diagnose_chunks(
+            [(audio_array[int(s['start']*16000):int(s['end']*16000)], s['start'], s['end'])
+             for s in vad_segments]
         )
+        progress_tracker.complete_phase(ProcessPhase.BGM_DETECT)
 
-        # 4. 按需人声分离
-        if segments_to_separate > 0:
-            processed_segments = await self._smart_separation(
-                vad_segments, circuit_decisions, audio_array, job
+        # 4. 初始化 Chunk 状态 + 按需人声分离
+        # 【关键】保存原始音频到 ChunkProcessState.original_audio
+        chunk_states = self._init_chunk_states(vad_segments, audio_array)
+        demucs_service = get_demucs_service()
+
+        chunks_to_separate = [(i, chunk_states[i], diagnoses[i])
+                              for i in range(len(diagnoses))
+                              if diagnoses[i].need_separation]
+
+        if chunks_to_separate:
+            progress_tracker.start_phase(ProcessPhase.DEMUCS, len(chunks_to_separate), "人声分离...")
+            for sep_idx, (chunk_idx, chunk_state, diag) in enumerate(chunks_to_separate):
+                # 执行分离，更新 current_audio
+                separated_audio = await demucs_service.separate_chunk(
+                    audio=chunk_state.original_audio,
+                    model=diag.recommended_model
+                )
+                chunk_state.current_audio = separated_audio
+                chunk_state.separation_level = (
+                    SeparationLevel.HTDEMUCS if diag.recommended_model == "htdemucs"
+                    else SeparationLevel.MDX_EXTRA
+                )
+                chunk_state.separation_model_used = diag.recommended_model
+                progress_tracker.update_phase(ProcessPhase.DEMUCS, increment=1)
+            progress_tracker.complete_phase(ProcessPhase.DEMUCS)
+
+        # 5. 逐Chunk转录 + 熔断回溯（转录层核心）
+        progress_tracker.start_phase(ProcessPhase.SENSEVOICE, len(chunk_states), "SenseVoice 转录...")
+        all_sentences = []
+
+        for chunk_state in chunk_states:
+            # 单个 Chunk 转录（含熔断回溯循环）
+            sentences = await self._transcribe_chunk_with_fusing(
+                chunk_state=chunk_state,
+                job=job,
+                subtitle_manager=subtitle_manager,
+                demucs_service=demucs_service
             )
-        else:
-            processed_segments = vad_segments
+            all_sentences.extend(sentences)
+            progress_tracker.update_phase(ProcessPhase.SENSEVOICE, increment=1)
 
-        # 5. SenseVoice 转录 + 分句
-        self._update_progress(job, 'transcribe', 0, '开始转录...')
-        transcript_results = await self._transcribe_with_sensevoice(
-            processed_segments, audio_array, job
-        )
-        self._update_progress(job, 'transcribe', 1, f'转录完成，{len(transcript_results)} 个句子')
+        progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
 
-        # 6. 熔断检查 + Whisper 补刀
-        final_results = await self._fuse_and_retry(
-            transcript_results, processed_segments, audio_array, job
+        # ═══════════════════════════════════════════════════════════════
+        # 后处理增强层（所有 Chunk 转录完成后，根据用户配置执行）
+        # ═══════════════════════════════════════════════════════════════
+
+        # 6. 后处理增强（Whisper补刀、WhisperX、LLM校对/翻译）
+        final_results = await self._post_process_enhancement(
+            all_sentences, audio_array, job, subtitle_manager, solution_config
         )
 
         # 7. 生成字幕
-        self._update_progress(job, 'srt', 0, '生成字幕...')
+        progress_tracker.start_phase(ProcessPhase.SRT, 1, "生成字幕...")
         await self._generate_subtitle_from_sentences(final_results, job)
-        self._update_progress(job, 'srt', 1, '字幕生成完成')
+        progress_tracker.complete_phase(ProcessPhase.SRT)
 
         # 8. 完成
         job.status = 'completed'
-        self._update_progress(job, 'complete', 1, '处理完成')
+        push_signal_event(get_sse_manager(), job.job_id, "job_complete", "处理完成")
 
     except Exception as e:
         self.logger.error(f"SenseVoice 处理失败: {e}", exc_info=True)
         job.status = 'failed'
         job.error = str(e)
+        push_signal_event(get_sse_manager(), job.job_id, "job_failed", str(e))
         raise
-```
 
-### 3.4 VAD 物理切分
-
-（与原版相同，无需修改）
-
-### 3.5 频谱预判
-
-（与原版相同，无需修改）
-
-### 3.6 智能分离（⚠️ 修订）
-
-```python
-async def _smart_separation(
-    self,
-    vad_segments: List[dict],
-    circuit_decisions: List,
-    audio_array: np.ndarray,
-    job: JobState
-) -> List[dict]:
-    """
-    智能分离（按需）
-
-    Args:
-        vad_segments: VAD 片段列表
-        circuit_decisions: 频谱决策列表
-        audio_array: 音频数组
-        job: 任务状态
-
-    Returns:
-        List[dict]: 处理后的片段列表
-    """
-    from .demucs_service import get_demucs_service
-
-    # 收集需要分离的片段
-    segments_to_separate = [
-        (i, seg) for i, (seg, decision) in enumerate(zip(vad_segments, circuit_decisions))
-        if decision.should_separate
-    ]
-
-    if not segments_to_separate:
-        self.logger.info("无需人声分离")
-        return vad_segments
-
-    # ❌ 错误：检查硬件配置
-    # if not self.hardware_capability.has_gpu:
-
-    # ✅ 正确：使用现有硬件信息
-    if not self.hardware_info.cuda_available:
-        self.logger.warning("无 GPU，跳过人声分离")
-        return vad_segments
-
-    # 加载 Demucs 模型
-    demucs_service = get_demucs_service()
-
-    # ❌ 错误：获取推荐模型
-    # model_name = self.hardware_capability.recommended_config.get('demucs_model', 'htdemucs')
-
-    # ✅ 正确：使用优化配置
-    model_name = self.optimization_config.demucs_model
-
-    if model_name is None or not self.optimization_config.enable_demucs:
-        self.logger.warning("硬件配置禁用人声分离")
-        return vad_segments
-
-    demucs_service.set_model(model_name)
-
-    self._update_progress(job, 'demucs', 0, f'人声分离 ({model_name})...')
-
-    # 逐片段分离
-    processed_segments = vad_segments.copy()
-
-    for idx, (seg_idx, seg) in enumerate(segments_to_separate):
-        # 分离人声
-        separated_path = await self._separate_segment(
-            seg, audio_array, demucs_service
-        )
-
-        # 更新片段路径
-        processed_segments[seg_idx]['file'] = separated_path
-        processed_segments[seg_idx]['separated'] = True
-
-        # 进度更新
-        progress = (idx + 1) / len(segments_to_separate)
-        self._update_progress(
-            job, 'demucs', progress,
-            f'人声分离 {idx+1}/{len(segments_to_separate)}'
-        )
-
-    # 卸载 Demucs
-    demucs_service.unload_model()
-
-    return processed_segments
-```
-
-### 3.7 SenseVoice 转录 + 分句
-
-（与原版相同，无需修改）
-
-### 3.8 熔断 + 补刀
-
-（与原版相同，无需修改）
-
-### 3.9 Whisper 补刀
-
-（与原版相同，无需修改）
-
-### 3.10 句级 SSE 推送（⚠️ 重要修订）
-
-```python
-async def _push_sse_sentence(self, job: JobState, sentence: SentenceSegment):
-    """
-    推送句级 SSE 事件
-
-    Args:
-        job: 任务状态
-        sentence: 句子段落
-    """
-    try:
-        # ❌ 错误：使用不存在的 API
-        # from .sse_service import get_sse_service
-        # sse_service = get_sse_service()
-        # await sse_service.push_event(...)
-
-        # ✅ 正确：使用现有 SSE 管理器
-        from .sse_service import get_sse_manager
-
-        sse_manager = get_sse_manager()
-
-        event_data = {
-            'text': sentence.text,
-            'start': sentence.start,
-            'end': sentence.end,
-            'confidence': sentence.confidence,
-            'is_final': True,
-            'source': 'sensevoice'
-        }
-
-        # ✅ 正确：使用 broadcast_sync（因为可能在后台线程调用）
-        sse_manager.broadcast_sync(
-            channel_id=f"job:{job.job_id}",
-            event='sentence',
-            data=event_data
-        )
-
-    except Exception as e:
-        self.logger.error(f"SSE 推送失败: {e}")
-```
-
-### 3.11 生成字幕
-
-（与原版相同，无需修改）
-
----
-
-## 四、模型管理集成（⚠️ 重要修订）
-
-修改 `backend/app/services/model_preload_manager.py`，新增 SenseVoice 管理：
-
-```python
-class ModelPreloadManager:
-    def __init__(self, config=None):
-        # ... 现有代码 ...
-
-        # 新增：SenseVoice 缓存（单例模式）
-        self._sensevoice_service = None
-
-    def get_sensevoice_model(self):
-        """
-        获取 SenseVoice 模型（单例）
-
-        ✅ 使用现有的全局锁保证线程安全
-        """
-        with self._global_lock:  # ✅ 使用现有锁
-            if self._sensevoice_service is None:
-                from .sensevoice_onnx_service import get_sensevoice_service
-                self._sensevoice_service = get_sensevoice_service()
-
-                if not self._sensevoice_service.is_loaded:
-                    self._sensevoice_service.load_model()
-
-                # 更新缓存版本
-                self._preload_status["cache_version"] = int(time.time())
-                self.logger.info("SenseVoice 模型已加载到缓存")
-
-            return self._sensevoice_service
-
-    def unload_sensevoice(self):
-        """
-        卸载 SenseVoice 模型
-
-        ✅ 使用现有的全局锁保证线程安全
-        """
-        with self._global_lock:  # ✅ 使用现有锁
-            if self._sensevoice_service is not None:
-                self._sensevoice_service.unload_model()
-                self._sensevoice_service = None
-
-                # 更新缓存版本
-                self._preload_status["cache_version"] = int(time.time())
-                self.logger.info("SenseVoice 模型已卸载")
-
-    def clear_cache(self):
-        """清空所有缓存（扩展）"""
-        with self._global_lock:
-            # ... 现有清理代码 ...
-
-            # 新增：清理 SenseVoice
-            self.unload_sensevoice()
-
-            self.logger.info("所有模型缓存已清空")
-```
-
-**重要说明**：
-- ✅ 必须使用现有的 `self._global_lock` 而非创建新锁
-- ✅ 必须更新 `self._preload_status["cache_version"]` 以保持统一
-- ✅ 遵循现有的日志记录规范
-
----
-
-## 五、进度更新方法修订（⚠️ 重要）
-
-修改 `_update_progress` 方法以支持动态权重：
-
-```python
-def _update_progress(self, job, phase, phase_ratio, message=""):
-    """
-    更新进度（支持动态权重）
-
-    ✅ 使用动态权重计算，适配 SenseVoice 引擎
-    """
-    from core.config import config
-
-    # 动态获取引擎
-    engine = getattr(job.settings, 'engine', 'whisperx')
-
-    # 动态计算权重
-    phase_weights = config.calculate_dynamic_weights(
-        engine=engine,
-        total_segments=getattr(job, 'total_segments', 100),
-        segments_to_separate=getattr(job, 'segments_to_separate', 0),
-        segments_to_retry=getattr(job, 'segments_to_retry', 0)
-    )
-
-    # 计算累计进度（使用动态权重）
-    phase_order = ['pending', 'extract', 'bgm_detect', 'demucs_global', 'split', 'transcribe', 'align', 'srt', 'complete']
-
-    try:
-        current_phase_index = phase_order.index(phase)
-        done_phases = phase_order[:current_phase_index]
-    except ValueError:
-        # 如果阶段不在标准列表中（如 'retry'），直接跳过
-        done_phases = []
-
-    done_weight = sum(phase_weights.get(p, 0) for p in done_phases)
-    current_weight = phase_weights.get(phase, 0) * phase_ratio
-    total_weight = 100
-
-    job.progress = round((done_weight + current_weight) / total_weight * 100, 1)
-    job.phase = phase
-    job.phase_percent = round(phase_ratio * 100, 1)
-    job.message = message
-
-    # ✅ 正确：推送 SSE（使用现有管理器）
-    from .sse_service import get_sse_manager
-
-    sse_manager = get_sse_manager()
-    sse_manager.broadcast_sync(
-        channel_id=f"job:{job.job_id}",
-        event="progress",
-        data={
-            "phase": phase,
-            "progress": job.progress,
-            "phase_percent": job.phase_percent,
-            "message": message
-        }
-    )
+    finally:
+        # 清理资源
+        remove_streaming_subtitle_manager(job.job_id)
+        remove_progress_tracker(job.job_id)
 ```
 
 ---
 
-## 六、快速测试（修订版）
+## 八、验收标准（扩展）
 
-创建端到端测试脚本：
+### 基础功能
 
-**路径**: `backend/test_phase3_revised.py`
-
-```python
-"""
-Phase 3 端到端测试脚本（修订版）
-"""
-import sys
-from pathlib import Path
-import asyncio
-
-# 添加项目根目录到路径
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-
-from app.services.transcription_service import TranscriptionService
-from app.models.job_models import JobState, JobSettings
-# ✅ 测试现有硬件服务
-from app.services.hardware_service import get_hardware_detector, get_hardware_optimizer
-
-
-async def test_hardware_integration():
-    """测试硬件服务集成"""
-    print("\n=== 测试硬件服务集成 ===")
-
-    detector = get_hardware_detector()
-    hardware_info = detector.detect()
-
-    print(f"GPU 可用: {hardware_info.cuda_available}")
-    print(f"GPU 名称: {hardware_info.gpu_name}")
-    print(f"GPU 显存: {hardware_info.gpu_memory_mb}")
-
-    optimizer = get_hardware_optimizer()
-    config = optimizer.get_optimization_config(hardware_info)
-
-    print(f"\n优化配置:")
-    print(f"  SenseVoice 设备: {config.sensevoice_device}")
-    print(f"  启用 Demucs: {config.enable_demucs}")
-    print(f"  Demucs 模型: {config.demucs_model}")
-    print(f"  说明: {config.note}")
-
-
-async def test_sensevoice_pipeline():
-    """测试 SenseVoice 完整流程"""
-    print("\n=== 测试 SenseVoice 完整流程 ===")
-
-    # 创建测试任务
-    job = JobState(
-        job_id="test_001",
-        input_path="test_data/test_video.mp4",
-        output_path="test_data/test_output.srt",
-        settings=JobSettings(
-            engine='sensevoice'
-        )
-    )
-
-    # 创建转录服务
-    service = TranscriptionService()
-
-    try:
-        # 执行转录
-        await service._process_video_sensevoice(job)
-
-        print(f"\n任务状态: {job.status}")
-        print(f"输出文件: {job.output_path}")
-
-    except Exception as e:
-        print(f"测试失败: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    asyncio.run(test_hardware_integration())
-    asyncio.run(test_sensevoice_pipeline())
-
-    print("\n=== Phase 3 测试完成 ===")
-```
-
----
-
-## 七、验收标准
-
-- [ ] 完整流程可运行（即使部分功能未完全实现）
+- [ ] 完整流程可运行
 - [ ] VAD 物理切分正常工作
-- [ ] 频谱预判可正确识别 BGM
 - [ ] 分句算法输出句级粒度字幕
-- [ ] 熔断机制正确触发
 - [ ] 字幕文件成功生成
-- [ ] **使用现有硬件服务，不创建重复代码**
-- [ ] **SSE 推送使用正确的 API**
-- [ ] **模型预加载使用现有全局锁**
 
----
+### VAD优先 + 频谱分诊（v2.1核心）
 
-## 八、注意事项
+- [ ] 流程顺序正确：`音频提取 → VAD → 频谱分诊 → 按需分离 → 转录`
+- [ ] 频谱分诊在每个VAD Chunk上独立执行
+- [ ] 纯净Chunk直接跳过分离，节省时间
+- [ ] 分离模型根据分诊结果动态选择（htdemucs/mdx_extra）
 
-1. **渐进实现**：
-   - 先实现核心流程框架
-   - 部分功能可暂时用 TODO 标记
-   - 确保主流程可运行
+### 熔断回溯机制（v2.1核心新增）
 
-2. **显存管理**：
-   - 确保模型严格串行化加载
-   - Demucs 用完立即卸载
-   - SenseVoice 和 Whisper 不同时加载
+- [ ] `ChunkProcessState` 正确保存 `original_audio`（分离前的原始音频）
+- [ ] 熔断触发时使用 `original_audio` 重新分离，而非 `current_audio`
+- [ ] 熔断后 `separation_level` 正确升级（NONE→HTDEMUCS→MDX_EXTRA）
+- [ ] 止损点机制生效（`max_fuse_retry=1`）
+- [ ] 熔断仅在 BGM/Noise 标签 + 低置信度时触发
+- [ ] 熔断不影响无 BGM 标签的低置信度句子（由后处理增强处理）
 
-3. **错误处理**：
-   - 每个步骤都要有异常捕获
-   - 失败后更新任务状态
-   - 记录详细日志
+### 后处理增强层
 
-4. **⚠️ 代码复用原则**（关键）：
-   - ✅ 使用 `get_hardware_detector()` 而非创建新检测器
-   - ✅ 使用 `get_sse_manager()` 而非 `get_sse_service()`
-   - ✅ 使用 `broadcast_sync()` 而非 `push_event()`
-   - ✅ 扩展现有类而非创建新类
+- [ ] Whisper 补刀发生在**所有 Chunk 转录完成后**
+- [ ] 仅当用户配置 `enhancement != OFF` 时才执行 Whisper 补刀
+- [ ] Whisper 补刀**仅使用文本**，时间戳不变
+- [ ] 伪对齐正确生成字级时间戳
+- [ ] `SentenceSegment.source` 正确标记来源
+- [ ] WhisperX 作为可选模块正常工作
+
+### 流式输出系统
+
+- [ ] `StreamingSubtitleManager` 正确管理句子列表
+- [ ] SSE 事件使用统一 Tag（`subtitle.sv_sentence`, `subtitle.whisper_patch` 等）
+- [ ] 多阶段更新正确推送到前端
+
+### 性能验证
+
+- [ ] 连续处理 3 个视频不 OOM
+- [ ] 进度条平滑无跳跃
 
 ---
 
 ## 九、下一步
 
-完成 Phase 3（修订版）后，进入 [Phase 4: 前端适配（修订版）](./04_Phase4_前端适配_修订版.md)
+完成 Phase 3（修订版 v2.1）后，进入 [Phase 4: 前端适配（修订版）](./04_Phase4_前端适配_修订版.md)
