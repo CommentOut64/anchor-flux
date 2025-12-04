@@ -39,6 +39,7 @@ from api.routes import model_routes
 from api.routes import media_routes  # 新增：媒体资源路由
 from api.routes.transcription_routes import create_transcription_router
 from api.routes.demucs_routes import create_demucs_router  # 新增：Demucs配置路由
+from api.routes import system_routes  # 新增：系统管理路由
 from services.file_service import FileManagementService
 
 # 导入FFmpeg管理器
@@ -60,6 +61,7 @@ app.add_middleware(
 # 注册API路由
 app.include_router(model_routes.router)
 app.include_router(media_routes.router)  # 新增：媒体资源路由
+app.include_router(system_routes.router)  # 新增：系统管理路由
 
 # 注册Demucs配置路由（需要在转录路由之前注册）
 demucs_router = create_demucs_router()
@@ -125,6 +127,9 @@ async def startup_event():
 
         # 不在启动时预加载模型，等待前端就绪后通过API调用
         logger.info("后端服务已就绪，等待前端启动后进行模型预加载")
+
+        # 6. 延迟检查并打开浏览器（如果没有活跃客户端）
+        asyncio.create_task(open_browser_if_needed())
 
         logger.info("=" * 60)
         logger.info("服务启动完成")
@@ -727,6 +732,38 @@ async def delayed_shutdown():
     logger.info("服务器即将关闭...")
     import os
     os._exit(0)
+
+
+async def open_browser_if_needed():
+    """启动后检查是否需要打开浏览器"""
+    # 等待3秒，让可能存在的前端页面有时间发送心跳
+    await asyncio.sleep(3)
+
+    from services.client_registry import get_client_registry
+    from services.sse_service import get_sse_manager
+
+    client_registry = get_client_registry()
+    sse_manager = get_sse_manager()
+
+    if not client_registry.has_active_clients():
+        # 没有活跃客户端，打开新标签页
+        logger.info("没有检测到活跃的浏览器标签页，正在打开新标签页...")
+        try:
+            import webbrowser
+            webbrowser.open("http://localhost:5173")
+            logger.info("浏览器标签页已打开: http://localhost:5173")
+        except Exception as e:
+            logger.error(f"打开浏览器失败: {e}")
+    else:
+        # 已有活跃客户端，通过 SSE 通知前端刷新（可选）
+        active_count = client_registry.get_active_count()
+        logger.info(f"检测到活跃的浏览器标签页: {active_count}个，复用现有标签页")
+        # 发送 SSE 事件通知前端后端已重启
+        try:
+            sse_manager.broadcast("system", {"type": "backend_restarted", "timestamp": time.time()})
+        except Exception as e:
+            logger.warning(f"发送SSE通知失败: {e}")
+
 
 if __name__ == "__main__":
     import uvicorn

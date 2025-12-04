@@ -7,11 +7,13 @@
  * - 全局 SSE 事件监听
  * - 自动跳转到编辑器（转录完成时）
  * - 全局任务状态同步
+ * - 启动心跳服务（标签页重用机制）
  */
 import { onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import sseChannelManager from '@/services/sseChannelManager'
+import { heartbeatService } from '@/services/heartbeat'
 
 const router = useRouter()
 const route = useRoute()
@@ -21,6 +23,15 @@ let unsubscribeGlobal = null
 
 onMounted(async () => {
   console.log('[App] 应用已挂载，执行初始化')
+
+  // 第零步：启动心跳服务
+  console.log('[App] 步骤 0: 启动心跳服务...')
+  try {
+    await heartbeatService.start()
+    console.log('[App] 心跳服务已启动')
+  } catch (error) {
+    console.error('[App] 心跳服务启动失败:', error)
+  }
 
   // 第一步：从后端同步任务列表（第一阶段修复：数据同步）
   console.log('[App] 步骤 1: 从后端同步任务列表...')
@@ -170,6 +181,9 @@ onUnmounted(() => {
   if (unsubscribeGlobal) {
     unsubscribeGlobal()
   }
+
+  // 停止心跳服务
+  heartbeatService.stop()
 })
 </script>
 

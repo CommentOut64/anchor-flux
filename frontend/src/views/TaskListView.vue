@@ -17,6 +17,9 @@
           <el-icon><Upload /></el-icon>
           上传视频
         </el-button>
+        <el-button type="danger" @click="handleExit">
+          退出系统
+        </el-button>
       </div>
     </header>
 
@@ -300,7 +303,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
 import { useRouter } from "vue-router";
-import { ElMessage, ElMessageBox } from "element-plus";
+import { ElMessage, ElMessageBox, ElLoading } from "element-plus";
 import {
   Upload,
   UploadFilled,
@@ -311,7 +314,7 @@ import {
   Close,
 } from "@element-plus/icons-vue";
 import { useUnifiedTaskStore } from "@/stores/unifiedTaskStore";
-import { transcriptionApi } from "@/services/api";
+import { transcriptionApi, systemApi } from "@/services/api";
 import fileApi from "@/services/api/fileApi"; // 导入文件 API
 import sseChannelManager from "@/services/sseChannelManager"; // 导入 SSE 频道管理器
 
@@ -869,6 +872,49 @@ async function getThumbnailUrl(jobId, forceReload = false) {
     // 失败时也设置为null（而非undefined），这样至少显示占位符
     thumbnailCache.value[jobId] = null;
     return null;
+  }
+}
+
+// 处理退出系统
+async function handleExit() {
+  try {
+    await ElMessageBox.confirm(
+      '确定要退出系统吗？\n\n运行中的任务会自动保存进度，下次启动时继续执行。',
+      '确认退出',
+      {
+        confirmButtonText: '确定退出',
+        cancelButtonText: '取消',
+        type: 'warning',
+      }
+    )
+
+    // 显示关闭进度
+    const loading = ElLoading.service({
+      text: '正在安全关闭系统...',
+      background: 'rgba(0, 0, 0, 0.7)'
+    })
+
+    try {
+      // 调用后端 shutdown API
+      await systemApi.shutdownSystem()
+    } catch (e) {
+      // 请求可能因后端关闭而失败，这是预期行为
+      console.log('[Exit] 后端已关闭:', e)
+    }
+
+    loading.close()
+
+    // 显示关闭完成提示
+    await ElMessageBox.alert(
+      '系统已安全关闭。\n\n请手动关闭此浏览器标签页。\n下次启动时，运行中的任务将自动恢复。',
+      '关闭完成',
+      { type: 'success' }
+    )
+  } catch (error) {
+    // 用户取消退出
+    if (error !== 'cancel') {
+      console.error('[Exit] 退出失败:', error)
+    }
   }
 }
 </script>
