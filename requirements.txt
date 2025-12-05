@@ -7,6 +7,7 @@ click
 colorama
 filelock
 psutil
+intel-openmp  # fbgemm.dll 需要的 OpenMP 运行时
 
 # --- 数值计算 (严格锁定兼容性) ---
 # 必须 < 2.0.0 以兼容现有生态
@@ -41,6 +42,7 @@ librosa
 soundfile
 ffmpeg-python
 av
+pydub
 
 # --- 人声分离 ---
 demucs==4.0.1
