@@ -51,12 +51,6 @@
 
 - [ ] 导出菜单
 - [ ] 幽灵任务，队列完成后出现
-
-[media] FFprobe 成功获取时长: 60.000000秒
-[media] 动态采样：时长60.0s → 4000个采样点
-
-16:48:34.973 [ERROR] [transcription_service] 删除任务数据失败: [WinError 32] 另一个程序正在使用此文件，进程无法访问。: 'F:\\video_to_srt_gpu\\jobs\\83e074e836ef4681894f6d1798d8e002\\test_video.mp4'
-
 - [ ] 快捷键
 - [ ] 后端写入日志
 
@@ -66,3 +60,18 @@
 
 11.校对
 
+
+
+目前项目放在miniconda环境中，我需要：
+
+1.将目前miniconda环境换成uv
+
+2.彻底清除whisperx及其依赖，改为使用faster-whisper，清除代码中所有相关的引用
+
+3.整理requirements.txt，删除不必要的，解决所有依赖版本冲突，使用修改过的requirements.txt构建uv环境（新的已经在F:\video_to_srt_gpu\docs\迁移到uv下，但你需要再次检查）
+
+4.保留当前项目目录结构，但改为嵌入式 Python (Embedded Python) + 虚拟环境 + 启动脚本，把 CUDA 和 cuDNN 的运行库（DLL 文件）嵌入进去，为未来打包发布做准备，未来所有开发都会以嵌入式python为基础
+
+5.归档所有有关whisperx的无用的文件
+
+参考F:\video_to_srt_gpu\docs\迁移到uv下的文档，生成一份完整的开发文档，包括从零开始构建uv环境，按照正确顺序安装依赖，修改项目代码，完成所有迁移到嵌入式 Python的步骤

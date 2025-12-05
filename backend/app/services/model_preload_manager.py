@@ -60,14 +60,17 @@ class ModelPreloadManager:
     def __init__(self, config: PreloadConfig = None):
         self.config = config or PreloadConfig()
         self.logger = self._setup_logger()
-        
+
         # 模型缓存 (LRU)
         self._whisper_cache: OrderedDict[Tuple[str, str, str], ModelCacheInfo] = OrderedDict()
         self._align_cache: OrderedDict[str, Tuple[Any, Any, float]] = OrderedDict()
-        
+
+        # SenseVoice 模型缓存（单例模式）
+        self._sensevoice_service = None
+
         # 统一锁 - 简化并发控制，避免多锁死锁
         self._global_lock = threading.RLock()
-        
+
         # 简化的预加载状态 - 单一数据源
         self._preload_status = {
             "is_preloading": False,
@@ -82,13 +85,13 @@ class ModelPreloadManager:
             "retry_cooldown": 30,
             "cache_version": int(time.time())  # 缓存版本号，用于状态同步
         }
-        
+
         # 预加载任务管理 - 实现幂等性
         self._preload_promise: Optional[asyncio.Task] = None
-        
+
         # 内存监控
         self._memory_monitor = MemoryMonitor()
-        
+
         self.logger.info("ModelPreloadManager初始化完成 - 简化架构")
     
     def _setup_logger(self) -> logging.Logger:
@@ -606,15 +609,18 @@ class ModelPreloadManager:
             whisper_count = len(self._whisper_cache)
             align_count = len(self._align_cache)
             total_memory = sum(info.memory_size for info in self._whisper_cache.values())
-            
+
             # 清理Whisper模型缓存
             for info in self._whisper_cache.values():
                 del info.model
             self._whisper_cache.clear()
-            
+
             # 清理对齐模型缓存
             self._align_cache.clear()
-            
+
+            # 清理 SenseVoice 模型缓存
+            self.unload_sensevoice()
+
             # 立即更新预加载状态 - 解决状态同步问题
             self._preload_status.update({
                 "loaded_models": 0,
@@ -624,12 +630,12 @@ class ModelPreloadManager:
                 "errors": [],
                 "cache_version": int(time.time())  # 更新缓存版本号
             })
-            
+
         # 垃圾回收和GPU内存清理
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
+
         self.logger.info(f"已清空所有模型缓存: Whisper={whisper_count}个, 对齐={align_count}个, 释放内存={total_memory}MB")
 
     def evict_model(self, model_id: str, device: str = "cuda", compute_type: str = "float16"):
@@ -678,6 +684,66 @@ class ModelPreloadManager:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # ========== SenseVoice 模型管理 ==========
+
+    def get_sensevoice_model(self):
+        """获取 SenseVoice 模型（单例）"""
+        with self._global_lock:
+            if self._sensevoice_service is None:
+                try:
+                    from services.sensevoice_onnx_service import get_sensevoice_service
+                    self._sensevoice_service = get_sensevoice_service()
+
+                    if not self._sensevoice_service.is_loaded:
+                        self._sensevoice_service.load_model()
+
+                    # 更新缓存版本
+                    self._preload_status["cache_version"] = int(time.time())
+                    self.logger.info("SenseVoice 模型已加载到缓存")
+
+                except Exception as e:
+                    self.logger.error(f"加载 SenseVoice 模型失败: {e}")
+                    self._sensevoice_service = None
+                    raise
+
+            return self._sensevoice_service
+
+    def unload_sensevoice(self):
+        """卸载 SenseVoice 模型"""
+        with self._global_lock:
+            if self._sensevoice_service is not None:
+                try:
+                    self._sensevoice_service.unload_model()
+                    self._sensevoice_service = None
+
+                    # 更新缓存版本
+                    self._preload_status["cache_version"] = int(time.time())
+
+                    self.logger.info("SenseVoice 模型已卸载")
+                except Exception as e:
+                    self.logger.error(f"卸载 SenseVoice 模型失败: {e}")
+
+        # 垃圾回收和GPU内存清理
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def unload_demucs(self):
+        """
+        卸载 Demucs 模型（显式释放显存）
+
+        注意：Demucs 模型通常在 transcription_service 中管理
+        此方法提供统一的显存释放接口
+        """
+        with self._global_lock:
+            self.logger.info("触发 Demucs 显存释放")
+
+        # 垃圾回收和GPU内存清理
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            self.logger.info("PyTorch 显存已释放")
 
     # ========== 单模型管理接口 - 委托给模型管理服务 ==========
 

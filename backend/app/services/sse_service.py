@@ -306,6 +306,69 @@ class SSEManager:
         }
 
 
+# ========== SSE 事件 Tag 定义（SenseVoice 扩展）==========
+
+# 进度事件 Tag
+SSE_PROGRESS_TAGS = {
+    "progress.overall": "总体进度更新",
+    "progress.extract": "音频提取进度",
+    "progress.bgm_detect": "BGM 检测进度",
+    "progress.spectrum_analysis": "频谱分诊进度",
+    "progress.demucs": "人声分离进度",
+    "progress.vad": "VAD 分段进度",
+    "progress.sensevoice": "SenseVoice 转录进度（流式）",
+    "progress.whisper": "Whisper 补刀进度",
+    "progress.whisperx": "WhisperX 对齐进度",
+    "progress.llm_proof": "LLM 校对进度",
+    "progress.llm_trans": "LLM 翻译进度",
+    "progress.srt": "SRT 生成进度",
+}
+
+# 字幕流式事件 Tag
+SSE_SUBTITLE_TAGS = {
+    "subtitle.sv_segment": "SenseVoice 完成一个 VAD 段",
+    "subtitle.sv_sentence": "SenseVoice 完成一个句子",
+    "subtitle.whisper_patch": "Whisper 补刀覆盖一个句子",
+    "subtitle.llm_proof": "LLM 校对覆盖一个句子",
+    "subtitle.llm_trans": "LLM 翻译完成一个句子",
+    "subtitle.batch_update": "批量更新多个句子",
+}
+
+# 信号事件 Tag
+SSE_SIGNAL_TAGS = {
+    "signal.job_start": "任务开始",
+    "signal.job_complete": "任务完成",
+    "signal.job_failed": "任务失败",
+    "signal.phase_start": "阶段开始",
+    "signal.phase_complete": "阶段完成",
+    "signal.circuit_breaker": "熔断触发",
+    "signal.model_upgrade": "模型升级",
+}
+
+
+# ========== SSE 推送辅助方法 ==========
+
+def push_progress_event(sse_manager: SSEManager, job_id: str, phase: str, data: dict):
+    """推送进度事件"""
+    tag = f"progress.{phase}"
+    channel_id = f"job:{job_id}"
+    sse_manager.broadcast_sync(channel_id, tag, data)
+
+
+def push_subtitle_event(sse_manager: SSEManager, job_id: str, event_type: str, sentence_data: dict):
+    """推送字幕流式事件"""
+    tag = f"subtitle.{event_type}"
+    channel_id = f"job:{job_id}"
+    sse_manager.broadcast_sync(channel_id, tag, sentence_data)
+
+
+def push_signal_event(sse_manager: SSEManager, job_id: str, signal_type: str, message: str = ""):
+    """推送信号事件"""
+    tag = f"signal.{signal_type}"
+    channel_id = f"job:{job_id}"
+    sse_manager.broadcast_sync(channel_id, tag, {"job_id": job_id, "signal": signal_type, "message": message})
+
+
 # ========== 单例模式 ==========
 
 _sse_manager_instance: Optional[SSEManager] = None

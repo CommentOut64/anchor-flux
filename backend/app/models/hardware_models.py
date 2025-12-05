@@ -68,11 +68,19 @@ class OptimizationConfig:
     concurrency: int = 1
     use_memory_mapping: bool = False
     cpu_affinity_cores: List[int] = field(default_factory=list)
-    
+
     # 推荐设备选择
     recommended_device: str = "cpu"
     recommended_model: str = "medium"  # 添加推荐模型
-    
+
+    # SenseVoice 相关配置
+    enable_sensevoice: bool = True
+    enable_demucs: bool = True
+    demucs_model: str = "htdemucs"  # htdemucs, mdx_extra
+    sensevoice_device: str = "cuda"  # cuda 或 cpu
+    sensevoice_quantize: bool = True  # 是否使用量化模型
+    note: str = ""
+
     def to_dict(self) -> Dict:
         """转换为字典格式"""
         return {
@@ -82,9 +90,19 @@ class OptimizationConfig:
                 "device": self.recommended_device,
                 "recommended_model": self.recommended_model
             },
+            "sensevoice": {
+                "enable": self.enable_sensevoice,
+                "device": self.sensevoice_device,
+                "quantize": self.sensevoice_quantize
+            },
+            "demucs": {
+                "enable": self.enable_demucs,
+                "model": self.demucs_model
+            },
             "system": {
                 "use_memory_mapping": self.use_memory_mapping,
                 "cpu_affinity_cores": self.cpu_affinity_cores,
-                "process_priority": "normal"  # 添加进程优先级字段
+                "process_priority": "normal",  # 添加进程优先级字段
+                "note": self.note
             }
         }
