@@ -2,7 +2,26 @@
 
 这些文件已被废弃，仅保留作为历史参考。
 
-## 归档文件列表
+## 目录结构
+
+```
+archive/
+├── README.md              # 本文件
+├── requirements.txt       # 旧的 conda 环境导出（含 whisperx）
+├── backend_legacy/        # 废弃的后端代码
+│   ├── debug_main.py
+│   ├── main_refactored.py
+│   ├── main_simple.py
+│   ├── processor.py
+│   └── video_to_srt_old.py
+└── frontend_legacy/       # 废弃的前端代码
+    ├── index.html
+    ├── package.json
+    ├── public/
+    └── src/
+```
+
+## 后端废弃文件 (backend_legacy/)
 
 ### 早期主入口文件
 
@@ -22,6 +41,11 @@
   - 已被完整版 main.py 替代
   - 归档时间：2025-11-18
 
+- `video_to_srt_old.py` - 原始 CLI 版本
+  - 使用 Rich 库的命令行界面
+  - 已被 Web 前端替代
+  - 归档时间：2025-11-18
+
 ### 核心处理模块
 
 - `processor.py` - 原处理器模块（82行简化版）
@@ -33,24 +57,22 @@
   - **简化版**：仅保留模型管理门面函数（最终也被替代）
   - 归档时间：2025-11-18
 
+## 前端废弃文件 (frontend_legacy/)
+
+- 完整的旧版 Vue 3 前端代码
+- 包含组件、服务、stores 等
+- 已被当前 frontend/ 目录下的新版本替代
+- 归档时间：2025-11-28
+
+## 其他文件
+
+- `requirements.txt` - 旧的 conda 环境导出
+  - 包含 whisperx 等已废弃的依赖
+  - 当前项目使用 uv 管理依赖
+
 ## 当前唯一入口
 
 **backend/app/main.py** - 项目的唯一主入口文件
-
-## 当前架构
-
-### 服务层 (backend/app/services/)
-- `transcription_service.py` - 统一转录服务
-- `cpu_affinity_service.py` - CPU亲和性管理
-- `model_preload_manager.py` - 模型预加载和缓存管理（含全局单例函数）
-- `hardware_service.py` - 硬件检测和优化
-
-### 模型层 (backend/app/models/)
-- `job_models.py` - 任务数据模型
-- `hardware_models.py` - 硬件信息模型
-
-### 配置层 (backend/app/config/)
-- `model_config.py` - 模型配置
 
 ## 说明
 
@@ -58,3 +80,8 @@
 - 如需参考历史代码，请查看 git 历史记录
 - 所有新功能都应在 backend/app/main.py 和对应的服务模块中开发
 - 模型管理功能现在完全由 `services/model_preload_manager.py` 提供
+
+## 最后更新
+
+- 更新日期：2025-12-06
+- 更新内容：合并 _deprecated 和 archive 目录，统一归档结构
