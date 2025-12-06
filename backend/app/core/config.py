@@ -194,6 +194,48 @@ class ProjectConfig:
             "memory_threshold": self.MEMORY_THRESHOLD
         }
 
+    def calculate_dynamic_weights(
+        self,
+        engine: str,
+        total_segments: int,
+        segments_to_separate: int,
+        segments_to_retry: int
+    ) -> dict:
+        """
+        根据引擎和实际场景动态计算权重
+
+        Args:
+            engine: 'faster_whisper' | 'sensevoice'
+            total_segments: 总片段数
+            segments_to_separate: 需要分离的片段数
+            segments_to_retry: 需要补刀的片段数
+
+        Returns:
+            动态权重字典
+        """
+        if engine == 'faster_whisper':
+            return self.PHASE_WEIGHTS.copy()
+
+        base_weights = self.PHASE_WEIGHTS.copy()
+
+        if total_segments > 0:
+            sep_ratio = segments_to_separate / total_segments
+            retry_ratio = segments_to_retry / total_segments
+
+            base_weights['demucs_global'] = int(15 * sep_ratio)
+            base_weights['transcribe'] = 70
+            base_weights['align'] = 0
+
+            if 'retry' not in base_weights:
+                base_weights['retry'] = 0
+            base_weights['retry'] = int(15 * retry_ratio)
+
+            used = sum(base_weights.values())
+            if used < 100:
+                base_weights['transcribe'] += (100 - used)
+
+        return base_weights
+
 
 # 全局配置实例
 config = ProjectConfig()
