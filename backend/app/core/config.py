@@ -26,8 +26,8 @@ class ProjectConfig:
         self.JOBS_DIR = self.BASE_DIR / "jobs"
         self.TEMP_DIR = self.BASE_DIR / "temp"
 
-        # FFmpeg路径（优先使用项目内的，支持独立打包）
-        self.FFMPEG_DIR = self.BASE_DIR / "ffmpeg" / "bin"
+        # FFmpeg路径（优先使用项目内的tools目录，支持独立打包）
+        self.FFMPEG_DIR = self.BASE_DIR / "tools"
         self.FFMPEG_EXE = self.FFMPEG_DIR / "ffmpeg.exe"
 
         # 模型缓存目录（强制接管，不使用默认的用户目录）
@@ -59,7 +59,7 @@ class ProjectConfig:
             print(f"使用 HuggingFace 官方源: {self.HF_ENDPOINT}")
             print("提示：如遇访问问题，可设置环境变量 USE_HF_MIRROR=true 使用镜像源")
 
-        # 确保目录存在
+        # 确保目录存在（tools目录不自动创建，需用户手动准备）
         for dir_path in [
             self.INPUT_DIR,
             self.OUTPUT_DIR,
@@ -67,8 +67,7 @@ class ProjectConfig:
             self.TEMP_DIR,
             self.MODELS_DIR,
             self.HF_CACHE_DIR,
-            self.TORCH_CACHE_DIR,
-            self.FFMPEG_DIR
+            self.TORCH_CACHE_DIR
         ]:
             dir_path.mkdir(parents=True, exist_ok=True)
 
