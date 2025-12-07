@@ -315,8 +315,17 @@ class JobQueueService:
                 logger.info(f" 开始执行任务: {self.running_job_id}")
 
                 try:
-                    # 调用原有的转录流程（会阻塞到任务结束）
-                    self.transcription_service._run_pipeline(job)
+                    # 根据引擎选择流水线
+                    engine = getattr(job.settings, 'engine', 'whisper')
+                    if engine == 'sensevoice':
+                        # SenseVoice 流水线（异步，使用频谱分诊）
+                        logger.info(f"使用 SenseVoice 流水线")
+                        import asyncio
+                        asyncio.run(self.transcription_service._process_video_sensevoice(job))
+                    else:
+                        # Whisper 流水线（同步，使用三点采样）
+                        logger.info(f"使用 Whisper 流水线")
+                        self.transcription_service._run_pipeline(job)
 
                     # 检查最终状态
                     if job.canceled:

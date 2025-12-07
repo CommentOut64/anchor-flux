@@ -119,8 +119,8 @@ cd /d "%PROJECT_ROOT%"
 
 timeout /t 3 /nobreak >nul
 
-echo [Opening] Browser...
-start "" "http://localhost:5173"
+REM 不在这里打开浏览器，由后端统一控制
+REM start "" "http://localhost:5173"
 
 echo.
 echo ========================================

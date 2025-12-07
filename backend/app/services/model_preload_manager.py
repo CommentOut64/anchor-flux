@@ -140,15 +140,14 @@ class ModelPreloadManager:
             return cache_status
     
     async def preload_models(self, progress_callback=None) -> Dict[str, Any]:
-        """预加载默认模型 - 简化版实现，带幂等性保证
+        """预加载默认模型 - 重构版：Demucs + VAD，无 Whisper
 
         预加载逻辑：
-        1. 如果用户选择了默认预加载模型，使用用户选择的模型
-        2. 如果用户未选择（或选择的模型不可用），自动选择体积最大的ready模型
-        3. 如果没有ready的模型，返回失败
+        1. 预加载 Silero VAD 模型（内置，快速）
+        2. 预加载默认 Demucs 模型（htdemucs）
+        3. 【移除】不再预加载 Whisper 模型（按需加载）
         """
         with self._global_lock:
-            # 检查是否已经在预加载中（幂等性检查）
             if self._preload_status["is_preloading"]:
                 self.logger.info("预加载已在进行中，返回已有任务")
                 return {"success": True, "message": "预加载已在进行中"}
@@ -157,236 +156,121 @@ class ModelPreloadManager:
                 self.logger.warning("模型预加载功能已禁用")
                 return {"success": False, "message": "预加载功能已禁用"}
 
-            #  根据用户配置确定要加载的模型
-            from services.user_config_service import get_user_config_service
-            from services.model_manager_service import get_model_manager as get_model_mgr
-
-            user_config = get_user_config_service()
-            model_mgr = get_model_mgr()
-
-            # 获取用户选择的模型
-            user_selected = user_config.get_default_preload_model()
-
-            # 获取所有ready的模型
-            ready_models = model_mgr.get_ready_whisper_models() if model_mgr else []
-
-            # 确定要加载的模型
-            models_to_load = []
-            if user_selected and user_selected in ready_models:
-                # 用户选择了有效的模型
-                models_to_load = [user_selected]
-                self.logger.info(f"使用用户选择的默认预加载模型: {user_selected}")
-            else:
-                # 用户未选择或选择的模型不可用，自动选择最大的模型
-                largest_model = model_mgr.get_largest_ready_model() if model_mgr else None
-                if largest_model:
-                    models_to_load = [largest_model]
-                    self.logger.info(f"自动选择体积最大的ready模型: {largest_model}")
-                else:
-                    self.logger.warning("没有可用的ready模型")
-                    return {"success": False, "message": "没有可用的ready模型"}
-
-            # 设置预加载状态
             self._preload_status.update({
                 "is_preloading": True,
                 "progress": 0.0,
                 "current_model": "",
-                "total_models": len(models_to_load),
+                "total_models": 2,  # VAD + Demucs
                 "loaded_models": 0,
                 "errors": [],
                 "last_attempt_time": time.time()
             })
 
-            self.logger.info(f"开始预加载任务: {models_to_load}")
-
         try:
             success_count = 0
-            total_models = len(models_to_load)
 
-            # ===== 优先加载 Silero VAD 模型（内置，快速） =====
+            # ===== 1. 预加载 Silero VAD 模型（保留原逻辑）=====
             try:
-                self.logger.info("[预加载] 优先加载 Silero VAD 模型（内置）...")
+                self.logger.info("[预加载] 加载 Silero VAD 模型...")
                 with self._global_lock:
                     self._preload_status.update({
-                        "current_model": "Silero VAD (内置)",
+                        "current_model": "Silero VAD",
                         "progress": 0.0
                     })
 
-                # 检查 Silero VAD 是否存在
                 from pathlib import Path as PathlibPath
                 from silero_vad.utils_vad import OnnxWrapper
 
                 builtin_model_path = PathlibPath(__file__).parent.parent / "assets" / "silero" / "silero_vad.onnx"
 
                 if builtin_model_path.exists():
-                    # 预加载 Silero VAD（验证可用性）
                     _ = OnnxWrapper(str(builtin_model_path), force_onnx_cpu=False)
-                    self.logger.info("Silero VAD 模型预加载成功（内置模型）")
+                    self.logger.info("Silero VAD 模型预加载成功")
+                    success_count += 1
+                    with self._global_lock:
+                        self._preload_status["loaded_models"] += 1
                 else:
                     self.logger.warning(f"Silero VAD 模型缺失: {builtin_model_path}")
 
             except Exception as e:
                 self.logger.warning(f"Silero VAD 预加载失败（非致命）: {e}")
-                # 不影响后续 Whisper 模型预加载
 
-            # ===== 预加载 Whisper 模型 =====
-            for i, model_name in enumerate(models_to_load):
-                try:
-                    # 更新当前进度
-                    with self._global_lock:
-                        self._preload_status.update({
-                            "current_model": model_name,
-                            "progress": (i / total_models) * 100
-                        })
+            # ===== 2. 预加载 Demucs 模型（新增）=====
+            try:
+                self.logger.info("[预加载] 加载 Demucs 模型...")
+                with self._global_lock:
+                    self._preload_status.update({
+                        "current_model": "Demucs (htdemucs)",
+                        "progress": 50.0
+                    })
 
-                    self.logger.info(f"[{i+1}/{total_models}] 处理模型: {model_name}")
+                from services.demucs_service import get_demucs_service
+                demucs_service = get_demucs_service()
 
-                    #  新增：检查模型是否正在下载（防御机制）
-                    from services.model_manager_service import get_model_manager
-                    model_mgr = get_model_manager()
+                # 在后台线程中执行同步的模型加载，避免阻塞主线程
+                loop = asyncio.get_event_loop()
+                preload_success = await loop.run_in_executor(
+                    None,
+                    demucs_service.preload_model,
+                    "htdemucs"
+                )
 
-                    if model_mgr.is_model_downloading("whisper", model_name):
-                        self.logger.info(f"模型 {model_name} 正在下载中，等待完成...")
-
-                        # 更新状态
-                        with self._global_lock:
-                            self._preload_status.update({
-                                "current_model": f"{model_name} (等待下载完成)",
-                                "progress": (i / total_models) * 100
-                            })
-
-                        # 等待下载完成（最多10分钟）
-                        if not model_mgr.wait_for_download_complete("whisper", model_name, timeout=600):
-                            error_msg = f"等待模型 {model_name} 下载超时或失败"
-                            self.logger.warning(f"{error_msg}")
-                            with self._global_lock:
-                                self._preload_status["errors"].append(error_msg)
-                            continue
-
-                        self.logger.info(f"模型 {model_name} 下载完成，继续预加载")
-
-                    #  新增：检查磁盘状态（确保模型已就绪）
-                    status, local_path, detail = model_mgr._check_whisper_model_exists(model_name)
-                    if status != "ready":
-                        error_msg = f"模型 {model_name} 未就绪（状态: {status}），跳过预加载"
-                        self.logger.warning(f"{error_msg}")
-                        with self._global_lock:
-                            self._preload_status["errors"].append(error_msg)
-                        continue
-
-                    # 检查内存
-                    if not self._memory_monitor.check_memory_available():
-                        error_msg = f"内存不足，跳过模型 {model_name}"
-                        self.logger.warning(f"{error_msg}")
-                        with self._global_lock:
-                            self._preload_status["errors"].append(error_msg)
-                        continue
-
-                    # 检查模型是否已缓存
-                    device = "cuda" if torch.cuda.is_available() else "cpu"
-                    key = (model_name, "float16", device)
-
-                    with self._global_lock:
-                        if key in self._whisper_cache:
-                            self.logger.info(f"模型 {model_name} 已在缓存中")
-                            self._preload_status["loaded_models"] += 1
-                            success_count += 1
-                            continue
-
-                    # 加载新模型
-                    settings = JobSettings(
-                        model=model_name,
-                        compute_type="float16",
-                        device=device
-                    )
-
-                    self.logger.info(f"开始加载模型: {model_name} (device={device})")
-                    start_time = time.time()
-
-                    # 在后台线程中执行同步的模型加载，避免阻塞主线程
-                    loop = asyncio.get_event_loop()
-                    model = await loop.run_in_executor(None, self._load_whisper_model, settings)
-
-                    load_time = time.time() - start_time
-
-                    # 预热模型
-                    if self.config.warmup_enabled:
-                        self.logger.info(f"预热模型: {model_name}")
-                        # 在后台线程中执行预热，避免阻塞
-                        await loop.run_in_executor(None, self._warmup_model, model)
-
+                if preload_success:
+                    self.logger.info("Demucs 模型预加载成功")
+                    success_count += 1
                     with self._global_lock:
                         self._preload_status["loaded_models"] += 1
-                    success_count += 1
-
-                    self.logger.info(f"模型 {model_name} 加载成功 (耗时: {load_time:.2f}s)")
-
-                    # 调用进度回调
-                    if progress_callback:
-                        with self._global_lock:
-                            progress_callback(self._preload_status.copy())
-
-                except Exception as e:
-                    error_msg = f"加载模型 {model_name} 失败: {str(e)}"
-                    self.logger.error(f"{error_msg}", exc_info=True)
+                else:
+                    self.logger.warning("Demucs 模型预加载返回失败")
                     with self._global_lock:
-                        self._preload_status["errors"].append(error_msg)
-            
+                        self._preload_status["errors"].append("Demucs 预加载失败")
+
+            except Exception as e:
+                self.logger.warning(f"Demucs 预加载失败（非致命）: {e}")
+                with self._global_lock:
+                    self._preload_status["errors"].append(f"Demucs 预加载失败: {e}")
+
+            # ===== 【移除】不再预加载 Whisper 模型 =====
+            # 原来的 Whisper 预加载代码已删除
+            # Whisper 仅在后处理补刀阶段按需加载
+
             # 完成预加载
             success = success_count > 0
-            
+
             with self._global_lock:
-                # 更新失败计数
-                if not success:
-                    self._preload_status["failed_attempts"] += 1
-                else:
-                    self._preload_status["failed_attempts"] = 0  # 成功后重置
-                
-                # 更新缓存版本号
-                self._preload_status["cache_version"] = int(time.time())
-                
-                # 结束预加载状态
                 self._preload_status.update({
                     "is_preloading": False,
                     "progress": 100.0,
-                    "current_model": ""
+                    "current_model": "",
+                    "cache_version": int(time.time())
                 })
-                
-                result = {
-                    "success": success,
-                    "loaded_models": self._preload_status["loaded_models"],
-                    "total_models": self._preload_status["total_models"],
-                    "errors": self._preload_status["errors"].copy(),
-                    "failed_attempts": self._preload_status["failed_attempts"],
-                    "cache_version": self._preload_status["cache_version"]
-                }
-            
-            # 日志输出
+
+            result = {
+                "success": success,
+                "loaded_models": success_count,
+                "total_models": 2,
+                "errors": self._preload_status["errors"].copy()
+            }
+
             if success:
-                self.logger.info(f"预加载任务成功完成: {success_count}/{total_models} 个模型")
+                self.logger.info(f"预加载任务成功完成: {success_count}/2 个模型")
             else:
-                self.logger.warning(f"预加载任务完成但无成功加载的模型")
-                
-            if result["errors"]:
-                self.logger.warning(f"预加载过程中出现 {len(result['errors'])} 个错误")
-            
-            # 调用最终进度回调
+                self.logger.warning("预加载任务完成但无成功加载的模型")
+
             if progress_callback:
                 progress_callback(self._preload_status.copy())
-            
+
             return result
-            
+
         except Exception as e:
+            self.logger.error(f"预加载异常: {e}", exc_info=True)
             with self._global_lock:
-                self._preload_status["is_preloading"] = False
-                self._preload_status["failed_attempts"] += 1
-            
-            self.logger.error(f"预加载过程异常: {str(e)}", exc_info=True)
-            return {
-                "success": False, 
-                "message": f"预加载失败: {str(e)}", 
-                "failed_attempts": self._preload_status["failed_attempts"]
-            }
+                self._preload_status.update({
+                    "is_preloading": False,
+                    "progress": 0.0,
+                    "errors": [str(e)]
+                })
+            return {"success": False, "message": str(e)}
 
     def reset_preload_attempts(self):
         """重置预加载失败计数 - 线程安全版本"""

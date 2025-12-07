@@ -323,6 +323,36 @@ class DemucsService:
             # 卸载旧模型，下次使用时会加载新模型
             self.unload_model()
 
+    def preload_model(self, model_name: str = None) -> bool:
+        """
+        预加载 Demucs 模型到显存
+
+        Args:
+            model_name: 模型名称，默认使用当前配置的模型
+
+        Returns:
+            bool: 是否加载成功
+        """
+        if model_name:
+            self.set_model(model_name)
+
+        try:
+            self.logger.info(f"预加载 Demucs 模型: {self.config.model_name}")
+            self._load_model()
+            self.logger.info(f"Demucs 模型 {self.config.model_name} 预加载完成")
+            return True
+        except Exception as e:
+            self.logger.error(f"Demucs 模型预加载失败: {e}")
+            return False
+
+    def is_model_loaded(self) -> bool:
+        """检查模型是否已加载"""
+        return self._model is not None
+
+    def get_loaded_model_name(self) -> Optional[str]:
+        """获取当前加载的模型名称"""
+        return self._model_name_loaded
+
     def _load_model(self, device: str = None):
         """
         懒加载Demucs模型

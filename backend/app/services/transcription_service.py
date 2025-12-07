@@ -1447,6 +1447,14 @@ class TranscriptionService:
                     bgm_level, bgm_ratios = self._detect_bgm(str(audio_path), job)
                     self.logger.info(f"BGM检测完成: {bgm_level.value}")
 
+                    # 如果 BGM 检测结果为 NONE，立即卸载 Demucs 模型释放显存
+                    if bgm_level == BGMLevel.NONE:
+                        from services.demucs_service import get_demucs_service
+                        demucs_service = get_demucs_service()
+                        if demucs_service.is_model_loaded():
+                            self.logger.info("BGM 检测为 NONE，卸载 Demucs 模型释放显存")
+                            demucs_service.unload_model()
+
             # ==========================================
             # 3. 阶段3: 全局人声分离（使用分级策略）
             # ==========================================
@@ -4365,6 +4373,11 @@ class TranscriptionService:
                     chunk_state.separation_model_used = diag.recommended_model
                     progress_tracker.update_phase(ProcessPhase.DEMUCS, increment=1)
                 progress_tracker.complete_phase(ProcessPhase.DEMUCS)
+            else:
+                # 没有 Chunk 需要分离，卸载 Demucs 模型释放显存
+                if demucs_service.is_model_loaded():
+                    self.logger.info("所有 Chunk 均为纯净人声，卸载 Demucs 模型释放显存")
+                    demucs_service.unload_model()
 
             # 5. 逐Chunk转录 + 熔断回溯（转录层核心）
             progress_tracker.start_phase(ProcessPhase.SENSEVOICE, len(chunk_states), "SenseVoice 转录...")

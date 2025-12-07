@@ -62,16 +62,31 @@
 
 
 
-目前项目放在miniconda环境中，我需要：
 
-1.将目前miniconda环境换成uv
 
-2.彻底清除whisperx及其依赖，改为使用faster-whisper，清除代码中所有相关的引用
+BGM检测完成: 比例=[0.01868760338502411, 0.01807172506509757, 0.04894797753079488], 平均=0.03, 最大=0.05
+00:08:24.058 [INFO] [transcription_service] BGM检测结果: light, 比例=[0.01868760338502411, 0.01807172506509757, 0.04894797753079488], 最大=0.05
+00:08:24.088 [INFO] [transcription_service] BGM检测完成: light
 
-3.整理requirements.txt，删除不必要的，解决所有依赖版本冲突，使用修改过的requirements.txt构建uv环境（新的已经在F:\video_to_srt_gpu\docs\迁移到uv下，但你需要再次检查）
 
-4.保留当前项目目录结构，但改为嵌入式 Python (Embedded Python) + 虚拟环境 + 启动脚本，把 CUDA 和 cuDNN 的运行库（DLL 文件）嵌入进去，为未来打包发布做准备，未来所有开发都会以嵌入式python为基础
 
-5.归档所有有关whisperx的无用的文件
+实时连接已断开，正在尝试重连
 
-参考F:\video_to_srt_gpu\docs\迁移到uv下的文档，生成一份完整的开发文档，包括从零开始构建uv环境，按照正确顺序安装依赖，修改项目代码，完成所有迁移到嵌入式 Python的步骤
+
+
+
+
+进度条回退
+
+
+
+
+
+EditorView.vue:856  视频加载错误: Error: 视频加载失败，正在重试 (1/3)...
+    at onError (index.vue:429:17)
+    at callWithErrorHandling (chunk-256OB4QR.js?v=cf2fc920:2560:19)
+    at callWithAsyncErrorHandling (chunk-256OB4QR.js?v=cf2fc920:2567:17)
+    at HTMLVideoElement.invoker (chunk-256OB4QR.js?v=cf2fc920:11679:5)
+handleVideoError @ EditorView.vue:856
+index.vue:332  [VideoStage] 视频源切换失败: Error: 加载失败
+    at HTMLVideoElement.onError (index.vue:314:18)
