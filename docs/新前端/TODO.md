@@ -86,7 +86,13 @@ EditorView.vue:856  视频加载错误: Error: 视频加载失败，正在重试
     at onError (index.vue:429:17)
     at callWithErrorHandling (chunk-256OB4QR.js?v=cf2fc920:2560:19)
     at callWithAsyncErrorHandling (chunk-256OB4QR.js?v=cf2fc920:2567:17)
-    at HTMLVideoElement.invoker (chunk-256OB4QR.js?v=cf2fc920:11679:5)
+    at HTMLVideoElement.invoker (chunk-256OB4QR.js?v=cf2fc920:11679:5)claude-sonnet-4-5-20250929[1m]
 handleVideoError @ EditorView.vue:856
 index.vue:332  [VideoStage] 视频源切换失败: Error: 加载失败
     at HTMLVideoElement.onError (index.vue:314:18)
+
+
+
+
+
+curl -v -H "Authorization: Bearer wgh-gemini-c" "https://wgh-gb.zeabur.app/v1beta/models"

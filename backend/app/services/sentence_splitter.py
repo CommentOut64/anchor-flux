@@ -1,15 +1,23 @@
 """
-分句算法
+分句算法 (Layer 1 优化版)
 
 核心原则：
 - 标点符号（。？！）必切
 - 长停顿（>0.4s）必切
 - 强制长度（5秒或30字）强制切
 - VAD 负责物理切分，分句算法负责语义切分
+
+Layer 1 优化:
+- 动态停顿阈值（根据语速自适应）
+- 边界修剪（消除静音段）
+- 智能长句拆分（优先在标点和停顿处）
+- 语言策略抽象（支持多语言扩展）
 """
 import re
 import logging
-from typing import List, Optional, TYPE_CHECKING
+import statistics
+from abc import ABC, abstractmethod
+from typing import List, Optional, Set, TYPE_CHECKING
 from dataclasses import dataclass
 
 if TYPE_CHECKING:
@@ -18,25 +26,146 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# 语言策略抽象 (解决硬编码语言规则问题)
+# ============================================================================
+
+class LanguageStrategy(ABC):
+    """语言策略抽象基类，用于处理不同语言的分句规则"""
+
+    @abstractmethod
+    def get_sentence_end_chars(self) -> Set[str]:
+        """获取句子结束标点"""
+        pass
+
+    @abstractmethod
+    def get_clause_break_chars(self) -> Set[str]:
+        """获取从句断句标点"""
+        pass
+
+    @abstractmethod
+    def get_continuation_words(self) -> List[str]:
+        """获取续接词列表"""
+        pass
+
+    @abstractmethod
+    def is_continuation(self, text: str) -> bool:
+        """判断文本是否以续接词开头"""
+        pass
+
+
+class ChineseStrategy(LanguageStrategy):
+    """中文语言策略"""
+
+    def get_sentence_end_chars(self) -> Set[str]:
+        return {'。', '？', '！', '.', '?', '!'}
+
+    def get_clause_break_chars(self) -> Set[str]:
+        return {'，', '、', '；', '：', ',', ';', ':'}
+
+    def get_continuation_words(self) -> List[str]:
+        return ['但', '可', '然', '所', '因', '如', '虽', '而', '不过', '或者',
+                '但是', '可是', '然后', '所以', '因为', '如果', '虽然', '而且']
+
+    def is_continuation(self, text: str) -> bool:
+        return any(text.strip().startswith(word) for word in self.get_continuation_words())
+
+
+class EnglishStrategy(LanguageStrategy):
+    """英文语言策略"""
+
+    def get_sentence_end_chars(self) -> Set[str]:
+        return {'.', '?', '!'}
+
+    def get_clause_break_chars(self) -> Set[str]:
+        return {',', ';', ':'}
+
+    def get_continuation_words(self) -> List[str]:
+        return ['but', 'and', 'or', 'so', 'because', 'however', 'therefore',
+                'although', 'though', 'yet', 'still', 'moreover', 'furthermore']
+
+    def is_continuation(self, text: str) -> bool:
+        first_word = text.strip().split()[0].lower() if text.strip() else ''
+        return first_word in self.get_continuation_words()
+
+
+class JapaneseStrategy(LanguageStrategy):
+    """日文语言策略"""
+
+    def get_sentence_end_chars(self) -> Set[str]:
+        return {'。', '？', '！', '.', '?', '!'}
+
+    def get_clause_break_chars(self) -> Set[str]:
+        return {'、', '，', ','}
+
+    def get_continuation_words(self) -> List[str]:
+        return ['でも', 'しかし', 'だから', 'そして', 'それで', 'ただ', 'けど']
+
+    def is_continuation(self, text: str) -> bool:
+        return any(text.strip().startswith(word) for word in self.get_continuation_words())
+
+
+def get_language_strategy(language: str) -> LanguageStrategy:
+    """根据语言代码获取对应的语言策略"""
+    strategies = {
+        'zh': ChineseStrategy(),
+        'en': EnglishStrategy(),
+        'ja': JapaneseStrategy(),
+        'auto': ChineseStrategy(),  # 默认使用中文策略
+    }
+    return strategies.get(language, ChineseStrategy())
+
+
 @dataclass
 class SplitConfig:
-    """分句配置"""
+    """分句配置 (Layer 1 优化版)"""
+    # ============================================================================
+    # 现有配置 (保持兼容性)
+    # ============================================================================
     # 标点切分
     sentence_end_punctuation: str = "。？！.?!"  # 句末标点
     clause_punctuation: str = "，；：,;:"        # 分句标点（可选切分点）
 
     # 停顿切分
-    pause_threshold: float = 0.4                 # 停顿阈值（秒）
-    long_pause_threshold: float = 0.8            # 长停顿阈值（强制切分）
+    pause_threshold: float = 0.5                 # 停顿阈值（秒）
+    long_pause_threshold: float = 1.0            # 长停顿阈值（强制切分）
 
     # 长度限制
     max_duration: float = 5.0                    # 最大时长（秒）
-    max_chars: int = 30                          # 最大字符数
+    max_chars: int = 50                          # 最大字符数
     min_chars: int = 2                           # 最小字符数（避免过短）
 
     # 特殊处理
     merge_short_sentences: bool = True           # 合并过短句子
     short_sentence_threshold: int = 3            # 短句阈值
+
+    # ============================================================================
+    # Layer 1 新增配置
+    # ============================================================================
+    # 语言设置 (解决硬编码问题)
+    language: str = "auto"                       # 语言: auto, zh, en, ja, ko 等
+
+    # 边界修剪
+    trim_leading_silence: bool = True            # 修剪句首静音
+    trim_trailing_silence: bool = True           # 修剪句尾静音
+    max_boundary_gap: float = 0.15               # 最大允许的边界间隙(秒)
+
+    # 动态停顿
+    use_dynamic_pause: bool = True               # 启用动态停顿阈值
+    speech_rate_window: int = 10                 # 语速计算窗口(字数)
+    pause_multiplier: float = 2.0                # 停顿阈值 = 中位数字间隔 * multiplier
+
+    # 智能分句
+    prefer_punctuation_break: bool = True        # 优先在标点处断句
+    soft_break_threshold: float = 0.8            # 软断点阈值(秒)
+
+    # 语义分组 (预留给 Layer 2)
+    enable_semantic_grouping: bool = True        # 启用语义分组
+    max_group_duration: float = 10.0             # 单个语义组最大时长(秒)
+
+    def get_strategy(self) -> LanguageStrategy:
+        """获取当前语言对应的策略"""
+        return get_language_strategy(self.language)
 
 
 class SentenceSplitter:
@@ -82,18 +211,22 @@ class SentenceSplitter:
                 split_reason = "punctuation"
 
             # 2. 停顿切分（检查与下一个词的间隔）
+            # Layer 1 优化: 使用动态停顿阈值
             elif i < len(words) - 1:
                 next_word = words[i + 1]
                 pause = next_word.start - word.end
 
+                # 计算动态停顿阈值（根据局部语速）
+                dynamic_threshold = self._calculate_dynamic_pause_threshold(words, i)
+
                 if pause >= self.config.long_pause_threshold:
                     should_split = True
                     split_reason = "long_pause"
-                elif pause >= self.config.pause_threshold:
-                    # 中等停顿 + 分句标点
+                elif pause >= dynamic_threshold:
+                    # 动态停顿 + 分句标点
                     if word.word in self.config.clause_punctuation:
                         should_split = True
-                        split_reason = "pause_with_clause"
+                        split_reason = "dynamic_pause_with_clause"
 
             # 3. 强制长度切分
             current_duration = word.end - current_start
@@ -129,8 +262,185 @@ class SentenceSplitter:
 
         return sentences
 
+    # ============================================================================
+    # Layer 1 优化算法
+    # ============================================================================
+
+    def _trim_sentence_boundaries(self, sentence: 'SentenceSegment') -> 'SentenceSegment':
+        """
+        修剪句子边界，消除静音段
+
+        核心思想：句子的 start/end 时间戳应该紧贴实际语音，而非简单取首尾词的时间戳
+
+        Args:
+            sentence: 待修剪的句子对象
+
+        Returns:
+            修剪后的句子对象
+        """
+        if not sentence.words:
+            return sentence
+
+        first_word = sentence.words[0]
+        last_word = sentence.words[-1]
+
+        # 修剪句首: 如果句子start比第一个词start早太多，说明包含了静音
+        if self.config.trim_leading_silence:
+            gap = first_word.start - sentence.start
+            if gap > self.config.max_boundary_gap:
+                sentence.start = first_word.start
+                logger.debug(f"修剪句首静音: {gap:.3f}s -> 0s")
+
+        # 修剪句尾: 如果句子end比最后一个词end晚太多，说明包含了静音
+        if self.config.trim_trailing_silence:
+            gap = sentence.end - last_word.end
+            if gap > self.config.max_boundary_gap:
+                sentence.end = last_word.end
+                logger.debug(f"修剪句尾静音: {gap:.3f}s -> 0s")
+
+        return sentence
+
+    def _calculate_dynamic_pause_threshold(
+        self,
+        words: List['WordTimestamp'],
+        current_index: int
+    ) -> float:
+        """
+        根据局部语速计算动态停顿阈值
+
+        优化策略:
+        - 使用中位数而非平均值，抗噪性更强
+        - 混合动态权重和静态基准，避免极端情况
+        - 设置阈值上下限，保证合理范围
+
+        Args:
+            words: 字级时间戳列表
+            current_index: 当前词索引
+
+        Returns:
+            动态停顿阈值（秒）
+        """
+        if not self.config.use_dynamic_pause:
+            return self.config.pause_threshold
+
+        # 计算窗口范围
+        window_size = self.config.speech_rate_window
+        start_idx = max(0, current_index - window_size // 2)
+        end_idx = min(len(words), current_index + window_size // 2)
+
+        # 计算窗口内的字间隔
+        intervals = []
+        for i in range(start_idx, end_idx - 1):
+            interval = words[i + 1].start - words[i].end
+            # 只统计正常间隔，排除长停顿
+            if 0 < interval < self.config.long_pause_threshold:
+                intervals.append(interval)
+
+        if not intervals:
+            return self.config.pause_threshold
+
+        # 优化: 使用中位数而非平均值，避免异常值干扰
+        median_interval = statistics.median(intervals)
+
+        # 优化: 混合动态权重和静态基准，防止阈值振荡
+        # 动态权重 0.7 + 静态基准 0.3
+        weighted_threshold = (
+            median_interval * self.config.pause_multiplier * 0.7 +
+            self.config.pause_threshold * 0.3
+        )
+
+        # 优化: 设置明确的上下限
+        final_threshold = max(min(weighted_threshold, 2.0), 0.2)
+
+        logger.debug(
+            f"动态停顿阈值: 中位数={median_interval:.3f}s, "
+            f"加权阈值={weighted_threshold:.3f}s, "
+            f"最终阈值={final_threshold:.3f}s"
+        )
+
+        return final_threshold
+
+    def _smart_split_long_sentence(
+        self,
+        words: List['WordTimestamp'],
+        text: str
+    ) -> List[List['WordTimestamp']]:
+        """
+        智能拆分过长的句子
+
+        拆分优先级:
+        1. 在句中标点处拆分（逗号、分号等）
+        2. 在较长停顿处拆分
+        3. 在接近中点的位置拆分
+
+        性能优化:
+        - 使用 running_length 计数器，避免循环内重复计算 (O(N) 而非 O(N^2))
+
+        Args:
+            words: 字级时间戳列表
+            text: 文本内容
+
+        Returns:
+            拆分后的词列表（列表的列表）
+        """
+        if len(text) <= self.config.max_chars:
+            return [words]
+
+        # 寻找最佳拆分点
+        best_split_idx = None
+        best_score = -1
+        target_len = self.config.max_chars * 0.7  # 目标长度为最大长度的70%
+
+        # 性能优化: 维护一个 running_length 计数器，避免重复计算
+        running_length = 0
+
+        for i, word in enumerate(words[:-1]):
+            running_length += len(word.word)
+            score = 0
+
+            # 1. 标点加分 (最高优先级)
+            if self.config.prefer_punctuation_break:
+                if word.word[-1] in ',;:':
+                    score += 100
+                elif word.word[-1] in '，、；：':
+                    score += 100
+
+            # 2. 停顿加分
+            pause = words[i + 1].start - word.end
+            if pause > 0.3:
+                score += 50 * min(pause, 1.0)
+
+            # 3. 接近目标长度加分
+            length_diff = abs(running_length - target_len)
+            score += max(0, 50 - length_diff)
+
+            if score > best_score:
+                best_score = score
+                best_split_idx = i + 1
+
+        if best_split_idx is None:
+            best_split_idx = len(words) // 2
+
+        # 递归拆分
+        left_words = words[:best_split_idx]
+        right_words = words[best_split_idx:]
+        left_text = ''.join(w.word for w in left_words)
+        right_text = ''.join(w.word for w in right_words)
+
+        result = self._smart_split_long_sentence(left_words, left_text)
+        result.extend(self._smart_split_long_sentence(right_words, right_text))
+
+        logger.debug(
+            f"智能拆分: 原长度={len(text)}, "
+            f"拆分点={best_split_idx}, "
+            f"得分={best_score:.1f}, "
+            f"左={len(left_text)}, 右={len(right_text)}"
+        )
+
+        return result
+
     def _create_sentence(self, words: List['WordTimestamp']) -> Optional['SentenceSegment']:
-        """创建句子对象"""
+        """创建句子对象 (集成边界修剪)"""
         from ..models.sensevoice_models import SentenceSegment
 
         if not words:
@@ -145,13 +455,18 @@ class SentenceSplitter:
         # 计算平均置信度
         avg_confidence = sum(w.confidence for w in words) / len(words)
 
-        return SentenceSegment(
+        sentence = SentenceSegment(
             text=text,
             start=words[0].start,
             end=words[-1].end,
             words=words.copy(),
             confidence=avg_confidence
         )
+
+        # Layer 1 优化: 修剪边界静音
+        sentence = self._trim_sentence_boundaries(sentence)
+
+        return sentence
 
     def _merge_short_sentences(
         self,

@@ -3821,7 +3821,9 @@ class TranscriptionService:
     def _split_sentences(
         self,
         sv_result: 'SenseVoiceResult',
-        chunk_start_time: float = 0.0
+        chunk_start_time: float = 0.0,
+        split_config: Optional['SplitConfig'] = None,  # Layer 1: 允许传入配置
+        enable_grouping: bool = True                    # Layer 2: 是否启用语义分组 (预留)
     ) -> List['SentenceSegment']:
         """
         将 SenseVoice 结果切分为句子（基于真实字级时间戳）
@@ -3829,6 +3831,8 @@ class TranscriptionService:
         Args:
             sv_result: SenseVoice 转录结果（包含真实字级时间戳）
             chunk_start_time: Chunk 在完整音频中的起始时间（用于时间偏移）
+            split_config: 分句配置（Layer 1 新增，可选）
+            enable_grouping: 是否启用语义分组（Layer 2 预留，可选）
 
         Returns:
             List[SentenceSegment]: 句子列表
@@ -3841,9 +3845,16 @@ class TranscriptionService:
         if not sv_result.words:
             return []
 
-        # 使用分句器进行切分（基于真实时间戳）
-        splitter = SentenceSplitter(SplitConfig())
+        # Layer 1: 使用传入的配置或默认配置
+        config = split_config or SplitConfig()
+        splitter = SentenceSplitter(config)
         sentences = splitter.split(sv_result.words, sv_result.text_clean)
+
+        # Layer 2: 语义分组 (可选，暂不实现)
+        # if enable_grouping:
+        #     from .semantic_grouper import SemanticGrouper, GroupConfig
+        #     grouper = SemanticGrouper(GroupConfig())
+        #     sentences = grouper.group(sentences)
 
         # 调整时间偏移（将 Chunk 内的相对时间转换为绝对时间）
         for sentence in sentences:

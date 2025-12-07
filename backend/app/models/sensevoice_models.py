@@ -127,6 +127,11 @@ class SentenceSegment:
     translation: Optional[str] = None             # 翻译结果
     translation_confidence: Optional[float] = None  # 翻译置信度
 
+    # Layer 2: 语义分组字段 (Layer 1 预留)
+    group_id: Optional[str] = None                # 语义组ID，同组的句子属于同一个完整语句
+    is_soft_break: bool = False                   # 是否为软断点（物理断但语义连续）
+    group_position: Optional[str] = None          # 在组内的位置: 'start', 'middle', 'end', 'single'
+
     def mark_as_modified(self, new_text: str, source: TextSource):
         """标记为已修改"""
         if not self.is_modified:
@@ -167,7 +172,11 @@ class SentenceSegment:
             "perplexity": self.perplexity,
             "translation": self.translation,
             "translation_confidence": self.translation_confidence,
-            "words": [w.to_dict() for w in self.words]
+            "words": [w.to_dict() for w in self.words],
+            # Layer 2: 语义分组相关字段
+            "group_id": self.group_id,
+            "is_soft_break": self.is_soft_break,
+            "group_position": self.group_position
         }
 
 
