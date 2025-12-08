@@ -7,6 +7,7 @@
 """
 from dataclasses import dataclass
 from enum import Enum
+from typing import List, Dict, Optional
 
 
 class ConfidenceLevel(Enum):
@@ -92,6 +93,7 @@ def needs_whisper_patch(
     confidence: float,
     duration: float = None,
     text_length: int = None,
+    words: Optional[List[Dict]] = None,
     config: ThresholdConfig = None
 ) -> bool:
     """
@@ -101,11 +103,13 @@ def needs_whisper_patch(
     1. 置信度低于阈值
     2. 短片段 + 少字符（CTC 解码限制）
     3. 单字符结果（可能是 CTC 漏字）
+    4. 【阶段五】任意实词的置信度低于字级阈值（木桶效应）
 
     Args:
         confidence: 置信度值
         duration: 片段时长(秒)，用于短片段检测
         text_length: 文本字符数（清洗后），用于短片段检测
+        words: 【阶段五新增】字级时间戳列表，用于字级触发
         config: 阈值配置
 
     Returns:
@@ -129,6 +133,27 @@ def needs_whisper_patch(
     if config.single_char_force_patch and text_length is not None:
         if text_length == 1:
             return True
+
+    # 条件 4: 【阶段五】字级木桶效应
+    # 检查是否有实词的置信度低于阈值
+    if words:
+        MIN_WORD_CONF = config.word_warning_confidence  # 使用已有的字级警告阈值 (0.5)
+        # 停用词列表（这些词即使置信度低也不触发补刀）
+        STOP_WORDS = {"the", "a", "an", "is", "it", "to", "of", "and", "in", "on"}
+
+        for w in words:
+            word_text = w.get("word", "").strip().lower()
+            word_conf = w.get("confidence", 1.0)
+
+            # 跳过空字符、标点、停用词
+            if not word_text or (len(word_text) == 1 and not word_text.isalnum()):
+                continue
+            if word_text in STOP_WORDS:
+                continue
+
+            # 任意实词置信度低于阈值，触发整句补刀
+            if word_conf < MIN_WORD_CONF:
+                return True
 
     return False
 
@@ -197,3 +222,36 @@ def get_warning_level(
     elif has_high_perplexity:
         return 'high_perplexity'
     return 'none'
+
+
+def is_critical_patch_needed(
+    text: str,
+    duration: float,
+    confidence: float
+) -> bool:
+    """
+    【阶段四】判断是否需要强制补刀（无论用户设置如何）
+
+    强制条件（二选一）：
+    1. 单字符结果且置信度 < 0.9（极可能是 CTC 漏字）
+    2. 极短片段（<0.2s）且文本极短（<3字符）
+
+    Args:
+        text: 清洗后的文本
+        duration: 片段时长（秒）
+        confidence: 置信度
+
+    Returns:
+        True 表示必须强制补刀
+    """
+    clean_text = text.strip()
+
+    # 条件 1：单字符 + 非高置信度
+    if len(clean_text) == 1 and confidence < 0.9:
+        return True
+
+    # 条件 2：极短片段 + 极短文本
+    if duration < 0.2 and len(clean_text) < 3:
+        return True
+
+    return False

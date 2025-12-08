@@ -4493,32 +4493,53 @@ class TranscriptionService:
         """
         from app.services.progress_tracker import get_progress_tracker, ProcessPhase
         from app.services.solution_matrix import EnhancementMode, ProofreadMode, TranslateMode
-        from app.core.thresholds import needs_whisper_patch
+        from app.core.thresholds import needs_whisper_patch, is_critical_patch_needed
 
         progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
 
-        # 1. 收集需要 Whisper 补刀的句子（根据用户配置）
+        # 1. 收集需要 Whisper 补刀的句子（含强制补刀和常规补刀）
         patch_queue = []
-        if solution_config.enhancement != EnhancementMode.OFF:
-            for i, sentence in enumerate(sentences):
-                # 计算片段时长和清洗后文本长度（用于短片段检测）
-                duration = sentence.end - sentence.start
-                text_clean = getattr(sentence, 'text_clean', None) or sentence.text
-                text_length = len(text_clean.strip()) if text_clean else 0
+        for i, sentence in enumerate(sentences):
+            should_patch = False
+            is_critical = False
 
-                # 增强版补刀判断：置信度、短片段、单字符
+            # 计算片段时长和清洗后文本长度
+            duration = sentence.end - sentence.start
+            text_clean = getattr(sentence, 'text_clean', None) or sentence.text
+            clean_text = text_clean.strip() if text_clean else ""
+            text_length = len(clean_text)
+
+            # 【阶段四】强制关键补刀条件（无论用户设置如何，必须修）
+            if is_critical_patch_needed(clean_text, duration, sentence.confidence):
+                should_patch = True
+                is_critical = True
+                self.logger.warning(
+                    f"触发强制补刀: '{clean_text}' "
+                    f"(conf={sentence.confidence:.2f}, dur={duration:.2f}s)"
+                )
+
+            # 常规补刀条件（遵循用户设置）
+            elif solution_config.enhancement != EnhancementMode.OFF:
+                # 【阶段五】构建字级时间戳列表
+                words_data = [{"word": w.word, "confidence": w.confidence} for w in sentence.words]
+
+                # 增强版补刀判断：置信度、短片段、单字符、字级触发
                 if needs_whisper_patch(
                     sentence.confidence,
                     duration=duration,
-                    text_length=text_length
+                    text_length=text_length,
+                    words=words_data  # 【阶段五】传入字级数据
                 ):
-                    patch_queue.append((i, sentence))
+                    should_patch = True
+
+            if should_patch:
+                patch_queue.append((i, sentence, is_critical))
 
         # 2. Whisper 补刀阶段
         if patch_queue:
             progress_tracker.start_phase(ProcessPhase.WHISPER_PATCH, len(patch_queue), "Whisper 补刀中...")
 
-            for idx, (sent_idx, sentence) in enumerate(patch_queue):
+            for idx, (sent_idx, sentence, is_critical) in enumerate(patch_queue):
                 await self._whisper_text_patch(
                     sentence, sent_idx, audio_array, job, subtitle_manager
                 )
