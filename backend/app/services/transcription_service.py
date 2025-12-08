@@ -3926,6 +3926,26 @@ class TranscriptionService:
             grouper = SemanticGrouper(GroupConfig(language=config.language))
             sentences = grouper.group(sentences)
 
+        # 【阶段三】VAD 边缘吸附 (Head Snap)
+        # 逻辑：如果是 Chunk 的第一句话，且 CTC 延迟在合理范围内（<0.6s），
+        # 强制将其 start 对齐到 Chunk 的物理起始点 (0.0 相对时间)
+        HEAD_SNAP_THRESHOLD = 0.6  # 最大允许吸附的延迟（秒）
+
+        if sentences:
+            first_sent = sentences[0]
+            # 检查第一个词的相对开始时间（相对于 chunk）
+            # 如果 > 0 且 < 阈值，说明 CTC 有延迟，需要吸附到 VAD 边缘
+            if 0 < first_sent.start < HEAD_SNAP_THRESHOLD:
+                self.logger.debug(
+                    f"Head Snap: '{first_sent.text[:15]}...' 延迟修正 "
+                    f"{first_sent.start:.3f}s -> 0.0s (相对VAD)"
+                )
+                # 修正句子开始时间
+                first_sent.start = 0.0
+                # 同时修正第一个单词的开始时间（保持一致性）
+                if first_sent.words:
+                    first_sent.words[0].start = 0.0
+
         # 调整时间偏移（将 Chunk 内的相对时间转换为绝对时间）
         for sentence in sentences:
             sentence.start += chunk_start_time
@@ -4166,6 +4186,72 @@ class TranscriptionService:
 
         self.logger.info(f"VAD 切分完成: {len(result)} 个片段")
         return result
+
+    def _merge_vad_segments(
+        self,
+        segments: List[Dict],
+        max_gap: float = 1.0,
+        max_duration: float = 25.0,
+        min_fragment_duration: float = 1.0
+    ) -> List[Dict]:
+        """
+        【阶段二】Post-VAD 智能合并层
+
+        策略：宁可错合（依赖 SentenceSplitter 分句），不可错分（导致 ASR 丢失上下文）。
+
+        Args:
+            segments: VAD 切分后的原始片段列表 [{start, end, index, mode}, ...]
+            max_gap: 允许合并的最大静音间隔（秒）
+            max_duration: 合并后的最大时长（秒）
+            min_fragment_duration: 短于此时长的片段强制尝试合并
+
+        Returns:
+            合并后的片段列表
+        """
+        if not segments:
+            return []
+
+        merged = []
+        current = segments[0].copy()
+
+        for next_seg in segments[1:]:
+            gap = next_seg['start'] - current['end']
+            current_duration = current['end'] - current['start']
+            combined_duration = next_seg['end'] - current['start']
+
+            should_merge = False
+
+            # 条件 1: 基础合并（间隔小且总长不超标）
+            if gap <= max_gap and combined_duration <= max_duration:
+                should_merge = True
+
+            # 条件 2: 碎片保护（当前段极短，可能是被切断的单词）
+            # 例如: "It's" (0.5s) ... [gap 1.5s] ... "only..."
+            elif current_duration < min_fragment_duration and combined_duration <= max_duration:
+                # 限制 gap 不超过 3s，避免引入过长静音
+                if gap < 3.0:
+                    self.logger.debug(
+                        f"碎片强制合并: fragment={current_duration:.2f}s, gap={gap:.2f}s"
+                    )
+                    should_merge = True
+
+            if should_merge:
+                current['end'] = next_seg['end']
+            else:
+                merged.append(current)
+                current = next_seg.copy()
+
+        merged.append(current)
+
+        # 重新编号
+        for i, seg in enumerate(merged):
+            seg['index'] = i
+
+        self.logger.info(
+            f"VAD 智能合并: 原始 {len(segments)} -> 合并后 {len(merged)} 段 "
+            f"(max_gap={max_gap}s, max_dur={max_duration}s)"
+        )
+        return merged
 
     def _init_chunk_states(
         self,
@@ -4502,7 +4588,16 @@ class TranscriptionService:
 
             # 2. VAD 物理切分
             progress_tracker.start_phase(ProcessPhase.VAD, 1, "VAD 切分...")
-            vad_segments = self._memory_vad_split(audio_array, sr, job)
+            raw_vad_segments = self._memory_vad_split(audio_array, sr, job)
+
+            # 【阶段二】Post-VAD 智能合并层
+            # max_gap=1.0s 涵盖慢语速场景，碎片保护避免短片段孤立
+            vad_segments = self._merge_vad_segments(
+                raw_vad_segments,
+                max_gap=1.0,
+                max_duration=25.0,
+                min_fragment_duration=1.0
+            )
             progress_tracker.complete_phase(ProcessPhase.VAD)
 
             # 3. 频谱分诊（Chunk级别）
