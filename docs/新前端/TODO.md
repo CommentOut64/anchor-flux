@@ -100,16 +100,15 @@ curl -v -H "Authorization: Bearer wgh-gemini-c" "https://wgh-gb.zeabur.app/v1bet
 
 F:\video_to_srt_gpu\.venv\lib\site-packages\torch\nn\modules\activation.py:1230: UserWarning: 1Torch was not compiled with flash attention. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\builder\windows\pytorch\aten\src\ATen\native\transformers\cuda\sdp_utils.cpp:555.)
   return torch._native_multi_head_attention(
-  
-  
-  Failed to load resource: the server responded with a status of 404 (Not Found)
-index.vue:407  Wavesurfer error: Error: Failed to fetch /api/media/77414c60dca24ab2a8b614d4c60e1040/audio: 404 (Not Found)
-    at Object.<anonymous> (wavesurfer.esm.js:1:2490)
-    at Generator.next (<anonymous>)
-    at o2 (wavesurfer.esm.js:1:85)
-(anonymous) @ index.vue:407
-index.vue:415 [WaveformTimeline] 自动重试 1/3
-wavesurfer.esm.js:1  Uncaught (in promise) Error: Failed to fetch /api/media/77414c60dca24ab2a8b614d4c60e1040/audio: 404 (Not Found)
-    at Object.<anonymous> (wavesurfer.esm.js:1:2490)
-    at Generator.next (<anonymous>)
-    at o2 (wavesurfer.esm.js:1:85)
+
+
+
+1.Post-VAD 智能合并层
+2：强制关键补刀
+第2点特别注意：默认使用medium模型，但提供更高的配置选项，whisper模型统一接入现有的模型下载管理器；对于强制对齐的细节在文档末尾还有讨论仔细阅读分析。
+3.过滤 Tags
+4.VAD 边缘吸附
+5.Word-Level Trigger（字级触发）
+
+补充：1.理论上项目已经实现了对于字级置信度低的字在前端高亮的代码，但现在没有正常显示，分析是否忘记了在前端集成
+2.进行所有上述的修改后，要对四层分句系统进行重新审视，看哪些部分需要做调整

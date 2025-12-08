@@ -148,12 +148,13 @@ class SplitConfig:
     # 边界修剪
     trim_leading_silence: bool = True            # 修剪句首静音
     trim_trailing_silence: bool = True           # 修剪句尾静音
-    max_boundary_gap: float = 0.15               # 最大允许的边界间隙(秒)
+    max_boundary_gap: float = 0.3                # 最大允许的边界间隙(秒)，放宽至0.3避免过度修剪
 
     # 动态停顿
     use_dynamic_pause: bool = True               # 启用动态停顿阈值
     speech_rate_window: int = 10                 # 语速计算窗口(字数)
-    pause_multiplier: float = 2.0                # 停顿阈值 = 中位数字间隔 * multiplier
+    pause_multiplier: float = 2.5                # 停顿阈值 = 百分位字间隔 * multiplier (提高至2.5)
+    min_pause_threshold: float = 0.3             # 最小停顿阈值(秒)，避免快语速场景下过度分句
 
     # 智能分句
     prefer_punctuation_break: bool = True        # 优先在标点处断句
@@ -309,9 +310,9 @@ class SentenceSplitter:
         根据局部语速计算动态停顿阈值
 
         优化策略:
-        - 使用中位数而非平均值，抗噪性更强
-        - 混合动态权重和静态基准，避免极端情况
-        - 设置阈值上下限，保证合理范围
+        - 使用 75th 百分位数，抗噪性强且避免对快速语音过度敏感
+        - 混合动态权重(50%)和静态基准(50%)，保持稳定性
+        - 使用可配置的最小阈值，避免极端情况
 
         Args:
             words: 字级时间戳列表
@@ -339,21 +340,24 @@ class SentenceSplitter:
         if not intervals:
             return self.config.pause_threshold
 
-        # 优化: 使用中位数而非平均值，避免异常值干扰
-        median_interval = statistics.median(intervals)
+        # 优化: 使用 75th 百分位数，避免快速语音场景下阈值过低
+        intervals_sorted = sorted(intervals)
+        percentile_75_idx = int(len(intervals_sorted) * 0.75)
+        percentile_75 = intervals_sorted[min(percentile_75_idx, len(intervals_sorted) - 1)]
 
-        # 优化: 混合动态权重和静态基准，防止阈值振荡
-        # 动态权重 0.7 + 静态基准 0.3
+        # 优化: 混合动态权重(50%)和静态基准(50%)，提高稳定性
+        # 动态权重 0.5 + 静态基准 0.5
         weighted_threshold = (
-            median_interval * self.config.pause_multiplier * 0.7 +
-            self.config.pause_threshold * 0.3
+            percentile_75 * self.config.pause_multiplier * 0.5 +
+            self.config.pause_threshold * 0.5
         )
 
-        # 优化: 设置明确的上下限
-        final_threshold = max(min(weighted_threshold, 2.0), 0.2)
+        # 优化: 使用可配置的最小阈值，确保快速语音场景下不会过度分句
+        min_threshold = getattr(self.config, 'min_pause_threshold', 0.3)
+        final_threshold = max(min(weighted_threshold, 2.0), min_threshold)
 
         logger.debug(
-            f"动态停顿阈值: 中位数={median_interval:.3f}s, "
+            f"动态停顿阈值: 75th百分位={percentile_75:.3f}s, "
             f"加权阈值={weighted_threshold:.3f}s, "
             f"最终阈值={final_threshold:.3f}s"
         )
@@ -442,21 +446,28 @@ class SentenceSplitter:
     def _create_sentence(self, words: List['WordTimestamp']) -> Optional['SentenceSegment']:
         """创建句子对象 (集成边界修剪)"""
         from ..models.sensevoice_models import SentenceSegment
+        from ..services.text_normalizer import get_text_normalizer
 
         if not words:
             return None
 
-        text = "".join(w.word for w in words)
+        # 原始文本（包含标签和连字符）
+        text_raw = "".join(w.word for w in words)
 
-        # 过滤过短句子
-        if len(text.strip()) < self.config.min_chars:
+        # 清洗文本（去除标签和连字符）
+        normalizer = get_text_normalizer()
+        text_clean = normalizer.clean(text_raw)
+
+        # 过滤过短句子（基于清洗后的文本）
+        if len(text_clean.strip()) < self.config.min_chars:
             return None
 
         # 计算平均置信度
         avg_confidence = sum(w.confidence for w in words) / len(words)
 
         sentence = SentenceSegment(
-            text=text,
+            text=text_raw,  # 保留原始文本用于调试
+            text_clean=text_clean,  # 清洗后的文本用于展示
             start=words[0].start,
             end=words[-1].end,
             words=words.copy(),

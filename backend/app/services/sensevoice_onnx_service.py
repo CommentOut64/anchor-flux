@@ -460,6 +460,18 @@ class SenseVoiceONNXService:
             # 3. CTC 解码
             text, word_timestamps, confidence = self.decoder.decode(logits, self.time_stride)
 
+            # 【阶段一】过滤特殊标记，修复时间戳前移问题
+            # 特殊标记格式：<|xxx|>，如 <|en|>, <|EMO_UNKNOWN|>, <|Speech|>, <|withitn|>
+            # 这些标记占用时间轴约 0.24s，导致字幕时间戳整体前移
+            clean_word_timestamps = []
+            for w in word_timestamps:
+                word = w.get("word", "")
+                if word.startswith("<|") and word.endswith("|>"):
+                    # 跳过特殊标记，它们不应占用时间轴
+                    continue
+                clean_word_timestamps.append(w)
+            word_timestamps = clean_word_timestamps
+
             # 4. 提取标签信息
             from ..services.text_normalizer import get_text_normalizer
             normalizer = get_text_normalizer()

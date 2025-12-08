@@ -41,6 +41,11 @@ class ThresholdConfig:
     # Whisper 补刀触发条件
     whisper_patch_trigger_confidence: float = 0.6  # 低于此值触发补刀
 
+    # 短片段强制补刀条件 (应对 CTC 对快速语音的限制)
+    short_segment_duration: float = 1.0  # 短片段时长阈值(秒)
+    short_segment_chars: int = 3         # 短片段字符数阈值
+    single_char_force_patch: bool = True # 单字符结果强制补刀
+
     # LLM 校对触发条件
     llm_proof_trigger_confidence: float = 0.7      # 低于此值触发校对
     llm_proof_trigger_modified: bool = True        # 被修改过的句子是否触发校对
@@ -83,12 +88,24 @@ def get_confidence_level(confidence: float, config: ThresholdConfig = None) -> C
         return ConfidenceLevel.CRITICAL
 
 
-def needs_whisper_patch(confidence: float, config: ThresholdConfig = None) -> bool:
+def needs_whisper_patch(
+    confidence: float,
+    duration: float = None,
+    text_length: int = None,
+    config: ThresholdConfig = None
+) -> bool:
     """
     判断是否需要 Whisper 补刀
 
+    触发条件（满足任一即触发）：
+    1. 置信度低于阈值
+    2. 短片段 + 少字符（CTC 解码限制）
+    3. 单字符结果（可能是 CTC 漏字）
+
     Args:
         confidence: 置信度值
+        duration: 片段时长(秒)，用于短片段检测
+        text_length: 文本字符数（清洗后），用于短片段检测
         config: 阈值配置
 
     Returns:
@@ -96,7 +113,24 @@ def needs_whisper_patch(confidence: float, config: ThresholdConfig = None) -> bo
     """
     if config is None:
         config = DEFAULT_THRESHOLDS
-    return confidence < config.whisper_patch_trigger_confidence
+
+    # 条件 1: 低置信度触发
+    if confidence < config.whisper_patch_trigger_confidence:
+        return True
+
+    # 条件 2: 短片段 + 少字符 (应对 CTC 对快速语音的限制)
+    # 时长 < 1s 且字符数 < 3 时，CTC 可能遗漏快速语音
+    if duration is not None and text_length is not None:
+        if (duration < config.short_segment_duration and
+            text_length < config.short_segment_chars):
+            return True
+
+    # 条件 3: 单字符结果强制补刀 (极可能是 CTC 漏字)
+    if config.single_char_force_patch and text_length is not None:
+        if text_length == 1:
+            return True
+
+    return False
 
 
 def needs_llm_proof(

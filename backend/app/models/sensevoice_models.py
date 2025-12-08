@@ -109,9 +109,10 @@ class SenseVoiceResult:
 @dataclass
 class SentenceSegment:
     """句级字幕段（时空解耦版）"""
-    text: str
-    start: float
-    end: float
+    text: str  # 原始文本（包含标签和连字符）
+    text_clean: str = ""  # 清洗后的文本（用于展示）
+    start: float = 0.0
+    end: float = 0.0
     words: List[WordTimestamp] = field(default_factory=list)
     confidence: float = 1.0
 
@@ -137,6 +138,7 @@ class SentenceSegment:
         if not self.is_modified:
             self.original_text = self.text
         self.text = new_text
+        self.text_clean = new_text  # 同时更新清洗后的文本
         self.source = source
         self.is_modified = True
 
@@ -160,7 +162,7 @@ class SentenceSegment:
     def to_dict(self) -> Dict:
         """转换为字典格式（用于 SSE 推送）"""
         return {
-            "text": self.text,
+            "text": self.text_clean or self.text,  # 优先使用清洗后的文本
             "start": self.start,
             "end": self.end,
             "confidence": self.confidence,

@@ -54,14 +54,23 @@ class StreamingSubtitleManager:
         self.sentences[index] = sentence
         self.sentence_count += 1
 
-        # 推送 SSE 事件
+        # 推送 SSE 事件（使用清洗后的文本）
+        sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
+            "index": index,
+            "text": sentence.text_clean or sentence.text,  # 优先使用清洗后的文本
+            "start": sentence.start,
+            "end": sentence.end,
+            "confidence": sentence.confidence,
+            "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source)
+        }
+
         push_subtitle_event(
             self.sse_manager,
             self.job_id,
             "sv_sentence",
             {
                 "index": index,
-                "sentence": sentence.to_dict(),
+                "sentence": sentence_dict,
                 "source": "sensevoice"
             }
         )

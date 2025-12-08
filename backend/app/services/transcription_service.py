@@ -41,15 +41,19 @@ class VADConfig:
     用于配置语音活动检测的参数
     
     参数说明：
-    - onset (0.0-1.0)：语音开始阈值，越高越严格，推荐0.6-0.7以过滤背景音乐
-    - offset (0.0-1.0)：语音结束阈值，通常为onset的70%左右
+    - onset (0.0-1.0)：语音开始阈值，越高越严格，推荐0.5-0.6以避免截断语音起始
+    - offset (0.0-1.0)：语音结束阈值，通常为onset的80%左右
     - min_speech_duration_ms：最小语音段长度，避免误检碎片音（推荐300-500ms）
     - min_silence_duration_ms：最小静音长度，越长越能过滤背景音乐（推荐300-500ms）
+
+    修改历史：
+    - 2025-12: onset 从 0.7 降低至 0.5，offset 从 0.5 降低至 0.4
+      原因：避免语音起始被截断，提高时间戳准确性
     """
     method: VADMethod = VADMethod.SILERO  # 默认使用Silero
     hf_token: Optional[str] = None         # Pyannote需要的HF Token
-    onset: float = 0.7                     # 语音开始阈值（提升至0.7以更严格过滤）
-    offset: float = 0.5                    # 语音结束阈值（对应onset=0.7的调整）
+    onset: float = 0.5                     # 语音开始阈值（降低至0.5避免截断）
+    offset: float = 0.4                    # 语音结束阈值（对应onset=0.5的调整）
     chunk_size: int = 30                   # 最大段长（秒）
     min_speech_duration_ms: int = 500      # 最小语音段长度（提升至500ms，过滤短噪音）
     min_silence_duration_ms: int = 500     # 最小静音长度（提升至500ms，确保断句清晰）
@@ -4040,13 +4044,13 @@ class TranscriptionService:
             end_ts = self._format_ts(sentence.end)
             lines.append(f"{start_ts} --> {end_ts}")
 
-            # 字幕文本
+            # 字幕文本（使用清洗后的文本）
             if include_translation and sentence.translation:
                 # 双语字幕：原文 + 翻译
-                lines.append(sentence.text)
+                lines.append(sentence.text_clean or sentence.text)
                 lines.append(sentence.translation)
             else:
-                lines.append(sentence.text)
+                lines.append(sentence.text_clean or sentence.text)
 
             # 空行分隔
             lines.append("")
@@ -4096,8 +4100,8 @@ class TranscriptionService:
                 }
 
                 # 添加字级时间戳
-                if hasattr(sentence, 'word_timestamps') and sentence.word_timestamps:
-                    for word in sentence.word_timestamps:
+                if hasattr(sentence, 'words') and sentence.words:
+                    for word in sentence.words:
                         word_data = {
                             "word": word.word,
                             "start": word.start,
@@ -4411,7 +4415,17 @@ class TranscriptionService:
         patch_queue = []
         if solution_config.enhancement != EnhancementMode.OFF:
             for i, sentence in enumerate(sentences):
-                if needs_whisper_patch(sentence.confidence):
+                # 计算片段时长和清洗后文本长度（用于短片段检测）
+                duration = sentence.end - sentence.start
+                text_clean = getattr(sentence, 'text_clean', None) or sentence.text
+                text_length = len(text_clean.strip()) if text_clean else 0
+
+                # 增强版补刀判断：置信度、短片段、单字符
+                if needs_whisper_patch(
+                    sentence.confidence,
+                    duration=duration,
+                    text_length=text_length
+                ):
                     patch_queue.append((i, sentence))
 
         # 2. Whisper 补刀阶段
