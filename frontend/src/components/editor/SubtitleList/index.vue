@@ -87,15 +87,29 @@
             <span class="duration-tag">{{ formatDuration(subtitle.end - subtitle.start) }}</span>
           </div>
 
-          <!-- 文本行 -->
+          <!-- 文本行（Toggle Mode：只读高亮视图 ⇄ 编辑模式） -->
           <div class="text-row">
+            <!-- 只读高亮视图 -->
+            <div
+              v-if="editingSubtitleId !== subtitle.id"
+              class="text-display"
+              :class="{ 'can-edit': props.editable }"
+              @click="startEditing(subtitle.id)"
+              v-html="renderTextWithHighlight(subtitle)"
+            ></div>
+
+            <!-- 编辑模式 -->
             <textarea
+              v-else
+              ref="editTextarea"
               class="text-input"
               :value="subtitle.text"
               @input="e => updateText(subtitle.id, e.target.value)"
+              @blur="stopEditing"
               placeholder="输入字幕文本..."
               rows="2"
             ></textarea>
+
             <span class="char-count" :class="{ warning: subtitle.text.length > 30 }">
               {{ subtitle.text.length }}
             </span>
@@ -154,9 +168,12 @@ const projectStore = useProjectStore()
 
 // Refs
 const listRef = ref(null)
+const editTextarea = ref(null)
 
 // State
 const searchText = ref('')
+const editingSubtitleId = ref(null)
+const originalTexts = ref(new Map())  // 记录原始文本，用于检测修改
 
 // Computed
 const subtitles = computed(() => projectStore.subtitles)
@@ -195,6 +212,65 @@ function updateTime(id, field, value) {
 function updateText(id, text) {
   projectStore.updateSubtitle(id, { text })
   emit('subtitle-edit', id, 'text', text)
+
+  // 标记文本已修改（清除高亮数据关联）
+  if (!originalTexts.value.has(id)) {
+    const subtitle = subtitles.value.find(s => s.id === id)
+    if (subtitle) {
+      originalTexts.value.set(id, subtitle.text)
+    }
+  }
+}
+
+function startEditing(id) {
+  if (!props.editable) return
+  editingSubtitleId.value = id
+  nextTick(() => {
+    if (editTextarea.value) {
+      editTextarea.value.focus()
+    }
+  })
+}
+
+function stopEditing() {
+  editingSubtitleId.value = null
+}
+
+function renderTextWithHighlight(subtitle) {
+  // 如果文本被修改过，不显示高亮
+  if (originalTexts.value.has(subtitle.id)) {
+    return escapeHtml(subtitle.text)
+  }
+
+  // 如果没有字级数据，直接返回文本
+  if (!subtitle.words || subtitle.words.length === 0) {
+    return escapeHtml(subtitle.text)
+  }
+
+  const WARN_THRESHOLD = 0.5
+  const CRITICAL_THRESHOLD = 0.3
+
+  let html = ''
+  for (const word of subtitle.words) {
+    const conf = word.confidence !== undefined ? word.confidence : 1.0
+    const text = escapeHtml(word.word)
+
+    if (conf < CRITICAL_THRESHOLD) {
+      html += `<span class="word-critical">${text}</span>`
+    } else if (conf < WARN_THRESHOLD) {
+      html += `<span class="word-warning">${text}</span>`
+    } else {
+      html += text
+    }
+  }
+  return html
+}
+
+function escapeHtml(text) {
+  if (!text) return ''
+  const div = document.createElement('div')
+  div.textContent = text
+  return div.innerHTML
 }
 
 function deleteSubtitle(id) {
@@ -547,9 +623,49 @@ function formatDuration(seconds) {
   }
 }
 
-// 文本行 - 优化尺寸
+// 文本行 - 优化尺寸（支持 Toggle Mode）
 .text-row {
   position: relative;
+
+  // 只读高亮视图
+  .text-display {
+    width: 100%;
+    min-height: 45px;
+    padding: 6px 35px 6px 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    color: var(--text-normal);
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    cursor: default;
+
+    &.can-edit {
+      cursor: text;
+      &:hover {
+        border-color: var(--primary);
+        background: var(--bg-secondary);
+      }
+    }
+
+    // 字级警告高亮样式
+    :deep(.word-warning) {
+      background-color: rgba(255, 193, 7, 0.25);
+      border-bottom: 2px solid var(--warning, #ffc107);
+      padding: 0 2px;
+      border-radius: 2px;
+    }
+
+    :deep(.word-critical) {
+      background-color: rgba(244, 67, 54, 0.25);
+      border-bottom: 2px solid var(--error, #f44336);
+      padding: 0 2px;
+      border-radius: 2px;
+      font-weight: 500;
+    }
+  }
 
   .text-input {
     width: 100%;
