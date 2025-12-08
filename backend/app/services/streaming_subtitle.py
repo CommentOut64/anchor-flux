@@ -7,8 +7,8 @@
 3. 支持多阶段增量更新（SV → Whisper → LLM）
 """
 from typing import Dict, List, Optional
-from ..models.sensevoice_models import SentenceSegment, TextSource
-from .sse_service import get_sse_manager
+from app.models.sensevoice_models import SentenceSegment, TextSource
+from app.services.sse_service import get_sse_manager
 import logging
 
 logger = logging.getLogger(__name__)
@@ -25,9 +25,9 @@ def push_subtitle_event(sse_manager, job_id: str, event_type: str, data: dict):
         data: 事件数据
     """
     sse_manager.broadcast_sync(
-        channel=f"job:{job_id}",
-        event_type=f"subtitle.{event_type}",
-        data=data
+        f"job:{job_id}",
+        f"subtitle.{event_type}",
+        data
     )
 
 

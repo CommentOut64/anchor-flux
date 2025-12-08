@@ -13,8 +13,8 @@ from typing import Dict, Optional, Literal
 from pathlib import Path
 import torch
 
-from models.job_models import JobState
-from services.sse_service import get_sse_manager
+from app.models.job_models import JobState
+from app.services.sse_service import get_sse_manager
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ class JobQueueService:
         self.lock = threading.RLock()  # 使用可重入锁，避免嵌套调用死锁
 
         # 持久化文件路径
-        from core.config import config
+        from app.core.config import config
         self.queue_file = Path(config.JOBS_DIR) / "queue_state.json"
         self.settings_file = Path(config.JOBS_DIR) / "queue_settings.json"
 
@@ -316,7 +316,7 @@ class JobQueueService:
 
                 try:
                     # 根据引擎选择流水线
-                    engine = getattr(job.settings, 'engine', 'whisper')
+                    engine = getattr(job.settings, 'engine', 'sensevoice')
                     if engine == 'sensevoice':
                         # SenseVoice 流水线（异步，使用频谱分诊）
                         logger.info(f"使用 SenseVoice 流水线")

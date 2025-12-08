@@ -96,3 +96,20 @@ index.vue:332  [VideoStage] 视频源切换失败: Error: 加载失败
 
 
 curl -v -H "Authorization: Bearer wgh-gemini-c" "https://wgh-gb.zeabur.app/v1beta/models"
+
+
+F:\video_to_srt_gpu\.venv\lib\site-packages\torch\nn\modules\activation.py:1230: UserWarning: 1Torch was not compiled with flash attention. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\builder\windows\pytorch\aten\src\ATen\native\transformers\cuda\sdp_utils.cpp:555.)
+  return torch._native_multi_head_attention(
+  
+  
+  Failed to load resource: the server responded with a status of 404 (Not Found)
+index.vue:407  Wavesurfer error: Error: Failed to fetch /api/media/77414c60dca24ab2a8b614d4c60e1040/audio: 404 (Not Found)
+    at Object.<anonymous> (wavesurfer.esm.js:1:2490)
+    at Generator.next (<anonymous>)
+    at o2 (wavesurfer.esm.js:1:85)
+(anonymous) @ index.vue:407
+index.vue:415 [WaveformTimeline] 自动重试 1/3
+wavesurfer.esm.js:1  Uncaught (in promise) Error: Failed to fetch /api/media/77414c60dca24ab2a8b614d4c60e1040/audio: 404 (Not Found)
+    at Object.<anonymous> (wavesurfer.esm.js:1:2490)
+    at Generator.next (<anonymous>)
+    at o2 (wavesurfer.esm.js:1:85)

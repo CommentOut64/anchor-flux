@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 import urllib.request
 import platform
 
-from core.config import config
+from app.core.config import config
 
 
 class FFmpegManager:

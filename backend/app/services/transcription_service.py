@@ -9,7 +9,7 @@ from enum import Enum
 from dataclasses import dataclass, field
 from collections import OrderedDict  # 新增导入
 from pydub import AudioSegment, silence
-from .whisper_service import get_whisper_service, load_audio as whisper_load_audio
+from app.services.whisper_service import get_whisper_service, load_audio as whisper_load_audio
 import torch
 import shutil
 import psutil
@@ -344,12 +344,12 @@ class CircuitBreakHandler:
             self.logger.debug(f"SSE推送失败（非致命）: {e}")
 
 
-from models.job_models import JobSettings, JobState
-from models.hardware_models import HardwareInfo, OptimizationConfig
-from services.hardware_service import get_hardware_detector, get_hardware_optimizer
-from services.cpu_affinity_service import CPUAffinityManager, CPUAffinityConfig
-from services.job_index_service import get_job_index_service
-from core.config import config  # 导入统一配置
+from app.models.job_models import JobSettings, JobState
+from app.models.hardware_models import HardwareInfo, OptimizationConfig
+from app.services.hardware_service import get_hardware_detector, get_hardware_optimizer
+from app.services.cpu_affinity_service import CPUAffinityManager, CPUAffinityConfig
+from app.services.job_index_service import get_job_index_service
+from app.core.config import config  # 导入统一配置
 
 # 全局模型缓存 (按 (model, compute_type, device) 键)
 _model_cache: Dict[Tuple[str, str, str], object] = {}
@@ -393,7 +393,7 @@ class TranscriptionService:
         self.job_index.cleanup_invalid_mappings()
 
         # 集成SSE管理器（用于实时进度推送）
-        from services.sse_service import get_sse_manager
+        from app.services.sse_service import get_sse_manager
         self.sse_manager = get_sse_manager()
         self.logger.info("SSE管理器已集成")
 
@@ -790,7 +790,7 @@ class TranscriptionService:
                 return None
 
             # 创建默认的CPU亲和性配置
-            from services.cpu_affinity_service import CPUAffinityConfig
+            from app.services.cpu_affinity_service import CPUAffinityConfig
             default_cpu_config = CPUAffinityConfig(
                 enabled=True,
                 strategy="auto",
@@ -1027,7 +1027,7 @@ class TranscriptionService:
         """
         try:
             # 动态获取SSE管理器（确保获取到已设置loop的实例）
-            from services.sse_service import get_sse_manager
+            from app.services.sse_service import get_sse_manager
             sse_manager = get_sse_manager()
 
             # 1. 推送到单任务频道（EditorView 使用）
@@ -1073,7 +1073,7 @@ class TranscriptionService:
         """
         try:
             # 动态获取SSE管理器（确保获取到已设置loop的实例）
-            from services.sse_service import get_sse_manager
+            from app.services.sse_service import get_sse_manager
             sse_manager = get_sse_manager()
 
             channel_id = f"job:{job.job_id}"
@@ -1150,7 +1150,7 @@ class TranscriptionService:
         """
         try:
             # 动态获取SSE管理器
-            from services.sse_service import get_sse_manager
+            from app.services.sse_service import get_sse_manager
             sse_manager = get_sse_manager()
 
             channel_id = f"job:{job.job_id}"
@@ -1183,7 +1183,7 @@ class TranscriptionService:
         """
         try:
             # 动态获取SSE管理器
-            from services.sse_service import get_sse_manager
+            from app.services.sse_service import get_sse_manager
             sse_manager = get_sse_manager()
 
             channel_id = f"job:{job.job_id}"
@@ -1428,7 +1428,7 @@ class TranscriptionService:
             # ==========================================
             # 2. 阶段2: BGM检测（可选）
             # ==========================================
-            from services.demucs_service import BGMLevel
+            from app.services.demucs_service import BGMLevel
 
             bgm_level = BGMLevel.NONE
             bgm_ratios = []
@@ -1449,7 +1449,7 @@ class TranscriptionService:
 
                     # 如果 BGM 检测结果为 NONE，立即卸载 Demucs 模型释放显存
                     if bgm_level == BGMLevel.NONE:
-                        from services.demucs_service import get_demucs_service
+                        from app.services.demucs_service import get_demucs_service
                         demucs_service = get_demucs_service()
                         if demucs_service.is_model_loaded():
                             self.logger.info("BGM 检测为 NONE，卸载 Demucs 模型释放显存")
@@ -1465,7 +1465,7 @@ class TranscriptionService:
             # 只有启用 Demucs 时才生成分离策略
             if demucs_settings.enabled:
                 # 【新增】使用策略解析器决定分离策略
-                from services.demucs_service import SeparationStrategyResolver, get_demucs_service
+                from app.services.demucs_service import SeparationStrategyResolver, get_demucs_service
                 strategy_resolver = SeparationStrategyResolver(demucs_settings)
                 separation_strategy = strategy_resolver.resolve(bgm_level)
 
@@ -1489,7 +1489,7 @@ class TranscriptionService:
             # 如果策略要求分离且尚未完成
             if separation_strategy and separation_strategy.should_separate and not use_vocals:
                 # 【关键】根据策略选择模型
-                from services.demucs_service import get_demucs_service
+                from app.services.demucs_service import get_demucs_service
                 demucs_service = get_demucs_service()
                 demucs_service.set_model_for_strategy(separation_strategy)
 
@@ -1545,7 +1545,7 @@ class TranscriptionService:
                 if processing_mode == ProcessingMode.MEMORY and audio_array is not None:
                     # 内存模式：VAD分段（不产生磁盘IO）
                     self.logger.info("使用内存VAD分段（高性能模式）")
-                    from services.transcription_service import VADConfig
+                    from app.services.transcription_service import VADConfig
                     current_segments = self._split_audio_in_memory(
                         audio_array,
                         sr=16000,
@@ -1713,7 +1713,7 @@ class TranscriptionService:
                     fallback = separation_strategy.fallback_model
                     if fallback:
                         self.logger.info(f"模型升级: {separation_strategy.initial_model} → {fallback}")
-                        from services.demucs_service import get_demucs_service
+                        from app.services.demucs_service import get_demucs_service
                         demucs_service = get_demucs_service()
                         demucs_service.set_model(fallback)
 
@@ -2354,6 +2354,72 @@ class TranscriptionService:
     def _detect_bgm(self, audio_path: str, job: JobState):
         """
         执行BGM检测，更新进度
+        
+        【v2.1 重构】使用频谱分诊替代旧的分位数采样 + Demucs 检测
+        新方法：纯频谱特征分析，无需运行 Demucs，速度更快且更准确
+
+        Args:
+            audio_path: 音频文件路径
+            job: 任务状态对象
+
+        Returns:
+            Tuple[BGMLevel, List[float]]: (BGM强度级别, 各采样点的音乐得分列表)
+        """
+        from app.services.demucs_service import BGMLevel
+        from app.services.audio_spectrum_classifier import get_spectrum_classifier
+        import librosa
+
+        self._update_progress(job, 'bgm_detect', 0, 'BGM检测中（频谱分诊）...')
+
+        try:
+            # 加载音频
+            audio_array, sr = librosa.load(audio_path, sr=16000)
+            
+            # 使用频谱分诊器进行快速全局预判
+            spectrum_classifier = get_spectrum_classifier()
+            level_str, avg_score = spectrum_classifier.quick_global_diagnosis(
+                audio_array, sr=sr, sample_duration=10.0
+            )
+            
+            # 转换为 BGMLevel 枚举
+            level_map = {
+                "none": BGMLevel.NONE,
+                "light": BGMLevel.LIGHT,
+                "heavy": BGMLevel.HEAVY,
+                "unknown": BGMLevel.LIGHT  # unknown 保守处理为 light
+            }
+            level = level_map.get(level_str, BGMLevel.LIGHT)
+            
+            # 构造兼容的 ratios 列表（用于日志和 SSE）
+            # 频谱分诊返回的是音乐得分，这里用 avg_score 填充
+            ratios = [avg_score, avg_score, avg_score]
+
+            self._update_progress(job, 'bgm_detect', 1, f'BGM检测完成: {level.value}')
+
+            # 推送SSE事件
+            self._push_sse_bgm_detected(job, level, ratios)
+
+            self.logger.info(
+                f"BGM检测结果（频谱分诊）: {level.value}, "
+                f"音乐得分={avg_score:.2f}"
+            )
+
+            return level, ratios
+
+        except Exception as e:
+            self.logger.warning(f"BGM检测失败，将跳过Demucs: {e}")
+            # 失败时返回 NONE 级别，不影响主流程
+            from app.services.demucs_service import BGMLevel
+            return BGMLevel.NONE, []
+    
+    def _detect_bgm_legacy(self, audio_path: str, job: JobState):
+        """
+        [已废弃] 执行BGM检测（旧版：分位数采样 + Demucs 检测）
+        
+        ⚠️ 此方法已废弃，保留供参考和回退使用
+        问题：Demucs 分离残差约 1-3%，导致纯人声也被误判为 light
+        
+        新方法请使用 _detect_bgm()（频谱分诊版本）
 
         Args:
             audio_path: 音频文件路径
@@ -2362,14 +2428,14 @@ class TranscriptionService:
         Returns:
             Tuple[BGMLevel, List[float]]: (BGM强度级别, 各采样点的BGM比例列表)
         """
-        from services.demucs_service import get_demucs_service, BGMLevel
+        from app.services.demucs_service import get_demucs_service, BGMLevel
 
         self._update_progress(job, 'bgm_detect', 0, 'BGM检测中...')
 
         try:
             demucs = get_demucs_service()
 
-            # 执行BGM检测
+            # 执行BGM检测（旧版：分位数采样）
             level, ratios = demucs.detect_background_music_level(audio_path)
 
             self._update_progress(job, 'bgm_detect', 1, f'BGM检测完成: {level.value}')
@@ -2387,7 +2453,7 @@ class TranscriptionService:
         except Exception as e:
             self.logger.warning(f"BGM检测失败，将跳过Demucs: {e}")
             # 失败时返回 NONE 级别，不影响主流程
-            from services.demucs_service import BGMLevel
+            from app.services.demucs_service import BGMLevel
             return BGMLevel.NONE, []
 
     def _separate_vocals_global(self, audio_path: str, job: JobState) -> str:
@@ -2401,7 +2467,7 @@ class TranscriptionService:
         Returns:
             str: 分离后的人声文件路径
         """
-        from services.demucs_service import get_demucs_service
+        from app.services.demucs_service import get_demucs_service
 
         self._update_progress(job, 'demucs_global', 0, '人声分离中...')
 
@@ -2439,7 +2505,7 @@ class TranscriptionService:
             ratios: 各采样点的BGM比例列表
         """
         try:
-            from services.sse_service import get_sse_manager
+            from app.services.sse_service import get_sse_manager
 
             sse_manager = get_sse_manager()
             channel_id = f"job:{job.job_id}"
@@ -2472,7 +2538,7 @@ class TranscriptionService:
             strategy: SeparationStrategy 对象
         """
         try:
-            from services.sse_service import get_sse_manager
+            from app.services.sse_service import get_sse_manager
 
             sse_manager = get_sse_manager()
             channel_id = f"job:{job.job_id}"
@@ -2508,7 +2574,7 @@ class TranscriptionService:
             breaker_state: 熔断器状态
         """
         try:
-            from services.sse_service import get_sse_manager
+            from app.services.sse_service import get_sse_manager
 
             sse_manager = get_sse_manager()
             channel_id = f"job:{job.job_id}"
@@ -2545,7 +2611,7 @@ class TranscriptionService:
             circuit_breaker: 熔断器状态对象
         """
         try:
-            from services.sse_service import get_sse_manager
+            from app.services.sse_service import get_sse_manager
 
             sse_manager = get_sse_manager()
             channel_id = f"job:{job.job_id}"
@@ -2605,7 +2671,7 @@ class TranscriptionService:
         Returns:
             str: 建议的处理模式描述
         """
-        from services.demucs_service import BGMLevel
+        from app.services.demucs_service import BGMLevel
 
         if level == BGMLevel.HEAVY:
             return "全局分离"
@@ -2778,7 +2844,7 @@ class TranscriptionService:
 
         # 尝试按需分离
         try:
-            from services.demucs_service import get_demucs_service
+            from app.services.demucs_service import get_demucs_service
             demucs = get_demucs_service()
 
             start_sec = seg_meta['start']
@@ -2976,7 +3042,7 @@ class TranscriptionService:
         """
         # 尝试使用模型管理服务检查并下载模型
         try:
-            from services.model_manager_service import get_model_manager
+            from app.services.model_manager_service import get_model_manager
             model_mgr = get_model_manager()
             whisper_model_info = model_mgr.whisper_models.get(settings.model)
 
@@ -3053,7 +3119,7 @@ class TranscriptionService:
 
         # 尝试使用模型预加载管理器
         try:
-            from services.model_preload_manager import get_model_manager as get_preload_manager
+            from app.services.model_preload_manager import get_model_manager as get_preload_manager
             model_manager = get_preload_manager()
             if model_manager:
                 self.logger.debug("使用模型预加载管理器获取模型")
@@ -3079,7 +3145,7 @@ class TranscriptionService:
 
             # 首先尝试仅使用本地文件 (使用 Faster-Whisper)
             try:
-                from core.config import config
+                from app.core.config import config
                 from faster_whisper import WhisperModel
                 m = WhisperModel(
                     settings.model,
@@ -3426,7 +3492,7 @@ class TranscriptionService:
             total_count: 总segment数量
         """
         try:
-            from services.sse_service import get_sse_manager
+            from app.services.sse_service import get_sse_manager
             sse_manager = get_sse_manager()
 
             channel_id = f"job:{job.job_id}"
@@ -3772,8 +3838,8 @@ class TranscriptionService:
                 - emotion: 情感标签
                 - event: 事件标签
         """
-        from .sensevoice_onnx_service import get_sensevoice_service
-        from ..models.sensevoice_models import SenseVoiceResult, WordTimestamp
+        from app.services.sensevoice_onnx_service import get_sensevoice_service
+        from app.models.sensevoice_models import SenseVoiceResult, WordTimestamp
 
         self.logger.info("调用 SenseVoice 转录服务")
 
@@ -3837,8 +3903,8 @@ class TranscriptionService:
         Returns:
             List[SentenceSegment]: 句子列表
         """
-        from ..models.sensevoice_models import SentenceSegment, TextSource
-        from .sentence_splitter import SentenceSplitter, SplitConfig
+        from app.models.sensevoice_models import SentenceSegment, TextSource
+        from app.services.sentence_splitter import SentenceSplitter, SplitConfig
 
         self.logger.info(f"开始句子切分: {len(sv_result.words)} 个字")
 
@@ -3850,11 +3916,11 @@ class TranscriptionService:
         splitter = SentenceSplitter(config)
         sentences = splitter.split(sv_result.words, sv_result.text_clean)
 
-        # Layer 2: 语义分组 (可选，暂不实现)
-        # if enable_grouping:
-        #     from .semantic_grouper import SemanticGrouper, GroupConfig
-        #     grouper = SemanticGrouper(GroupConfig())
-        #     sentences = grouper.group(sentences)
+        # Layer 2: 语义分组 (可选，已实现)
+        if enable_grouping:
+            from app.services.semantic_grouper import SemanticGrouper, GroupConfig
+            grouper = SemanticGrouper(GroupConfig(language=config.language))
+            sentences = grouper.group(sentences)
 
         # 调整时间偏移（将 Chunk 内的相对时间转换为绝对时间）
         for sentence in sentences:
@@ -3922,7 +3988,7 @@ class TranscriptionService:
         Returns:
             List[WordTimestamp]: 字级时间戳列表
         """
-        from ..models.sensevoice_models import WordTimestamp
+        from app.models.sensevoice_models import WordTimestamp
 
         if not text:
             return []
@@ -3992,6 +4058,72 @@ class TranscriptionService:
         self.logger.info(f"SRT字幕生成完成: {output_path}")
         return output_path
 
+    def _save_raw_transcription(
+        self,
+        job: 'JobState',
+        sentences: List['SentenceSegment']
+    ):
+        """
+        保存原始转录数据（未经 LLM 处理的 SenseVoice 原始输出）
+
+        Args:
+            job: 任务状态
+            sentences: 句子列表
+        """
+        import json
+        from pathlib import Path
+
+        try:
+            # 准备保存数据
+            raw_data = {
+                "job_id": job.job_id,
+                "filename": job.filename,
+                "timestamp": self._get_current_timestamp(),
+                "total_sentences": len(sentences),
+                "sentences": []
+            }
+
+            # 收集所有句子的原始数据
+            for idx, sentence in enumerate(sentences):
+                sentence_data = {
+                    "index": idx,
+                    "start": sentence.start,
+                    "end": sentence.end,
+                    "text": sentence.text,  # 包含原始标签的文本
+                    "confidence": sentence.confidence,
+                    "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
+                    "words": []
+                }
+
+                # 添加字级时间戳
+                if hasattr(sentence, 'word_timestamps') and sentence.word_timestamps:
+                    for word in sentence.word_timestamps:
+                        word_data = {
+                            "word": word.word,
+                            "start": word.start,
+                            "end": word.end,
+                            "confidence": word.confidence,
+                            "is_pseudo": word.is_pseudo
+                        }
+                        sentence_data["words"].append(word_data)
+
+                raw_data["sentences"].append(sentence_data)
+
+            # 保存到文件
+            output_path = Path(job.dir) / f"{job.job_id}_raw_transcription.json"
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(raw_data, f, ensure_ascii=False, indent=2)
+
+            self.logger.info(f"原始转录数据已保存: {output_path}")
+
+        except Exception as e:
+            self.logger.error(f"保存原始转录数据失败: {e}", exc_info=True)
+
+    def _get_current_timestamp(self) -> str:
+        """获取当前时间戳字符串"""
+        from datetime import datetime
+        return datetime.now().isoformat()
+
     def _memory_vad_split(
         self,
         audio_array: np.ndarray,
@@ -4012,8 +4144,11 @@ class TranscriptionService:
         """
         self.logger.info("开始 VAD 内存切分...")
 
+        # 创建默认 VAD 配置
+        vad_config = VADConfig()
+        
         # 调用现有的 _vad_silero 方法
-        vad_segments = self._vad_silero(audio_array, sr)
+        vad_segments = self._vad_silero(audio_array, sr, vad_config)
 
         # 转换为标准格式
         result = []
@@ -4047,7 +4182,7 @@ class TranscriptionService:
         Returns:
             List[ChunkProcessState]: Chunk 状态列表
         """
-        from ..models.circuit_breaker_models import ChunkProcessState, SeparationLevel
+        from app.models.circuit_breaker_models import ChunkProcessState, SeparationLevel
 
         self.logger.info(f"初始化 {len(vad_segments)} 个 Chunk 状态...")
 
@@ -4097,7 +4232,7 @@ class TranscriptionService:
         Returns:
             List[SentenceSegment]: 句子列表
         """
-        from .fuse_breaker import get_fuse_breaker, execute_fuse_upgrade, FuseAction
+        from app.services.fuse_breaker import get_fuse_breaker, execute_fuse_upgrade, FuseAction
 
         fuse_breaker = get_fuse_breaker()
 
@@ -4179,8 +4314,8 @@ class TranscriptionService:
         Returns:
             SentenceSegment: 更新后的句子
         """
-        from .whisper_service import get_whisper_service
-        from ..models.sensevoice_models import TextSource
+        from app.services.whisper_service import get_whisper_service
+        from app.models.sensevoice_models import TextSource
 
         whisper_service = get_whisper_service()
 
@@ -4266,9 +4401,9 @@ class TranscriptionService:
         Returns:
             List[SentenceSegment]: 增强后的句子列表
         """
-        from .progress_tracker import get_progress_tracker, ProcessPhase
-        from .solution_matrix import EnhancementMode, ProofreadMode, TranslateMode
-        from ..core.thresholds import needs_whisper_patch
+        from app.services.progress_tracker import get_progress_tracker, ProcessPhase
+        from app.services.solution_matrix import EnhancementMode, ProofreadMode, TranslateMode
+        from app.core.thresholds import needs_whisper_patch
 
         progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
 
@@ -4313,21 +4448,21 @@ class TranscriptionService:
         6-8: 后处理增强阶段（Whisper补刀、LLM校对/翻译）
         9: 输出阶段（生成字幕）
         """
-        from .streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
-        from .progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
-        from .solution_matrix import SolutionConfig, TranslateMode
-        from .audio_spectrum_classifier import get_spectrum_classifier
-        from .demucs_service import get_demucs_service
-        from .sse_service import get_sse_manager
-        from ..models.circuit_breaker_models import SeparationLevel
+        from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
+        from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
+        from app.services.solution_matrix import SolutionConfig, TranslateMode
+        from app.services.audio_spectrum_classifier import get_spectrum_classifier
+        from app.services.demucs_service import get_demucs_service
+        from app.services.sse_service import get_sse_manager
+        from app.models.circuit_breaker_models import SeparationLevel
         from pathlib import Path
 
         def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
             """推送信号事件（使用统一命名空间格式）"""
             sse_manager.broadcast_sync(
-                channel=f"job:{job_id}",
-                event_type=f"signal.{signal_code}",
-                data={"signal": signal_code, "message": message}
+                f"job:{job_id}",
+                f"signal.{signal_code}",
+                {"signal": signal_code, "message": message}
             )
 
         # 获取方案配置
@@ -4341,7 +4476,14 @@ class TranscriptionService:
         try:
             # 1. 音频提取
             progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "提取音频...")
-            audio_array, sr = self._extract_audio_with_array(job.input_file, job, target_sr=16000)
+            audio_array, sr = self._extract_audio_with_array(job.input_path, job, target_sr=16000)
+
+            # 保存音频文件供波形图使用
+            import soundfile as sf
+            audio_path = Path(job.dir) / "audio.wav"
+            sf.write(str(audio_path), audio_array, sr)
+            self.logger.info(f"音频文件已保存: {audio_path}")
+
             progress_tracker.complete_phase(ProcessPhase.EXTRACT)
 
             # 2. VAD 物理切分
@@ -4407,6 +4549,9 @@ class TranscriptionService:
 
             progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
 
+            # 保存原始转录数据（未分句的完整数据）
+            self._save_raw_transcription(job, all_sentences)
+
             # 6. 后处理增强（Whisper补刀、LLM校对/翻译）
             final_results = await self._post_process_enhancement(
                 all_sentences, audio_array, job, subtitle_manager, solution_config
@@ -4414,7 +4559,7 @@ class TranscriptionService:
 
             # 7. 生成字幕
             progress_tracker.start_phase(ProcessPhase.SRT, 1, "生成字幕...")
-            output_path = str(Path(job.job_dir) / f"{job.job_id}.srt")
+            output_path = str(Path(job.dir) / f"{job.job_id}.srt")
             self._generate_subtitle_from_sentences(
                 final_results,
                 output_path,

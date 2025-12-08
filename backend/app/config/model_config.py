@@ -30,7 +30,7 @@ class ModelPreloadConfig:
     @classmethod
     def get_preload_config(cls):
         """获取预加载配置对象"""
-        from services.model_preload_manager import PreloadConfig
+        from app.services.model_preload_manager import PreloadConfig
         
         return PreloadConfig(
             enabled=cls.ENABLED,

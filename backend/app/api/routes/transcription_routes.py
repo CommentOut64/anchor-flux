@@ -11,11 +11,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import json
 
-from models.job_models import JobSettings, JobState, DemucsSettings, SenseVoiceSettings
-from services.transcription_service import TranscriptionService
-from services.file_service import FileManagementService
-from services.sse_service import get_sse_manager
-from services.job_queue_service import get_queue_service  # 新增导入
+from app.models.job_models import JobSettings, JobState, DemucsSettings, SenseVoiceSettings
+from app.services.transcription_service import TranscriptionService
+from app.services.file_service import FileManagementService
+from app.services.sse_service import get_sse_manager
+from app.services.job_queue_service import get_queue_service  # 新增导入
 
 
 class DemucsSettingsAPI(BaseModel):
@@ -158,7 +158,7 @@ def create_transcription_router(
             job = transcription_service.create_job(original_filename, input_path, settings, job_id=job_id)
 
             # 🔥 新增: 加入队列（而非直接启动）
-            queue_service = get_queue_service()
+            queue_service = get_queue_service(transcription_service)
             queue_service.add_job(job)
 
             return {
@@ -213,7 +213,7 @@ def create_transcription_router(
             }
         """
         try:
-            queue_service = get_queue_service()
+            queue_service = get_queue_service(transcription_service)
             jobs = []
             failed = []
 
@@ -268,7 +268,7 @@ def create_transcription_router(
             settings_obj = TranscribeSettings(**json.loads(settings))
 
             # 获取队列服务
-            queue_service = get_queue_service()
+            queue_service = get_queue_service(transcription_service)
             job = queue_service.get_job(job_id)
 
             if not job:
@@ -363,7 +363,7 @@ def create_transcription_router(
     @router.post("/cancel/{job_id}")
     async def cancel_job(job_id: str, delete_data: bool = False):
         """取消转录任务（V2.2: 使用队列服务）"""
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         ok = queue_service.cancel_job(job_id, delete_data=delete_data)
         if not ok:
             raise HTTPException(status_code=404, detail="任务未找到")
@@ -372,7 +372,7 @@ def create_transcription_router(
     @router.post("/pause/{job_id}")
     async def pause_job(job_id: str):
         """暂停转录任务（V2.2: 使用队列服务）"""
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         ok = queue_service.pause_job(job_id)
         if not ok:
             raise HTTPException(status_code=404, detail="任务未找到")
@@ -387,7 +387,7 @@ def create_transcription_router(
         - /resume: 恢复暂停的任务，重新加入队列尾部，状态变为 queued
         - /restore-job: 从 checkpoint 断点续传
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         ok = queue_service.resume_job(job_id)
         if not ok:
             raise HTTPException(status_code=400, detail="无法恢复任务（任务未暂停或不存在）")
@@ -416,7 +416,7 @@ def create_transcription_router(
                 - "force": 强制插队，暂停当前任务A -> 执行B -> B完成后自动恢复A
                 - None: 使用默认模式（可通过 /api/queue-settings 配置）
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         result = queue_service.prioritize_job(job_id, mode=mode)
 
         if not result.get("success"):
@@ -441,7 +441,7 @@ def create_transcription_router(
         返回:
             - default_prioritize_mode: 默认插队模式 ("gentle" 或 "force")
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         return queue_service.get_settings()
 
     @router.post("/queue-settings")
@@ -456,7 +456,7 @@ def create_transcription_router(
                 - "gentle": 温和插队（默认）
                 - "force": 强制插队
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         try:
             settings = queue_service.update_settings(
                 default_prioritize_mode=default_prioritize_mode
@@ -476,7 +476,7 @@ def create_transcription_router(
         Args:
             job_ids: 按新顺序排列的任务ID列表
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         ok = queue_service.reorder_queue(job_ids)
 
         if not ok:
@@ -490,7 +490,7 @@ def create_transcription_router(
     @router.get("/queue-status")
     async def get_queue_status():
         """获取队列状态摘要"""
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         return queue_service.get_queue_status()
 
     @router.get("/events/global")
@@ -508,15 +508,15 @@ def create_transcription_router(
         - initial_state返回所有任务（处理中 + 已完成）
         - 避免客户端连接时漏掉完成任务的实时更新
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
 
         def get_initial_state():
             """
             返回所有任务列表（第二阶段修复：实时更新）
             包含活跃任务 + 历史完成任务
             """
-            from services.job_index_service import get_job_index_service
-            from core.config import config
+            from app.services.job_index_service import get_job_index_service
+            from app.core.config import config
             from pathlib import Path
             import json as json_module
 
@@ -649,12 +649,12 @@ def create_transcription_router(
         返回所有任务列表（处理中 + 已完成），前端用此接口同步后端实际存在的任务
         此接口为真实源，用于修复幽灵任务问题
         """
-        from services.job_index_service import get_job_index_service
-        from core.config import config
+        from app.services.job_index_service import get_job_index_service
+        from app.core.config import config
         from pathlib import Path
         import json as json_module
 
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         job_index = get_job_index_service(config.JOBS_DIR)
         jobs_root = Path(config.JOBS_DIR)
 
@@ -790,7 +790,7 @@ def create_transcription_router(
             job_id: 任务ID
             include_media: 是否包含媒体状态信息（默认True）
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         job = queue_service.get_job(job_id)
         if not job:
             # 如果队列服务中没有，尝试从transcription_service获取
@@ -1188,7 +1188,7 @@ def create_transcription_router(
         """
         try:
             # 从队列服务或转录服务获取任务
-            queue_service = get_queue_service()
+            queue_service = get_queue_service(transcription_service)
             job = queue_service.get_job(job_id)
 
             if not job:

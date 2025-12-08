@@ -7,7 +7,7 @@ import tempfile
 import logging
 from typing import List, Dict, Optional, Tuple
 
-from models.hardware_models import HardwareInfo, OptimizationConfig
+from app.models.hardware_models import HardwareInfo, OptimizationConfig
 
 try:
     import torch

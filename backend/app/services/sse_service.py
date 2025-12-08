@@ -383,7 +383,7 @@ def get_sse_manager() -> SSEManager:
     global _sse_manager_instance
     if _sse_manager_instance is None:
         # 从配置中读取参数（如果需要）
-        from core.config import config
+        from app.core.config import config
         heartbeat_interval = getattr(config, 'SSE_HEARTBEAT_INTERVAL', 10)
         max_queue_size = getattr(config, 'SSE_MAX_QUEUE_SIZE', 1000)
 

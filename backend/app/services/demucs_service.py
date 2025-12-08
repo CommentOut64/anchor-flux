@@ -749,15 +749,22 @@ class DemucsService:
         duration_sec: Optional[float] = None
     ) -> Tuple[BGMLevel, List[float]]:
         """
-        [已废弃] 快速检测背景音乐强度（分位数采样策略）
+        [已废弃] 快速检测背景音乐强度（分位数采样 + Demucs 残差策略）
 
-        ⚠️ 此方法已废弃，请使用 Chunk 级频谱分诊替代：
-        >>> from services.audio_spectrum_classifier import get_spectrum_classifier
+        ⚠️ 此方法已废弃，Whisper/SenseVoice 流水线均已切换到频谱分诊：
+        
+        Whisper 流水线使用：
+        >>> from app.services.audio_spectrum_classifier import get_spectrum_classifier
         >>> classifier = get_spectrum_classifier()
-        >>> diagnosis = classifier.diagnose_chunk(audio_chunk, chunk_index, sr)
-
-        新架构流程：VAD切分 → 频谱分诊(Chunk级) → 按需分离 → 转录
-        详见：docs/SenseVoice/最终方案/08_集成实现指南.md
+        >>> level_str, avg_score = classifier.quick_global_diagnosis(audio, sr)
+        
+        SenseVoice 流水线使用：
+        >>> diagnoses = classifier.diagnose_chunks(chunks, sr)
+        
+        废弃原因：
+        - Demucs 分离即使对纯人声也有 1-3% 残差，导致误判为 light
+        - 需要加载 Demucs 模型，速度慢
+        - 新方法纯频谱分析，无需 Demucs，更快更准确
 
         ---
         旧文档（保留供参考）：

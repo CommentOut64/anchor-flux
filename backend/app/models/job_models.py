@@ -7,7 +7,7 @@ import torch
 
 # 使用TYPE_CHECKING避免循环导入
 if TYPE_CHECKING:
-    from services.cpu_affinity_service import CPUAffinityConfig
+    from app.services.cpu_affinity_service import CPUAffinityConfig
 
 
 @dataclass
@@ -77,7 +77,7 @@ class SenseVoiceSettings:
 class JobSettings:
     """转录任务设置"""
     # === 转录引擎选择 ===
-    engine: str = "whisper"                     # 转录引擎: whisper/sensevoice
+    engine: str = "sensevoice"                  # 转录引擎: whisper/sensevoice（默认 SenseVoice）
 
     model: str = "medium"
     compute_type: str = "float16"

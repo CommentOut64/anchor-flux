@@ -8,10 +8,10 @@ import numpy as np
 import logging
 from typing import List, Tuple
 
-from ..models.circuit_breaker_models import (
+from app.models.circuit_breaker_models import (
     SpectrumFeatures, SpectrumDiagnosis, DiagnosisResult
 )
-from ..core.spectrum_thresholds import SpectrumThresholds, DEFAULT_SPECTRUM_THRESHOLDS
+from app.core.spectrum_thresholds import SpectrumThresholds, DEFAULT_SPECTRUM_THRESHOLDS
 
 logger = logging.getLogger(__name__)
 
@@ -124,21 +124,61 @@ class AudioSpectrumClassifier:
         Returns:
             SpectrumDiagnosis: 分诊结果
         """
-        features = self.extract_features(audio, sr)
         th = self.thresholds
+        duration_sec = len(audio) / sr
+        
+        # 短 Chunk 保守策略：降低敏感度
+        # 对于 < 2秒的片段，频谱特征不稳定，提高判定阈值避免误判
+        short_chunk_threshold = 2.0  # 秒
+        is_short_chunk = duration_sec < short_chunk_threshold
+        
+        # 极短片段（< 0.5秒）直接返回 CLEAN，样本量不足无法可靠分析
+        if duration_sec < 0.5:
+            logger.debug(f"Chunk {chunk_index}: 极短片段({duration_sec:.2f}s)，跳过分诊")
+            return SpectrumDiagnosis(
+                chunk_index=chunk_index,
+                diagnosis=DiagnosisResult.CLEAN,
+                need_separation=False,
+                music_score=0.0,
+                noise_score=0.0,
+                clean_score=1.0,
+                recommended_model=None,
+                features=SpectrumFeatures(),
+                reason=f"极短片段({duration_sec:.2f}s)，跳过分诊"
+            )
+        
+        features = self.extract_features(audio, sr)
 
         # 计算各项得分
         music_score = self._calculate_music_score(features)
         noise_score = self._calculate_noise_score(features)
         clean_score = 1.0 - max(music_score, noise_score)
+        
+        # 短 Chunk 敏感度调整：提高阈值 30%
+        # 这样可以减少因样本不足导致的误判
+        if is_short_chunk:
+            effective_music_threshold = th.music_score_threshold * 1.3
+            effective_noise_threshold = th.noise_score_threshold * 1.3
+            effective_mixed_threshold = 0.2 * 1.3  # 原值 0.2
+            logger.debug(
+                f"Chunk {chunk_index}: 短片段({duration_sec:.2f}s)，"
+                f"提高阈值 music>{effective_music_threshold:.2f}, noise>{effective_noise_threshold:.2f}"
+            )
+        else:
+            effective_music_threshold = th.music_score_threshold
+            effective_noise_threshold = th.noise_score_threshold
+            effective_mixed_threshold = 0.2
 
-        # 综合判定
+        # 综合判定（使用调整后的阈值）
         diagnosis = DiagnosisResult.CLEAN
         need_separation = False
         recommended_model = None
         reason = "纯净人声"
+        
+        if is_short_chunk:
+            reason = f"纯净人声 (短片段{duration_sec:.1f}s)"
 
-        if music_score >= th.music_score_threshold:
+        if music_score >= effective_music_threshold:
             diagnosis = DiagnosisResult.MUSIC
             need_separation = True
             reason = f"检测到音乐 (score={music_score:.2f})"
@@ -151,13 +191,13 @@ class AudioSpectrumClassifier:
                 recommended_model = "htdemucs"
                 reason += " [轻度BGM]"
 
-        elif noise_score >= th.noise_score_threshold:
+        elif noise_score >= effective_noise_threshold:
             diagnosis = DiagnosisResult.NOISE
             need_separation = True
             recommended_model = "htdemucs"
             reason = f"检测到噪音 (score={noise_score:.2f})"
 
-        elif music_score > 0.2 and noise_score > 0.2:
+        elif music_score > effective_mixed_threshold and noise_score > effective_mixed_threshold:
             diagnosis = DiagnosisResult.MIXED
             need_separation = True
             recommended_model = "htdemucs"

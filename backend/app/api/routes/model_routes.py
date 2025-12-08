@@ -10,9 +10,9 @@ import json
 import time
 import logging
 
-from models.model_models import ModelInfo
-from services.model_manager_service import get_model_manager
-from services.sse_service import get_sse_manager  # 导入统一SSE管理器
+from app.models.model_models import ModelInfo
+from app.services.model_manager_service import get_model_manager
+from app.services.sse_service import get_sse_manager  # 导入统一SSE管理器
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 logger = logging.getLogger(__name__)

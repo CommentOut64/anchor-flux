@@ -6,7 +6,7 @@
 import logging
 import sys
 from pathlib import Path
-from core.config import config
+from app.core.config import config
 
 
 class MillisecondFormatter(logging.Formatter):

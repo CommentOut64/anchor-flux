@@ -51,7 +51,7 @@ async def get_all_config():
     Returns:
         所有配置项的字典
     """
-    from services.user_config_service import get_user_config_service
+    from app.services.user_config_service import get_user_config_service
     
     try:
         config_service = get_user_config_service()
@@ -73,7 +73,7 @@ async def get_subtitle_time_offset():
     Returns:
         offset: 偏移量（秒）
     """
-    from services.user_config_service import get_user_config_service
+    from app.services.user_config_service import get_user_config_service
     
     try:
         config_service = get_user_config_service()
@@ -103,7 +103,7 @@ async def set_subtitle_time_offset(req: SubtitleTimeOffsetRequest):
     Returns:
         success: 是否设置成功
     """
-    from services.user_config_service import get_user_config_service
+    from app.services.user_config_service import get_user_config_service
     
     try:
         config_service = get_user_config_service()
@@ -135,7 +135,7 @@ async def get_default_model():
     Returns:
         model_id: 模型ID，None表示未设置
     """
-    from services.user_config_service import get_user_config_service
+    from app.services.user_config_service import get_user_config_service
     
     try:
         config_service = get_user_config_service()
@@ -160,7 +160,7 @@ async def set_default_model(req: DefaultModelRequest):
     Returns:
         success: 是否设置成功
     """
-    from services.user_config_service import get_user_config_service
+    from app.services.user_config_service import get_user_config_service
     
     try:
         config_service = get_user_config_service()
@@ -192,7 +192,7 @@ async def update_config(req: ConfigUpdateRequest):
     Returns:
         success: 是否更新成功
     """
-    from services.user_config_service import get_user_config_service
+    from app.services.user_config_service import get_user_config_service
     
     try:
         config_service = get_user_config_service()

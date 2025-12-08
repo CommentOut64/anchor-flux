@@ -382,7 +382,7 @@ const titleInputRef = ref(null); // 输入框引用
 
 // 转录设置相关
 const showAdvancedSettings = ref(false); // 是否显示高级设置
-const transcriptionEngine = ref("whisper"); // 转录引擎: whisper | sensevoice
+const transcriptionEngine = ref("sensevoice"); // 转录引擎: whisper | sensevoice（默认 SenseVoice）
 const selectedPresetId = ref("default"); // SenseVoice 预设 ID
 
 // SenseVoice 预设配置

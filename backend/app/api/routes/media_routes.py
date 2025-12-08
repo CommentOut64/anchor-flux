@@ -20,7 +20,7 @@ from typing import Optional, Tuple
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from core.config import config
+from app.core.config import config
 
 router = APIRouter(prefix="/api/media", tags=["media"])
 
@@ -309,7 +309,7 @@ async def _generate_proxy_video_with_progress(source: Path, output: Path, job_id
 def _push_proxy_progress(job_id: str, progress: float, completed: bool = False):
     """推送Proxy生成进度到SSE"""
     try:
-        from services.sse_service import get_sse_manager
+        from app.services.sse_service import get_sse_manager
         sse_manager = get_sse_manager()
 
         channel_id = f"job:{job_id}"
@@ -1218,7 +1218,7 @@ async def trigger_preview_generation(job_id: str):
     # 异步生成 360p 预览
     from utils.progressive_video_generator import progressive_video_generator
     try:
-        from services.sse_service import get_sse_manager
+        from app.services.sse_service import get_sse_manager
         progressive_video_generator.set_sse_manager(get_sse_manager())
     except:
         pass

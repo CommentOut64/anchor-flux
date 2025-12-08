@@ -16,10 +16,8 @@ import psutil
 import torch
 from faster_whisper import WhisperModel
 
-# 修复导入路径
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from models.job_models import JobSettings
+# 使用完整路径导入
+from app.models.job_models import JobSettings
 
 
 @dataclass
@@ -204,7 +202,7 @@ class ModelPreloadManager:
                         "progress": 50.0
                     })
 
-                from services.demucs_service import get_demucs_service
+                from app.services.demucs_service import get_demucs_service
                 demucs_service = get_demucs_service()
 
                 # 在后台线程中执行同步的模型加载，避免阻塞主线程
@@ -330,7 +328,7 @@ class ModelPreloadManager:
             self.logger.info(f"正在从磁盘加载模型 {settings.model} (device={settings.device}, compute_type={settings.compute_type})")
 
             # 导入配置以获取缓存路径
-            from core.config import config
+            from app.core.config import config
 
             # 使用 faster_whisper 的 WhisperModel 加载模型
             model = WhisperModel(
@@ -510,7 +508,7 @@ class ModelPreloadManager:
         with self._global_lock:
             if self._sensevoice_service is None:
                 try:
-                    from services.sensevoice_onnx_service import get_sensevoice_service
+                    from app.services.sensevoice_onnx_service import get_sensevoice_service
                     self._sensevoice_service = get_sensevoice_service()
 
                     if not self._sensevoice_service.is_loaded:
@@ -576,7 +574,7 @@ class ModelPreloadManager:
             bool: 是否成功启动下载
         """
         try:
-            from services.model_manager_service import get_model_manager
+            from app.services.model_manager_service import get_model_manager
             model_mgr = get_model_manager()
             success = model_mgr.download_whisper_model(model_id)
 
@@ -599,7 +597,7 @@ class ModelPreloadManager:
             bool: 是否删除成功
         """
         try:
-            from services.model_manager_service import get_model_manager
+            from app.services.model_manager_service import get_model_manager
             model_mgr = get_model_manager()
 
             # 先从缓存中移除
@@ -638,7 +636,7 @@ class ModelPreloadManager:
             Dict: 包含whisper模型的状态信息
         """
         try:
-            from services.model_manager_service import get_model_manager
+            from app.services.model_manager_service import get_model_manager
             model_mgr = get_model_manager()
 
             # 获取磁盘上的模型状态

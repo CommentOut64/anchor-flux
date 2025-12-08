@@ -17,14 +17,14 @@ from datetime import datetime
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # 导入核心配置和日志
-from core.config import config
-from core.logging import setup_logging
+from app.core.config import config
+from app.core.logging import setup_logging
 
 # 导入新的转录服务（替换processor）
-from services.transcription_service import get_transcription_service
-from models.job_models import JobSettings
-from services.cpu_affinity_service import CPUAffinityConfig
-from services.model_preload_manager import (
+from app.services.transcription_service import get_transcription_service
+from app.models.job_models import JobSettings
+from app.services.cpu_affinity_service import CPUAffinityConfig
+from app.services.model_preload_manager import (
     PreloadConfig,
     get_model_manager,
     initialize_model_manager,
@@ -32,19 +32,19 @@ from services.model_preload_manager import (
     get_preload_status,
     get_cache_status
 )
-from config.model_config import ModelPreloadConfig
+from app.config.model_config import ModelPreloadConfig
 
 # 导入API路由
-from api.routes import model_routes
-from api.routes import media_routes  # 新增：媒体资源路由
-from api.routes.transcription_routes import create_transcription_router
-from api.routes.demucs_routes import create_demucs_router  # 新增：Demucs配置路由
-from api.routes import system_routes  # 新增：系统管理路由
-from api.routes import config_routes  # 新增：用户配置路由
-from services.file_service import FileManagementService
+from app.api.routes import model_routes
+from app.api.routes import media_routes  # 新增：媒体资源路由
+from app.api.routes.transcription_routes import create_transcription_router
+from app.api.routes.demucs_routes import create_demucs_router  # 新增：Demucs配置路由
+from app.api.routes import system_routes  # 新增：系统管理路由
+from app.api.routes import config_routes  # 新增：用户配置路由
+from app.services.file_service import FileManagementService
 
 # 导入FFmpeg管理器
-from services.ffmpeg_manager import get_ffmpeg_manager
+from app.services.ffmpeg_manager import get_ffmpeg_manager
 
 # 配置日志（在其他初始化之前）
 logger = setup_logging()
@@ -84,7 +84,7 @@ async def startup_event():
             current_loop = asyncio.get_running_loop()
 
             # 设置统一SSE管理器的事件循环（用于转录进度和模型下载）
-            from services.sse_service import get_sse_manager
+            from app.services.sse_service import get_sse_manager
             sse_manager = get_sse_manager()
             sse_manager.set_event_loop(current_loop)
             logger.info("统一SSE管理器事件循环已设置")
@@ -110,9 +110,9 @@ async def startup_event():
 
         # 4. 初始化队列服务（新增）
         logger.info("步骤 4/4: 初始化任务队列服务...")
-        from services.job_queue_service import get_queue_service
-        from services.transcription_service import get_transcription_service
-        from core.config import config
+        from app.services.job_queue_service import get_queue_service
+        from app.services.transcription_service import get_transcription_service
+        from app.core.config import config
         transcription_service = get_transcription_service(str(config.JOBS_DIR))
         queue_service = get_queue_service(transcription_service)
         logger.info("任务队列服务已启动")
@@ -120,7 +120,7 @@ async def startup_event():
         # 5. 清理无效的任务索引映射（第一阶段修复：数据同步）
         logger.info("清理无效的任务索引映射...")
         try:
-            from services.job_index_service import get_job_index_service
+            from app.services.job_index_service import get_job_index_service
             job_index = get_job_index_service(str(config.JOBS_DIR))
             job_index.cleanup_invalid_mappings()
             logger.info("任务索引映射清理完成")
@@ -146,7 +146,7 @@ async def shutdown_event():
     """应用关闭事件 - 清理资源"""
     try:
         # 停止队列服务（新增）
-        from services.job_queue_service import get_queue_service
+        from app.services.job_queue_service import get_queue_service
         try:
             queue_service = get_queue_service()
             queue_service.shutdown()
@@ -289,7 +289,7 @@ async def ping():
 @app.get("/api/test/stream")
 async def test_sse_stream(request: Request):
     """SSE 测试端点 - 用于前端测试 SSE 连接"""
-    from services.sse_service import get_sse_manager
+    from app.services.sse_service import get_sse_manager
     sse_manager = get_sse_manager()
 
     # 使用固定的测试频道
@@ -335,7 +335,7 @@ async def get_hardware_basic():
     """获取核心硬件信息"""
     try:
         # 创建临时的硬件检测服务以获取信息
-        from services.hardware_service import get_hardware_detector
+        from app.services.hardware_service import get_hardware_detector
         detector = get_hardware_detector()
         hardware_info = detector.detect()
         
@@ -354,7 +354,7 @@ async def get_hardware_basic():
 async def get_hardware_optimization():
     """获取基于硬件的优化配置"""
     try:
-        from services.hardware_service import get_hardware_detector, get_hardware_optimizer
+        from app.services.hardware_service import get_hardware_detector, get_hardware_optimizer
         detector = get_hardware_detector()
         optimizer = get_hardware_optimizer()
         
@@ -376,7 +376,7 @@ async def get_hardware_optimization():
 async def get_hardware_status():
     """获取完整的硬件状态和优化信息"""
     try:
-        from services.hardware_service import get_hardware_detector, get_hardware_optimizer
+        from app.services.hardware_service import get_hardware_detector, get_hardware_optimizer
         detector = get_hardware_detector()
         optimizer = get_hardware_optimizer()
         
@@ -469,7 +469,7 @@ async def start_models_preload():
 async def clear_models_cache():
     """清空模型缓存 - 简化版本，立即同步状态"""
     try:
-        from services.model_preload_manager import get_model_manager
+        from app.services.model_preload_manager import get_model_manager
         model_manager = get_model_manager()
         
         if model_manager:
@@ -497,7 +497,7 @@ async def clear_models_cache():
 async def reset_preload_attempts():
     """重置预加载失败计数"""
     try:
-        from services.model_preload_manager import get_model_manager
+        from app.services.model_preload_manager import get_model_manager
         model_manager = get_model_manager()
 
         if model_manager:
@@ -525,8 +525,8 @@ async def reset_preload_attempts():
 async def get_default_preload_config():
     """获取默认预加载模型配置"""
     try:
-        from services.user_config_service import get_user_config_service
-        from services.model_manager_service import get_model_manager
+        from app.services.user_config_service import get_user_config_service
+        from app.services.model_manager_service import get_model_manager
 
         user_config = get_user_config_service()
         model_manager = get_model_manager()
@@ -563,7 +563,7 @@ async def get_default_preload_config():
 async def set_default_preload_model(request: dict):
     """设置默认预加载模型"""
     try:
-        from services.user_config_service import get_user_config_service
+        from app.services.user_config_service import get_user_config_service
 
         model_id = request.get("model_id")
         user_config = get_user_config_service()
@@ -594,7 +594,7 @@ async def set_default_preload_model(request: dict):
 async def unload_model(request: dict):
     """卸载指定模型"""
     try:
-        from services.model_preload_manager import get_model_manager as get_preload_manager
+        from app.services.model_preload_manager import get_model_manager as get_preload_manager
 
         model_id = request.get("model_id")
         device = request.get("device", "cuda")
@@ -631,8 +631,8 @@ async def unload_model(request: dict):
 async def load_specific_model(request: dict):
     """加载指定模型"""
     try:
-        from services.model_preload_manager import get_model_manager as get_preload_manager, PreloadConfig
-        from models.job_models import JobSettings
+        from app.services.model_preload_manager import get_model_manager as get_preload_manager, PreloadConfig
+        from app.models.job_models import JobSettings
         import torch
 
         model_id = request.get("model_id")
@@ -651,7 +651,7 @@ async def load_specific_model(request: dict):
             }
 
         # 检查模型状态
-        from services.model_manager_service import get_model_manager
+        from app.services.model_manager_service import get_model_manager
         model_mgr = get_model_manager()
         status, local_path, detail = model_mgr._check_whisper_model_exists(model_id)
 
@@ -702,7 +702,7 @@ async def shutdown_server():
         logger.info("收到关闭服务器请求")
 
         # 清理资源
-        from services.model_preload_manager import get_model_manager
+        from app.services.model_preload_manager import get_model_manager
         model_manager = get_model_manager()
         if model_manager:
             model_manager.clear_cache()
@@ -741,8 +741,8 @@ async def open_browser_if_needed():
     # 等待3秒，让可能存在的前端页面有时间发送心跳
     await asyncio.sleep(3)
 
-    from services.client_registry import get_client_registry
-    from services.sse_service import get_sse_manager
+    from app.services.client_registry import get_client_registry
+    from app.services.sse_service import get_sse_manager
 
     client_registry = get_client_registry()
     sse_manager = get_sse_manager()

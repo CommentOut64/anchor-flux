@@ -14,6 +14,9 @@ class TextNormalizer:
     # SenseVoice 特殊标签模式（如 <|zh|>, <|HAPPY|>, <|BGM|> 等）
     SPECIAL_TAGS = re.compile(r'<\|.*?\|>')
 
+    # SentencePiece 分词符号（用于标记空格）
+    SENTENCEPIECE_SYMBOL = '▁'
+
     # 异常重复字符（3个及以上相同字符）
     REPEATED_CHARS = re.compile(r'(.)\1{2,}')
 
@@ -45,10 +48,13 @@ class TextNormalizer:
         # 1. 移除 SenseVoice 特殊标签
         text = TextNormalizer.SPECIAL_TAGS.sub('', text)
 
-        # 2. 处理异常重复字符（保留最多2个）
+        # 2. 替换 SentencePiece 分词符号为空格
+        text = text.replace(TextNormalizer.SENTENCEPIECE_SYMBOL, ' ')
+
+        # 3. 处理异常重复字符（保留最多2个）
         text = TextNormalizer.REPEATED_CHARS.sub(r'\1\1', text)
 
-        # 3. 规范化空白字符
+        # 4. 规范化空白字符
         text = TextNormalizer.EXTRA_SPACES.sub(' ', text)
 
         return text.strip()

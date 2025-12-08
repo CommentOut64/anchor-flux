@@ -9,7 +9,7 @@
 """
 import logging
 from typing import Optional
-from ..models.circuit_breaker_models import (
+from app.models.circuit_breaker_models import (
     FuseAction, FuseDecision, ChunkProcessState, SeparationLevel
 )
 

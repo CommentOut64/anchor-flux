@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import threading
 
-from core.config import config
+from app.core.config import config
 
 logger = logging.getLogger(__name__)
 

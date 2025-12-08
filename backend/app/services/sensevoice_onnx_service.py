@@ -158,6 +158,31 @@ class CTCDecoder:
 class SenseVoiceONNXService:
     """SenseVoice ONNX 推理服务（纯 ONNX Runtime 实现）"""
 
+    # 语言 ID 映射
+    LID_DICT = {
+        "auto": 0,
+        "zh": 3,
+        "en": 4,
+        "yue": 7,
+        "ja": 11,
+        "ko": 12,
+        "nospeech": 13
+    }
+
+    # 文本规范化 ID 映射
+    TEXTNORM_DICT = {
+        "withitn": 14,  # 带逆文本规范化
+        "woitn": 15     # 不带逆文本规范化
+    }
+
+    # 前端参数（来自 config.yaml）
+    SAMPLE_RATE = 16000
+    N_MELS = 80
+    FRAME_LENGTH_MS = 25  # 窗长 25ms
+    FRAME_SHIFT_MS = 10   # 帧移 10ms
+    LFR_M = 7  # LFR 窗口大小
+    LFR_N = 6  # LFR 步长
+
     def __init__(self, config=None):
         """
         初始化 SenseVoice 服务
@@ -166,7 +191,7 @@ class SenseVoiceONNXService:
             config: SenseVoice 配置
         """
         if config is None:
-            from ..models.sensevoice_models import SenseVoiceConfig
+            from app.models.sensevoice_models import SenseVoiceConfig
             config = SenseVoiceConfig()
 
         self.config = config
@@ -179,25 +204,39 @@ class SenseVoiceONNXService:
         # 模型路径
         self.model_path = self._resolve_model_path()
 
-        # 时间步长（SenseVoice 有 6 倍下采样，输入 10ms/帧，输出 60ms/帧）
-        self.time_stride = 0.06  # 60ms
+        # 计算帧参数
+        self.n_fft = int(self.SAMPLE_RATE * self.FRAME_LENGTH_MS / 1000)  # 400
+        self.hop_length = int(self.SAMPLE_RATE * self.FRAME_SHIFT_MS / 1000)  # 160
+
+        # 时间步长：LFR 后每帧代表 LFR_N * FRAME_SHIFT_MS = 60ms
+        self.time_stride = self.LFR_N * self.FRAME_SHIFT_MS / 1000  # 0.06s
 
     def _resolve_model_path(self) -> str:
         """
         解析模型路径
 
         优先级：
-        1. 本地路径（如果存在）
-        2. ModelScope 缓存路径
-        3. HuggingFace 缓存路径
+        1. 项目预置模型（backend/models/pretrained/sensevoice/）
+        2. 本地路径（如果 model_dir 是绝对路径）
+        3. ModelScope 缓存路径
+        4. HuggingFace 缓存路径
+        5. 项目 models 目录（backend/models/sensevoice/）
 
         Returns:
             模型路径
         """
+        from ..core.config import config as project_config
+
+        # 优先使用项目预置模型（类似 Demucs 的方式）
+        pretrained_model_path = Path(__file__).parent.parent.parent / "models" / "pretrained" / "sensevoice"
+        if pretrained_model_path.exists() and (pretrained_model_path / "model_quant.onnx").exists():
+            self.logger.info(f"使用预置模型: {pretrained_model_path}")
+            return str(pretrained_model_path)
+
         model_dir = self.config.model_dir
 
-        # 检查是否为本地路径
-        if os.path.exists(model_dir):
+        # 检查是否为本地路径（绝对路径）
+        if os.path.isabs(model_dir) and os.path.exists(model_dir):
             self.logger.info(f"使用本地模型: {model_dir}")
             return model_dir
 
@@ -214,8 +253,7 @@ class SenseVoiceONNXService:
             self.logger.info(f"使用 HuggingFace 缓存: {hf_cache}")
             return str(hf_cache)
 
-        # 使用项目内的 models 目录
-        from ..core.config import config as project_config
+        # 检查项目内的 models 目录
         project_model_path = project_config.MODELS_DIR / "sensevoice"
         if project_model_path.exists():
             self.logger.info(f"使用项目模型: {project_model_path}")
@@ -223,10 +261,11 @@ class SenseVoiceONNXService:
 
         raise FileNotFoundError(
             f"未找到 SenseVoice 模型。请下载模型到以下任一位置：\n"
-            f"1. {modelscope_cache}\n"
-            f"2. {hf_cache}\n"
-            f"3. {project_model_path}\n"
-            f"或设置 model_dir 为本地路径"
+            f"1. {pretrained_model_path} (推荐，随项目发布)\n"
+            f"2. {modelscope_cache}\n"
+            f"3. {hf_cache}\n"
+            f"4. {project_model_path}\n"
+            f"或设置 model_dir 为绝对路径"
         )
 
     def load_model(self):
@@ -404,11 +443,19 @@ class SenseVoiceONNXService:
             raise ValueError(f"SenseVoice 要求采样率为 16000 Hz，当前为 {sample_rate} Hz")
 
         try:
-            # 1. 音频预处理
+            # 设置默认值
+            if language is None:
+                language = "auto"
+            if use_itn is None:
+                use_itn = True
+
+            # 1. 音频预处理（提取 Fbank + LFR）
             audio_features = self._preprocess_audio(audio_array, sample_rate)
 
-            # 2. 模型推理
-            logits = self._run_inference(audio_features)
+            self.logger.debug(f"特征形状: {audio_features.shape}")  # [batch, time, 560]
+
+            # 2. 模型推理（传递完整的 4 个输入）
+            logits = self._run_inference(audio_features, language=language, use_itn=use_itn)
 
             # 3. CTC 解码
             text, word_timestamps, confidence = self.decoder.decode(logits, self.time_stride)
@@ -438,15 +485,17 @@ class SenseVoiceONNXService:
 
     def _preprocess_audio(self, audio_array: np.ndarray, sample_rate: int) -> np.ndarray:
         """
-        音频预处理
+        音频预处理：提取 Fbank 特征并做 LFR 处理
 
         Args:
             audio_array: 音频数组
             sample_rate: 采样率
 
         Returns:
-            预处理后的特征
+            预处理后的特征 [batch, time, 560]
         """
+        import librosa
+
         # 确保单声道
         if len(audio_array.shape) > 1:
             audio_array = np.mean(audio_array, axis=1)
@@ -460,28 +509,116 @@ class SenseVoiceONNXService:
         if max_val > 1.0:
             audio_array = audio_array / max_val
 
-        # SenseVoice 输入格式：[batch, samples]
-        audio_features = audio_array[np.newaxis, :]  # [1, samples]
+        # 1. 提取 Mel 频谱特征 (Fbank)
+        # 使用 librosa 提取 mel 频谱，与 kaldi fbank 类似
+        mel_spec = librosa.feature.melspectrogram(
+            y=audio_array,
+            sr=sample_rate,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            n_mels=self.N_MELS,
+            window='hamming',
+            center=False,
+            power=1.0  # 使用幅度谱而非功率谱
+        )
 
-        return audio_features
+        # 转换为对数刻度 (log mel)
+        fbank = np.log(np.maximum(mel_spec, 1e-10)).T  # [time, n_mels]
 
-    def _run_inference(self, audio_features: np.ndarray) -> np.ndarray:
+        # 2. 应用 LFR (Low Frame Rate) 处理
+        # 将连续的 LFR_M 帧堆叠，步长为 LFR_N
+        fbank_lfr = self._apply_lfr(fbank)  # [time_lfr, n_mels * LFR_M]
+
+        # 3. 添加 batch 维度
+        features = fbank_lfr[np.newaxis, :, :]  # [1, time, 560]
+
+        return features.astype(np.float32)
+
+    def _apply_lfr(self, fbank: np.ndarray) -> np.ndarray:
+        """
+        应用 LFR (Low Frame Rate) 处理
+
+        将连续的 LFR_M 帧堆叠成一帧，步长为 LFR_N
+
+        Args:
+            fbank: 原始 Fbank 特征 [time, n_mels]
+
+        Returns:
+            LFR 后的特征 [time_lfr, n_mels * LFR_M]
+        """
+        T, D = fbank.shape  # time, n_mels (80)
+        lfr_m = self.LFR_M  # 7
+        lfr_n = self.LFR_N  # 6
+
+        # 计算 LFR 后的时间步数
+        # 公式：T_lfr = (T - lfr_m) // lfr_n + 1
+        T_lfr = (T - lfr_m) // lfr_n + 1
+
+        if T_lfr <= 0:
+            # 如果音频太短，至少返回一帧（用 padding）
+            # 用最后一帧填充
+            padded = np.zeros((lfr_m, D), dtype=fbank.dtype)
+            padded[:T] = fbank[:min(T, lfr_m)]
+            if T < lfr_m:
+                padded[T:] = fbank[-1] if T > 0 else 0
+            return padded.reshape(1, -1)  # [1, 560]
+
+        # 堆叠帧
+        lfr_features = np.zeros((T_lfr, D * lfr_m), dtype=fbank.dtype)
+        for i in range(T_lfr):
+            start = i * lfr_n
+            # 取 lfr_m 帧并拼接
+            lfr_features[i] = fbank[start:start + lfr_m].reshape(-1)
+
+        return lfr_features  # [time_lfr, 560]
+
+    def _run_inference(
+        self,
+        audio_features: np.ndarray,
+        language: str = "auto",
+        use_itn: bool = True
+    ) -> np.ndarray:
         """
         运行模型推理
 
         Args:
-            audio_features: 音频特征 [batch, samples]
+            audio_features: 音频特征 [batch, time, 560]
+            language: 语言代码 (auto, zh, en, yue, ja, ko, nospeech)
+            use_itn: 是否使用逆文本规范化
 
         Returns:
             logits: [time_steps, vocab_size]
         """
-        # 获取输入名称
-        input_name = self.session.get_inputs()[0].name
+        batch_size = audio_features.shape[0]
+        feats_length = audio_features.shape[1]
+
+        # 准备 4 个输入
+        # 1. speech: [batch, time, 560] float32
+        speech = audio_features.astype(np.float32)
+
+        # 2. speech_lengths: [batch] int32
+        speech_lengths = np.array([feats_length] * batch_size, dtype=np.int32)
+
+        # 3. language: [batch] int32
+        lang_id = self.LID_DICT.get(language, self.LID_DICT["auto"])
+        language_input = np.array([lang_id] * batch_size, dtype=np.int32)
+
+        # 4. textnorm: [batch] int32
+        textnorm_id = self.TEXTNORM_DICT["withitn" if use_itn else "woitn"]
+        textnorm_input = np.array([textnorm_id] * batch_size, dtype=np.int32)
 
         # 运行推理
-        outputs = self.session.run(None, {input_name: audio_features})
+        outputs = self.session.run(
+            None,
+            {
+                "speech": speech,
+                "speech_lengths": speech_lengths,
+                "language": language_input,
+                "textnorm": textnorm_input
+            }
+        )
 
-        # 提取 logits（假设第一个输出是 logits）
+        # 提取 logits（第一个输出是 ctc_logits）
         logits = outputs[0]  # [batch, time_steps, vocab_size]
 
         # 移除 batch 维度

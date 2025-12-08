@@ -16,9 +16,9 @@ import os
 import shutil
 import time
 
-from models.model_models import ModelInfo
-from core.config import config
-from services.model_validator import ModelValidator
+from app.models.model_models import ModelInfo
+from app.core.config import config
+from app.services.model_validator import ModelValidator
 
 
 class ModelManagerService:

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from core.config import config
+from app.core.config import config
 
 
 class ProgressiveVideoGenerator:
