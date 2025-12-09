@@ -4,26 +4,94 @@ Faster-Whisper 转录服务
 职责：
 - Whisper 补刀（后处理增强阶段）
 - 仅提供文本，时间戳由 SenseVoice 确定，使用伪对齐
+- 自动检测并下载缺失的 Whisper 模型（默认 medium）
+- 自动使用 HuggingFace 镜像源（hf-mirror.com）
 """
 from faster_whisper import WhisperModel
 from typing import Optional, Dict, Any, Union, Tuple
 import numpy as np
 import logging
 import gc
+import os
+from pathlib import Path
 
 from app.core import config
 
 logger = logging.getLogger(__name__)
 
+# ========== 模型配置常量 ==========
+# 默认模型名称
+DEFAULT_WHISPER_MODEL = "medium"
+
+# 支持的模型列表及其 HuggingFace 仓库 ID
+WHISPER_MODELS = {
+    "tiny": "Systran/faster-whisper-tiny",
+    "tiny.en": "Systran/faster-whisper-tiny.en",
+    "base": "Systran/faster-whisper-base",
+    "base.en": "Systran/faster-whisper-base.en",
+    "small": "Systran/faster-whisper-small",
+    "small.en": "Systran/faster-whisper-small.en",
+    "medium": "Systran/faster-whisper-medium",
+    "medium.en": "Systran/faster-whisper-medium.en",
+    "large-v1": "Systran/faster-whisper-large-v1",
+    "large-v2": "Systran/faster-whisper-large-v2",
+    "large-v3": "Systran/faster-whisper-large-v3",
+    "turbo": "Systran/faster-whisper-large-v3-turbo",
+    "distil-large-v2": "Systran/faster-distil-whisper-large-v2",
+    "distil-large-v3": "Systran/faster-distil-whisper-large-v3",
+}
+
+# CTranslate2 格式模型必需的文件
+REQUIRED_MODEL_FILES = ["model.bin", "config.json", "vocabulary.txt"]
+
+# HuggingFace 镜像源
+HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
+
 
 class WhisperService:
-    """Faster-Whisper 转录服务"""
+    """Faster-Whisper 转录服务（自动下载模型，自动使用镜像源）"""
 
     def __init__(self):
         self.model: Optional[WhisperModel] = None
         self._model_name: str = ""
         self._device: str = "cuda"
         self._compute_type: str = "float16"
+        
+        # 强制设置镜像源环境变量
+        self._setup_hf_mirror()
+
+    def _setup_hf_mirror(self):
+        """配置 HuggingFace 镜像源（解决国内访问问题）"""
+        # 检查是否禁用镜像
+        use_mirror = os.getenv('USE_HF_MIRROR', 'true').lower() == 'true'
+        
+        if use_mirror:
+            os.environ['HF_ENDPOINT'] = HF_MIRROR_ENDPOINT
+            logger.info(f"WhisperService: 使用 HuggingFace 镜像源: {HF_MIRROR_ENDPOINT}")
+        else:
+            logger.info("WhisperService: 使用 HuggingFace 官方源")
+
+    @staticmethod
+    def get_model_repo_id(model_name: str) -> str:
+        """
+        获取模型对应的 HuggingFace 仓库 ID
+        
+        Args:
+            model_name: 模型名称 (tiny, base, small, medium, large-v2, large-v3 等)
+            
+        Returns:
+            str: 完整的仓库 ID (如 Systran/faster-whisper-medium)
+        """
+        # 如果已经是完整的仓库 ID，直接返回
+        if "/" in model_name:
+            return model_name
+        
+        # 查找预定义的模型
+        if model_name in WHISPER_MODELS:
+            return WHISPER_MODELS[model_name]
+        
+        # 尝试构造默认格式
+        return f"Systran/faster-whisper-{model_name}"
 
     @property
     def is_loaded(self) -> bool:
@@ -47,21 +115,24 @@ class WhisperService:
 
     def load_model(
         self,
-        model_name: str = "medium",
+        model_name: str = DEFAULT_WHISPER_MODEL,
         device: str = "cuda",
         compute_type: str = "float16",
         download_root: str = None,
-        local_files_only: bool = False
+        local_files_only: bool = False,
+        auto_download: bool = True
     ) -> "WhisperService":
         """
-        加载 Faster-Whisper 模型
+        加载 Faster-Whisper 模型（自动下载缺失的模型）
 
         Args:
             model_name: 模型名称 (tiny, base, small, medium, large-v2, large-v3)
+                       默认值: medium（平衡速度与精度）
             device: 设备 (cuda, cpu)
             compute_type: 计算类型 (float16, int8, int8_float16)
-            download_root: 模型下载目录
+            download_root: 模型下载目录（默认使用 config.HF_CACHE_DIR）
             local_files_only: 是否仅使用本地文件
+            auto_download: 是否自动下载缺失的模型（默认 True）
 
         Returns:
             self: 支持链式调用
@@ -77,12 +148,41 @@ class WhisperService:
         # 设置下载目录
         if download_root is None:
             download_root = str(config.HF_CACHE_DIR)
+        
+        # 确保下载目录存在
+        Path(download_root).mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"加载 Faster-Whisper 模型: {model_name} (device={device}, compute_type={compute_type})")
+        # 确保镜像源配置
+        self._setup_hf_mirror()
+
+        # 获取完整的仓库 ID
+        model_repo_id = self.get_model_repo_id(model_name)
+
+        logger.info(f"=" * 50)
+        logger.info(f"加载 Faster-Whisper 模型")
+        logger.info(f"  模型名称: {model_name}")
+        logger.info(f"  仓库 ID: {model_repo_id}")
+        logger.info(f"  设备: {device}, 计算类型: {compute_type}")
+        logger.info(f"  缓存目录: {download_root}")
+        logger.info(f"  镜像源: {os.environ.get('HF_ENDPOINT', '官方源')}")
+        logger.info(f"=" * 50)
 
         try:
+            # 检查模型是否存在本地，不存在则下载
+            if auto_download:
+                model_path = self._ensure_model_downloaded(
+                    model_repo_id, 
+                    download_root,
+                    force_download=False
+                )
+                if model_path:
+                    # 使用本地路径加载
+                    logger.info(f"使用本地模型路径: {model_path}")
+                    model_repo_id = model_path
+
+            # 加载模型
             self.model = WhisperModel(
-                model_name,
+                model_repo_id,
                 device=device,
                 compute_type=compute_type,
                 download_root=download_root,
@@ -93,13 +193,184 @@ class WhisperService:
             self._device = device
             self._compute_type = compute_type
 
-            logger.info(f"Faster-Whisper 模型加载完成: {model_name}")
+            logger.info(f"✓ Faster-Whisper 模型加载完成: {model_name}")
 
         except Exception as e:
-            logger.error(f"加载 Faster-Whisper 模型失败: {e}")
+            logger.error(f"✗ 加载 Faster-Whisper 模型失败: {e}")
             raise
 
         return self
+
+    def _ensure_model_downloaded(
+        self, 
+        model_repo_id: str, 
+        cache_dir: str,
+        force_download: bool = False
+    ) -> Optional[str]:
+        """
+        确保模型已下载到本地（使用镜像源）
+
+        Args:
+            model_repo_id: 模型仓库 ID (如 Systran/faster-whisper-medium)
+            cache_dir: 缓存目录
+            force_download: 是否强制重新下载
+
+        Returns:
+            str: 模型本地路径，如果模型已存在或下载成功；None 表示需要让 Faster-Whisper 自行处理
+        """
+        from huggingface_hub import snapshot_download, HfApi
+        
+        logger.info(f"检查模型是否存在本地: {model_repo_id}")
+
+        # 计算模型缓存路径
+        model_cache_name = f"models--{model_repo_id.replace('/', '--')}"
+        model_dir = Path(cache_dir) / model_cache_name
+
+        # 检查模型是否已存在且完整
+        if not force_download:
+            local_path = self._check_local_model(model_dir)
+            if local_path:
+                logger.info(f"✓ 模型已存在本地: {local_path}")
+                return local_path
+
+        # 模型不存在或不完整，开始下载
+        logger.info(f"=" * 40)
+        logger.info(f"模型不存在本地，开始下载...")
+        logger.info(f"  仓库: {model_repo_id}")
+        logger.info(f"  镜像源: {os.environ.get('HF_ENDPOINT', '官方源')}")
+        logger.info(f"  目标目录: {cache_dir}")
+        logger.info(f"  这可能需要几分钟，请耐心等待...")
+        logger.info(f"=" * 40)
+
+        try:
+            # 使用 snapshot_download 下载完整模型
+            model_path = snapshot_download(
+                repo_id=model_repo_id,
+                cache_dir=cache_dir,
+                resume_download=True,  # 支持断点续传
+                local_files_only=False,
+                # 不指定 revision，使用默认的 main 分支
+            )
+
+            logger.info(f"✓ 模型下载完成: {model_path}")
+            return model_path
+
+        except Exception as e:
+            logger.error(f"✗ 模型下载失败: {e}")
+            logger.warning(f"将尝试让 Faster-Whisper 自行处理下载...")
+            
+            # 提供更详细的错误提示
+            if "Connection" in str(e) or "timeout" in str(e).lower():
+                logger.error("网络连接问题，请检查网络或尝试使用 VPN")
+                logger.info("提示: 可以手动下载模型到以下目录:")
+                logger.info(f"  {cache_dir}")
+            
+            return None
+
+    def _check_local_model(self, model_dir: Path) -> Optional[str]:
+        """
+        检查本地模型是否存在且完整
+
+        Args:
+            model_dir: 模型缓存目录 (如 .../models--Systran--faster-whisper-medium)
+
+        Returns:
+            str: 模型 snapshot 路径，如果模型完整；否则返回 None
+        """
+        if not model_dir.exists():
+            logger.debug(f"模型目录不存在: {model_dir}")
+            return None
+
+        # HuggingFace Hub 的缓存结构: models--xxx/snapshots/hash/
+        snapshots_dir = model_dir / "snapshots"
+        if not snapshots_dir.exists():
+            logger.debug(f"snapshots 目录不存在: {snapshots_dir}")
+            return None
+
+        # 找到最新的 snapshot
+        snapshots = [d for d in snapshots_dir.iterdir() if d.is_dir()]
+        if not snapshots:
+            logger.debug("没有找到任何 snapshot")
+            return None
+
+        # 按修改时间排序，取最新的
+        latest_snapshot = max(snapshots, key=lambda x: x.stat().st_mtime)
+
+        # 检查必需文件是否存在
+        missing_files = []
+        for required_file in REQUIRED_MODEL_FILES:
+            if not (latest_snapshot / required_file).exists():
+                missing_files.append(required_file)
+
+        if missing_files:
+            logger.warning(f"模型文件不完整，缺少: {missing_files}")
+            return None
+
+        return str(latest_snapshot)
+
+    def check_model_exists(self, model_name: str = DEFAULT_WHISPER_MODEL) -> Dict[str, Any]:
+        """
+        检查指定模型是否存在本地（供 API 调用）
+
+        Args:
+            model_name: 模型名称
+
+        Returns:
+            dict: {
+                "exists": bool,
+                "model_name": str,
+                "repo_id": str,
+                "local_path": str or None,
+                "cache_dir": str
+            }
+        """
+        cache_dir = str(config.HF_CACHE_DIR)
+        repo_id = self.get_model_repo_id(model_name)
+        model_cache_name = f"models--{repo_id.replace('/', '--')}"
+        model_dir = Path(cache_dir) / model_cache_name
+        
+        local_path = self._check_local_model(model_dir)
+        
+        return {
+            "exists": local_path is not None,
+            "model_name": model_name,
+            "repo_id": repo_id,
+            "local_path": local_path,
+            "cache_dir": cache_dir
+        }
+
+    def list_available_models(self) -> Dict[str, str]:
+        """
+        列出所有支持的模型
+
+        Returns:
+            dict: {model_name: repo_id, ...}
+        """
+        return WHISPER_MODELS.copy()
+
+    def list_local_models(self) -> list:
+        """
+        列出本地已下载的模型
+
+        Returns:
+            list: 已下载模型的列表
+        """
+        cache_dir = Path(config.HF_CACHE_DIR)
+        local_models = []
+
+        for model_name, repo_id in WHISPER_MODELS.items():
+            model_cache_name = f"models--{repo_id.replace('/', '--')}"
+            model_dir = cache_dir / model_cache_name
+            local_path = self._check_local_model(model_dir)
+            
+            if local_path:
+                local_models.append({
+                    "model_name": model_name,
+                    "repo_id": repo_id,
+                    "local_path": local_path
+                })
+
+        return local_models
 
     def unload_model(self):
         """卸载模型释放显存"""
@@ -155,6 +426,10 @@ class WhisperService:
         """
         if not self.model:
             raise RuntimeError("模型未加载，请先调用 load_model()")
+
+        # 处理语言代码：'auto' 或空字符串应转换为 None（自动检测）
+        if language is None or language == 'auto' or language == '':
+            language = None
 
         # 执行转录
         segments_generator, info = self.model.transcribe(

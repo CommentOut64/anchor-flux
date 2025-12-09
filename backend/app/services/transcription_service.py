@@ -4378,6 +4378,105 @@ class TranscriptionService:
                     subtitle_manager.add_sentence(sent)
                 return sentences
 
+    async def _whisper_text_patch_with_arbitration(
+        self,
+        sentence: 'SentenceSegment',
+        sentence_index: int,
+        audio_array: np.ndarray,
+        job: 'JobState',
+        subtitle_manager: 'StreamingSubtitleManager',
+        is_trash_suspect: bool = False
+    ) -> 'SentenceSegment':
+        """
+        Whisper 补刀 + 仲裁判决（二次安检机制）
+
+        核心逻辑：
+        - 如果是垃圾嫌疑样本，根据 Whisper 反馈判决去留
+        - 如果是常规补刀，直接采纳 Whisper 结果
+
+        Args:
+            sentence: 原始句子
+            sentence_index: 句子索引
+            audio_array: 完整音频数组
+            job: 任务状态
+            subtitle_manager: 流式字幕管理器
+            is_trash_suspect: 是否是垃圾嫌疑样本
+
+        Returns:
+            SentenceSegment: 更新后的句子（或标记删除）
+        """
+        from app.services.whisper_service import get_whisper_service
+        from app.models.sensevoice_models import TextSource
+
+        whisper_service = get_whisper_service()
+
+        # 确保 Whisper 模型已加载（首次运行会自动下载）
+        if not whisper_service.is_loaded:
+            self.logger.info("加载 Whisper 模型...")
+            whisper_service.load_model()  # 自动下载 CTranslate2 格式模型
+
+        # 提取对应时间段的音频
+        sr = 16000
+        start_sample = int(sentence.start * sr)
+        end_sample = int(sentence.end * sr)
+        audio_segment = audio_array[start_sample:end_sample]
+
+        # 获取上下文提示
+        context = subtitle_manager.get_context_window(sentence_index)
+
+        # Whisper 转录
+        result = whisper_service.transcribe(
+            audio=audio_segment,
+            initial_prompt=context,
+            language=getattr(job.settings, 'language', 'auto'),
+            word_timestamps=False
+        )
+
+        whisper_text = result.get('text', '').strip()
+        whisper_conf = self._estimate_whisper_confidence(result)
+
+        # === 判决时刻 ===
+        if is_trash_suspect:
+            # 仲裁阈值
+            WHISPER_ARBITRATION_CONF = 0.5  # Whisper 也必须有一定确信度
+            MIN_TEXT_LENGTH = 1  # 最少文本长度
+
+            # 判死刑条件：Whisper 也听不清 OR 输出为空
+            if whisper_conf < WHISPER_ARBITRATION_CONF or len(whisper_text) < MIN_TEXT_LENGTH:
+                self.logger.info(
+                    f"仲裁结果: 删除垃圾片段 {sentence_index} - "
+                    f"SenseVoice({sentence.confidence:.2f}) + Whisper({whisper_conf:.2f}, '{whisper_text}')"
+                )
+                subtitle_manager.mark_for_deletion(
+                    index=sentence_index,
+                    reason=f"whisper_arbitration_failed_conf_{whisper_conf:.2f}"
+                )
+                return sentence
+            else:
+                # 挽救成功！
+                self.logger.info(
+                    f"仲裁结果: 挽救片段 {sentence_index} - "
+                    f"'{whisper_text}' (Whisper Conf {whisper_conf:.2f})"
+                )
+
+        # 常规补刀 OR 垃圾样本通过仲裁 => 采纳 Whisper 结果
+        if not whisper_text:
+            self.logger.warning(f"Whisper 补刀返回空文本，保留原结果")
+            return sentence
+
+        # 保存 Whisper 备选文本
+        sentence.whisper_alternative = whisper_text
+
+        # 使用伪对齐更新句子
+        subtitle_manager.update_sentence(
+            index=sentence_index,
+            new_text=whisper_text,
+            source=TextSource.WHISPER_PATCH,
+            confidence=whisper_conf
+        )
+
+        return subtitle_manager.sentences[sentence_index]
+
     async def _whisper_text_patch(
         self,
         sentence: 'SentenceSegment',
@@ -4409,6 +4508,11 @@ class TranscriptionService:
 
         whisper_service = get_whisper_service()
 
+        # 确保 Whisper 模型已加载（首次运行会自动下载）
+        if not whisper_service.is_loaded:
+            self.logger.info("加载 Whisper 模型...")
+            whisper_service.load_model()  # 自动下载 CTranslate2 格式模型
+
         # 提取对应时间段的音频（使用 SenseVoice 的时间窗口）
         sr = 16000
         start_sample = int(sentence.start * sr)
@@ -4422,7 +4526,7 @@ class TranscriptionService:
         result = whisper_service.transcribe(
             audio=audio_segment,
             initial_prompt=context,
-            language=job.settings.get('language', 'auto'),
+            language=getattr(job.settings, 'language', 'auto'),
             word_timestamps=False  # 不需要字级时间戳，使用伪对齐
         )
 
@@ -4497,11 +4601,18 @@ class TranscriptionService:
 
         progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
 
-        # 1. 收集需要 Whisper 补刀的句子（含强制补刀和常规补刀）
+        # 调试日志：确认方法被调用
+        self.logger.info(f"[DEBUG] 开始后处理增强: {len(sentences)} 句, enhancement={solution_config.enhancement.value}")
+
+        # 1. 收集需要 Whisper 补刀的句子（含强制补刀、常规补刀、垃圾核查）
         patch_queue = []
+        # 阈值配置
+        GARBAGE_CONFIDENCE_THRESHOLD = 0.4  # 低于此值触发 Whisper 仲裁
+
         for i, sentence in enumerate(sentences):
             should_patch = False
             is_critical = False
+            is_trash_suspect = False  # 是否是"垃圾嫌疑"需要 Whisper 仲裁
 
             # 计算片段时长和清洗后文本长度
             duration = sentence.end - sentence.start
@@ -4518,8 +4629,80 @@ class TranscriptionService:
                     f"(conf={sentence.confidence:.2f}, dur={duration:.2f}s)"
                 )
 
+            # 【新增】低置信度"二次安检"逻辑
+            # 如果整句置信度极低（可能是幻觉/噪音），用 Whisper 仲裁
+            elif sentence.confidence < GARBAGE_CONFIDENCE_THRESHOLD:
+                should_patch = True
+                is_trash_suspect = True
+                self.logger.info(
+                    f"触发低置信度核查: '{clean_text[:30]}...' "
+                    f"(conf={sentence.confidence:.2f})"
+                )
+
+            # 【新增】字级强制补刀（独立检查，不受 enhancement 配置影响）
+            # 条件1: 单字符实词且置信度 < 0.9
+            # 条件2: 任意实词置信度极低 (< 0.35)，几乎肯定是识别错误
+            if not should_patch:
+                # 调试：检查 sentence.words 是否存在
+                words_count = len(sentence.words) if sentence.words else 0
+                self.logger.info(f"[DEBUG] 句子{i} words数量: {words_count}, text: '{clean_text[:30]}'")
+
+                if sentence.words:
+                    SINGLE_CHAR_CONF_THRESHOLD = 0.9  # 单字符词的高置信度要求
+                    CRITICAL_WORD_CONF_THRESHOLD = 0.35  # 极低置信度阈值（低于此值几乎肯定是错误）
+                    LOW_CONF_WORD_COUNT_THRESHOLD = 3  # 多个低置信度词的数量阈值
+                    LOW_WORD_CONF_THRESHOLD = 0.5  # 低置信度词的阈值
+                    
+                    low_conf_word_count = 0  # 统计低置信度词数量
+                    
+                    for w in sentence.words:
+                        # 去除空白和 SentencePiece 边界标记 ▁ (U+2581)
+                        word_text = w.word.strip().lstrip('▁').lower()
+                        word_conf = w.confidence
+
+                        # 调试日志：输出所有词（不仅仅是单字符）
+                        self.logger.info(
+                            f"[DEBUG] 句子{i} 词: '{w.word}' (cleaned: '{word_text}') len={len(word_text)} conf={word_conf:.3f}"
+                        )
+
+                        # 跳过空字符、标点
+                        if not word_text or (len(word_text) == 1 and not word_text.isalnum()):
+                            continue
+
+                        # 条件1: 单字符实词 + 置信度 < 0.9
+                        if len(word_text) == 1 and word_text.isalnum() and word_conf < SINGLE_CHAR_CONF_THRESHOLD:
+                            should_patch = True
+                            is_critical = True
+                            self.logger.warning(
+                                f"触发字级单字符强制补刀: Sentence {i} 含单字符词 '{word_text}' "
+                                f"(conf={word_conf:.2f})"
+                            )
+                            break
+
+                        # 条件2: 任意实词置信度极低 (< 0.35)，几乎肯定是识别错误
+                        if len(word_text) >= 2 and word_conf < CRITICAL_WORD_CONF_THRESHOLD:
+                            should_patch = True
+                            is_critical = True
+                            self.logger.warning(
+                                f"触发字级极低置信度强制补刀: Sentence {i} 含极低置信度词 '{word_text}' "
+                                f"(conf={word_conf:.2f})"
+                            )
+                            break
+                        
+                        # 统计低置信度词数量
+                        if len(word_text) >= 2 and word_conf < LOW_WORD_CONF_THRESHOLD:
+                            low_conf_word_count += 1
+                    
+                    # 条件3: 多个低置信度词（>= 3个），整句可能有问题
+                    if not should_patch and low_conf_word_count >= LOW_CONF_WORD_COUNT_THRESHOLD:
+                        should_patch = True
+                        is_critical = True
+                        self.logger.warning(
+                            f"触发字级多低置信度词强制补刀: Sentence {i} 含 {low_conf_word_count} 个低置信度词"
+                        )
+
             # 常规补刀条件（遵循用户设置）
-            elif solution_config.enhancement != EnhancementMode.OFF:
+            if not should_patch and solution_config.enhancement != EnhancementMode.OFF:
                 # 【阶段五】构建字级时间戳列表
                 words_data = [{"word": w.word, "confidence": w.confidence} for w in sentence.words]
 
@@ -4533,21 +4716,44 @@ class TranscriptionService:
                     should_patch = True
 
             if should_patch:
-                patch_queue.append((i, sentence, is_critical))
+                patch_queue.append({
+                    "index": i,
+                    "sentence": sentence,
+                    "is_critical": is_critical,
+                    "is_trash_suspect": is_trash_suspect
+                })
 
-        # 2. Whisper 补刀阶段
+        # 调试日志：输出补刀队列统计
+        self.logger.info(f"[DEBUG] 补刀队列构建完成: {len(patch_queue)} 个句子需要补刀")
+
+        # 2. Whisper 补刀阶段（含仲裁判决）
         if patch_queue:
             progress_tracker.start_phase(ProcessPhase.WHISPER_PATCH, len(patch_queue), "Whisper 补刀中...")
 
-            for idx, (sent_idx, sentence, is_critical) in enumerate(patch_queue):
-                await self._whisper_text_patch(
-                    sentence, sent_idx, audio_array, job, subtitle_manager
+            for idx, item in enumerate(patch_queue):
+                sent_idx = item["index"]
+                sentence = item["sentence"]
+                is_trash_suspect = item["is_trash_suspect"]
+
+                # 执行 Whisper 补刀并获取仲裁结果
+                await self._whisper_text_patch_with_arbitration(
+                    sentence=sentence,
+                    sentence_index=sent_idx,
+                    audio_array=audio_array,
+                    job=job,
+                    subtitle_manager=subtitle_manager,
+                    is_trash_suspect=is_trash_suspect
                 )
                 progress_tracker.update_phase(ProcessPhase.WHISPER_PATCH, increment=1)
 
             progress_tracker.complete_phase(ProcessPhase.WHISPER_PATCH)
 
-        # 3. [可选] LLM 校对
+        # 3. 清理被标记为垃圾的句子
+        deleted_count = subtitle_manager.remove_marked_sentences()
+        if deleted_count > 0:
+            self.logger.info(f"Whisper 仲裁：删除了 {deleted_count} 个确认为垃圾的片段")
+
+        # 4. [可选] LLM 校对
         if solution_config.proofread != ProofreadMode.OFF:
             # TODO: 实现 LLM 校对
             self.logger.info("LLM 校对功能待实现")

@@ -134,20 +134,29 @@ def needs_whisper_patch(
         if text_length == 1:
             return True
 
-    # 条件 4: 【阶段五】字级木桶效应
-    # 检查是否有实词的置信度低于阈值
+    # 条件 4: 【阶段五】字级木桶效应 + 字级单字符强制补刀
+    # 检查是否有实词的置信度低于阈值，或存在单字符词（极可能是 CTC 漏字）
     if words:
         MIN_WORD_CONF = config.word_warning_confidence  # 使用已有的字级警告阈值 (0.5)
-        # 停用词列表（这些词即使置信度低也不触发补刀）
+        SINGLE_CHAR_CONF = 0.9  # 单字符词的高置信度要求（低于此值强制补刀）
+        # 停用词列表（这些词即使置信度低也不触发补刀，但单字符规则优先）
         STOP_WORDS = {"the", "a", "an", "is", "it", "to", "of", "and", "in", "on"}
 
         for w in words:
-            word_text = w.get("word", "").strip().lower()
+            # 去除空白和 SentencePiece 边界标记 ▁ (U+2581)
+            word_text = w.get("word", "").strip().lstrip('▁').lower()
             word_conf = w.get("confidence", 1.0)
 
-            # 跳过空字符、标点、停用词
+            # 跳过空字符、标点
             if not word_text or (len(word_text) == 1 and not word_text.isalnum()):
                 continue
+
+            # 【强制补刀】单字符实词 + 置信度 < 0.9 => 极可能是 CTC 漏字（如 "E" 应为 "Evil"）
+            # 此规则优先于停用词列表，因为单字符错误风险极高
+            if len(word_text) == 1 and word_text.isalnum() and word_conf < SINGLE_CHAR_CONF:
+                return True
+
+            # 跳过停用词（常规阈值检查）
             if word_text in STOP_WORDS:
                 continue
 

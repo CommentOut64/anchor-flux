@@ -162,9 +162,59 @@ class StreamingSubtitleManager:
             }
         )
 
+    def mark_for_deletion(self, index: int, reason: str = "garbage"):
+        """
+        标记句子为待删除（Whisper 仲裁后确认为垃圾）
+
+        Args:
+            index: 句子索引
+            reason: 删除原因
+        """
+        if index not in self.sentences:
+            return
+
+        sentence = self.sentences[index]
+        sentence.marked_for_deletion = True
+        sentence.deletion_reason = reason
+
+        # 推送 SSE 事件通知前端
+        push_subtitle_event(
+            self.sse_manager,
+            self.job_id,
+            "sentence_deleted",
+            {
+                "index": index,
+                "reason": reason
+            }
+        )
+        logger.info(f"标记删除句子 {index}: {reason}")
+
+    def remove_marked_sentences(self) -> int:
+        """
+        物理删除被标记为垃圾的句子
+
+        Returns:
+            int: 删除的句子数量
+        """
+        marked_indices = [
+            idx for idx, s in self.sentences.items()
+            if getattr(s, 'marked_for_deletion', False)
+        ]
+
+        for idx in marked_indices:
+            del self.sentences[idx]
+
+        if marked_indices:
+            logger.info(f"已删除 {len(marked_indices)} 个垃圾句子: {marked_indices}")
+
+        return len(marked_indices)
+
     def get_all_sentences(self) -> List[SentenceSegment]:
-        """获取所有句子（按时间排序）"""
-        sentences = list(self.sentences.values())
+        """获取所有句子（按时间排序，排除已标记删除的）"""
+        sentences = [
+            s for s in self.sentences.values()
+            if not getattr(s, 'marked_for_deletion', False)
+        ]
         sentences.sort(key=lambda s: s.start)
         return sentences
 

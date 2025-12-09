@@ -140,6 +140,9 @@ class CTCDecoder:
                 "is_pseudo": False
             })
 
+        # 【新增】CTC 重叠去重：移除前缀重复（如 "W" + "Would" => "Would"）
+        word_timestamps = self._remove_overlap_duplicates(word_timestamps)
+
         # 4. 拼接文本
         text = "".join([wt["word"] for wt in word_timestamps])
 
@@ -147,6 +150,67 @@ class CTCDecoder:
         avg_confidence = np.mean([wt["confidence"] for wt in word_timestamps]) if word_timestamps else 0.0
 
         return text, word_timestamps, float(avg_confidence)
+
+    def _remove_overlap_duplicates(self, word_timestamps: List[Dict]) -> List[Dict]:
+        """
+        移除 CTC 解码产生的重叠前缀词（口吃去重）
+
+        典型场景：
+        - "W" (start=0.0, end=0.06, conf=0.572) + "Would" (start=0.06, end=0.24, conf=0.886)
+        - 原因：CTC 在上一帧输出了 "W"，下一帧输出了完整的 "Would"
+        - 修正：删除 "W"，只保留 "Would"
+
+        去重条件（同时满足）：
+        1. 当前词是下一个词的前缀（忽略大小写）
+        2. 时间间隔 <= 0.1s（避免误判真正独立的单词）
+        3. 当前词长度 <= 2（避免误删正常短词）
+
+        Args:
+            word_timestamps: 原始字级时间戳列表
+
+        Returns:
+            List[Dict]: 去重后的字级时间戳列表
+        """
+        if len(word_timestamps) < 2:
+            return word_timestamps
+
+        cleaned = []
+        i = 0
+
+        while i < len(word_timestamps):
+            current = word_timestamps[i]
+            current_word = current["word"].strip().lower()
+
+            # 检查是否应该与下一个词合并
+            if i + 1 < len(word_timestamps):
+                next_word_info = word_timestamps[i + 1]
+                next_word = next_word_info["word"].strip().lower()
+
+                # 计算时间间隔
+                time_gap = next_word_info["start"] - current["end"]
+
+                # 判断是否为前缀重复
+                is_prefix = (
+                    len(current_word) <= 2 and  # 当前词极短
+                    len(next_word) > len(current_word) and  # 下一个词更长
+                    next_word.startswith(current_word) and  # 下一个词包含当前词作为前缀
+                    time_gap <= 0.1  # 时间紧挨着或重叠
+                )
+
+                if is_prefix:
+                    # 跳过当前词（前缀），保留下一个完整词
+                    # logger.debug(
+                    #     f"CTC 去重: 移除前缀 '{current_word}' -> 保留 '{next_word}' "
+                    #     f"(gap={time_gap:.3f}s)"
+                    # )
+                    i += 1
+                    continue
+
+            # 保留当前词
+            cleaned.append(current)
+            i += 1
+
+        return cleaned
 
     @staticmethod
     def _softmax(logits: np.ndarray) -> np.ndarray:
@@ -472,6 +536,10 @@ class SenseVoiceONNXService:
                 clean_word_timestamps.append(w)
             word_timestamps = clean_word_timestamps
 
+            # 【新增】Token 合并：将 BPE/SentencePiece Subword Tokens 合并为完整单词
+            # 修复 "laval" 被拆分为 " la" + "val" 的问题
+            word_timestamps = self._merge_tokens_to_words(word_timestamps)
+
             # 4. 提取标签信息
             from ..services.text_normalizer import get_text_normalizer
             normalizer = get_text_normalizer()
@@ -676,6 +744,79 @@ class SenseVoiceONNXService:
             results.append(result)
 
         return results
+
+    def _merge_tokens_to_words(self, tokens: List[Dict]) -> List[Dict]:
+        """
+        将 BPE/SentencePiece Subword Tokens 合并为完整单词
+
+        典型场景：
+        - " la" (0.900) + "val" (0.687) => " laval" (min=0.687)
+        - 原因：SenseVoice 使用 Subword 分词器（BPE/SentencePiece）
+        - 目标：将字符级时间戳聚合为词级时间戳
+
+        合并规则：
+        1. Token 以空格/▁ 开头 => 新词开始
+        2. Token 不以空格开头 且 是字母数字 => 词的延续，合并到前一个词
+        3. 标点符号 => 独立成词（视情况）
+
+        置信度策略：取最小值（木桶效应），利于触发补刀
+
+        Args:
+            tokens: 原始字符级时间戳列表
+
+        Returns:
+            List[Dict]: 合并后的词级时间戳列表
+        """
+        if not tokens:
+            return []
+
+        merged_words = []
+        current_word = None
+
+        for token in tokens:
+            text = token["word"]
+
+            # 判断是否是新词的开始
+            # 规则1：以空格开头（如 " la"）或 SentencePiece 符号 ▁ 开头
+            # 规则2：当前没有正在构建的词
+            # 规则3：标点符号通常独立（可选，这里暂不处理）
+            is_new_word = (
+                text.startswith(" ") or
+                text.startswith("▁") or  # SentencePiece 词边界标记 (U+2581)
+                current_word is None
+            )
+
+            if is_new_word:
+                # 归档上一个词
+                if current_word is not None:
+                    merged_words.append(current_word)
+
+                # 开始新词
+                current_word = token.copy()
+            else:
+                # 合并到当前词
+                # 1. 文本拼接
+                current_word["word"] += text
+
+                # 2. 时间延展（结束时间更新为当前 token 的结束时间）
+                current_word["end"] = token["end"]
+
+                # 3. 置信度：取最小值（木桶效应），反映该词最弱环节的可信度
+                # 这样有利于触发 Whisper 补刀
+                current_word["confidence"] = min(
+                    current_word["confidence"],
+                    token["confidence"]
+                )
+
+                # 4. 标记伪对齐状态
+                if token.get("is_pseudo"):
+                    current_word["is_pseudo"] = True
+
+        # 归档最后一个词
+        if current_word is not None:
+            merged_words.append(current_word)
+
+        return merged_words
 
     def get_model_info(self) -> Dict:
         """获取模型信息"""
