@@ -1,7 +1,15 @@
 """
 对齐服务模块
 
-包含:
-- alignment_service: 锚点对齐算法（核心）
-- pseudo_alignment: 伪对齐算法（已存在）
+Phase 3 实现 - 2025-12-10
+
+提供双流对齐算法和关键词提取功能。
 """
+
+from .alignment_service import AlignmentService
+from .keyword_extractor import KeywordExtractor
+
+__all__ = [
+    "AlignmentService",
+    "KeywordExtractor",
+]
