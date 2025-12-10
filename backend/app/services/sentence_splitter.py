@@ -264,6 +264,29 @@ class SentenceSplitter:
         return sentences
 
     # ============================================================================
+    # 辅助方法
+    # ============================================================================
+
+    def _is_chinese_char(self, char: str) -> bool:
+        """判断字符是否为中文字符"""
+        if not char:
+            return False
+        code = ord(char)
+        # 常用汉字范围: CJK Unified Ideographs
+        return (0x4E00 <= code <= 0x9FFF or   # 基本汉字
+                0x3400 <= code <= 0x4DBF or   # CJK扩展A
+                0x20000 <= code <= 0x2A6DF or # CJK扩展B
+                0xF900 <= code <= 0xFAFF)     # CJK兼容汉字
+
+    def _is_punctuation(self, char: str) -> bool:
+        """判断字符是否为标点符号"""
+        if not char:
+            return False
+        # 包含中英文常见标点
+        punctuation = set(',.!?;:\'\"()[]{}，。！？；：""''（）【】《》、')
+        return char in punctuation
+
+    # ============================================================================
     # Layer 1 优化算法
     # ============================================================================
 
@@ -451,8 +474,25 @@ class SentenceSplitter:
         if not words:
             return None
 
-        # 原始文本（包含标签和连字符）
-        text_raw = "".join(w.word for w in words)
+        # 智能构建文本：根据词的特性决定是否添加空格
+        # 英文单词之间需要空格，中文字符之间不需要
+        text_parts = []
+        for i, w in enumerate(words):
+            word = w.word
+            text_parts.append(word)
+            
+            # 判断是否需要在此词后添加空格
+            if i < len(words) - 1:
+                next_word = words[i + 1].word
+                # 如果当前词或下一词是中文字符，不加空格
+                # 如果当前词以标点结尾且下一词不是标点，不加空格（标点已含空格语义）
+                # 否则（英文单词之间）加空格
+                if not self._is_chinese_char(word[-1] if word else '') and \
+                   not self._is_chinese_char(next_word[0] if next_word else '') and \
+                   not self._is_punctuation(next_word[0] if next_word else ''):
+                    text_parts.append(' ')
+        
+        text_raw = "".join(text_parts)
 
         # 清洗文本（去除标签和连字符）
         normalizer = get_text_normalizer()

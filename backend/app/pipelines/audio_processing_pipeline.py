@@ -227,7 +227,7 @@ class AudioProcessingPipeline:
         audio_path = temp_dir / f"{Path(video_path).stem}_audio.wav"
 
         # FFmpeg 命令
-        ffmpeg_cmd = config.FFMPEG_PATH or "ffmpeg"
+        ffmpeg_cmd = str(config.FFMPEG_EXE) if config.FFMPEG_EXE.exists() else "ffmpeg"
         cmd = [
             ffmpeg_cmd, '-y', '-i', video_path,
             '-vn',                    # 仅音频

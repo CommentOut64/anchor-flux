@@ -133,6 +133,14 @@ class SentenceSegment:
     is_soft_break: bool = False                   # 是否为软断点（物理断但语义连续）
     group_position: Optional[str] = None          # 在组内的位置: 'start', 'middle', 'end', 'single'
 
+    # Phase 4: 双流对齐字段
+    alignment_score: Optional[float] = None       # 对齐质量分数 (0-1)
+    matched_ratio: Optional[float] = None         # 匹配比例 (0-1)
+    is_draft: bool = False                        # 是否为草稿（快流）
+    is_finalized: bool = False                    # 是否已定稿（慢流完成）
+    sv_original_text: Optional[str] = None        # SenseVoice 原始文本（用于对比）
+    whisper_text: Optional[str] = None            # Whisper 识别文本（用于对比）
+
     def mark_as_modified(self, new_text: str, source: TextSource):
         """标记为已修改"""
         if not self.is_modified:

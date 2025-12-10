@@ -79,11 +79,11 @@ class SenseVoiceExecutor:
     def is_loaded(self) -> bool:
         """
         检查模型是否已加载
-        
+
         Returns:
             bool: 是否已加载
         """
-        return self.service.model is not None
+        return self.service.session is not None
     
     def get_model_info(self) -> Dict[str, Any]:
         """

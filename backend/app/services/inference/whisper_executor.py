@@ -47,9 +47,9 @@ class WhisperExecutor:
         执行 Whisper 推理
         
         Args:
-            audio: 音频文件路径或音频数组
-            start_time: 起始时间（秒）
-            end_time: 结束时间（秒）
+            audio: 音频数组（已切片的 Chunk 音频，不需要再次切片）
+            start_time: Chunk 起始时间（秒）- 仅用于日志，不用于切片
+            end_time: Chunk 结束时间（秒）- 仅用于日志，不用于切片
             language: 语言代码（zh/en/auto）
             initial_prompt: 初始提示词（用于引导识别）
         
@@ -58,28 +58,48 @@ class WhisperExecutor:
                 - text: 识别文本
                 - confidence: 置信度估算
                 - language: 检测到的语言
+        
+        Note:
+            传入的 audio 应该是已经切片好的 Chunk 音频，
+            不会再进行二次切片。
         """
+        duration = end_time - start_time
         self.logger.debug(
             f'执行 Whisper 推理: start={start_time:.2f}s, end={end_time:.2f}s, '
+            f'duration={duration:.2f}s, '
             f'prompt={initial_prompt[:50] if initial_prompt else None}'
         )
         
-        # 调用底层服务
-        result = self.service.transcribe_segment(
+        # 直接调用 transcribe，不进行二次切片
+        # 传入的 audio 已经是切片后的 Chunk 音频
+        # 禁用 condition_on_previous_text 避免基于前文截断音频末尾内容
+        result = self.service.transcribe(
             audio=audio,
-            start_time=start_time,
-            end_time=end_time,
             language=language,
-            initial_prompt=initial_prompt
+            initial_prompt=initial_prompt,
+            word_timestamps=False,  # 使用伪对齐，不需要词级时间戳
+            beam_size=5,
+            vad_filter=False,  # 已经是 VAD 切片，不需要再次 VAD
+            condition_on_previous_text=False  # 禁用前文条件化，保留 prompt 用于词汇引导
         )
         
         # 估算置信度
         confidence = self.service.estimate_confidence(result)
-        
+
+        # 调试：打印原始 segments
+        segments = result.get('segments', [])
+        self.logger.info(f'Whisper 原始 segments ({len(segments)} 个):')
+        for i, seg in enumerate(segments):
+            self.logger.info(
+                f'  Segment {i}: [{seg.get("start", 0):.2f}s - {seg.get("end", 0):.2f}s] '
+                f'"{seg.get("text", "")}" '
+                f'(no_speech_prob={seg.get("no_speech_prob", 0):.3f})'
+            )
+
         # 提取文本
         text = result.get('text', '').strip()
-        
-        self.logger.debug(f'Whisper 推理完成: text={text}, confidence={confidence:.2f}')
+
+        self.logger.info(f'Whisper 推理完成: text={text}, confidence={confidence:.2f}')
         
         return {
             'text': text,
