@@ -207,6 +207,10 @@ class DualAlignmentPipeline:
             AlignmentLevel.SENSEVOICE_ONLY: 0
         }
 
+        # 错误统计
+        self.error_count = 0
+        self.error_details: List[Dict[str, Any]] = []
+
     async def run(
         self,
         chunks: List[AudioChunk],
@@ -230,15 +234,26 @@ class DualAlignmentPipeline:
         self.logger.info(f"开始双流对齐流水线: {self.total_chunks} 个 Chunk")
 
         # 加载模型（如果尚未加载）
-        if not self.sensevoice_executor.is_loaded():
-            self.logger.info("加载 SenseVoice 模型...")
-            self.sensevoice_executor.service.load_model()
-            self.logger.info("SenseVoice 模型加载完成")
+        try:
+            if not self.sensevoice_executor.is_loaded():
+                self.logger.info("加载 SenseVoice 模型...")
+                self.sensevoice_executor.service.load_model()
+                self.logger.info("SenseVoice 模型加载完成")
+        except Exception as e:
+            self.logger.error(f"SenseVoice 模型加载失败: {e}", exc_info=True)
+            raise RuntimeError(f"SenseVoice 模型加载失败，无法继续处理: {e}")
 
-        if not self.whisper_executor.is_loaded():
-            self.logger.info("加载 Whisper 模型...")
-            self.whisper_executor.service.load_model()
-            self.logger.info("Whisper 模型加载完成")
+        try:
+            if not self.whisper_executor.is_loaded():
+                self.logger.info("加载 Whisper 模型...")
+                self.whisper_executor.service.load_model()
+                self.logger.info("Whisper 模型加载完成")
+        except Exception as e:
+            self.logger.error(f"Whisper 模型加载失败: {e}", exc_info=True)
+            if not self.config.enable_fallback:
+                raise RuntimeError(f"Whisper 模型加载失败，无法继续处理: {e}")
+            else:
+                self.logger.warning("Whisper 模型加载失败，将使用 SenseVoice 草稿作为最终结果")
 
         results = []
 
@@ -296,9 +311,8 @@ class DualAlignmentPipeline:
                 is_draft=True
             )
 
-            # 立即推送草稿
-            for sentence in draft_sentences:
-                self.subtitle_manager.add_sentence(sentence)
+            # 立即推送草稿（使用 Chunk 级别的批量推送）
+            self.subtitle_manager.add_draft_sentences(chunk_index, draft_sentences)
 
             self.logger.info(f"Chunk {chunk_index}: 草稿已推送 ({len(draft_sentences)} 个句子)")
 
@@ -318,16 +332,8 @@ class DualAlignmentPipeline:
             # 更新 Prompt 缓存（使用定稿文本）
             self._update_prompt_cache(final_sentences)
 
-            # 阶段 4: 推送定稿
-            for i, sentence in enumerate(final_sentences):
-                # 计算全局句子索引
-                sentence_index = chunk_index * 100 + i  # 简单的索引策略
-                self.subtitle_manager.update_sentence(
-                    sentence_index,
-                    sentence.text_clean or sentence.text,
-                    sentence.source,
-                    confidence=sentence.confidence
-                )
+            # 阶段 4: 推送定稿（使用 Chunk 级别的批量替换）
+            self.subtitle_manager.replace_chunk(chunk_index, final_sentences)
 
             self.logger.info(
                 f"Chunk {chunk_index}: 定稿已推送 ({len(final_sentences)} 个句子, "
@@ -350,13 +356,50 @@ class DualAlignmentPipeline:
             self.logger.error(f"Chunk {chunk_index} 处理失败: {e}", exc_info=True)
             processing_time = time.time() - start_time
 
-            return ChunkProcessingResult(
-                chunk_index=chunk_index,
-                sentences=[],
-                alignment_level=AlignmentLevel.SENSEVOICE_ONLY,
-                processing_time=processing_time,
-                error=str(e)
-            )
+            # 记录错误详情
+            self.error_count += 1
+            error_detail = {
+                "chunk_index": chunk_index,
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "processing_time": processing_time
+            }
+            self.error_details.append(error_detail)
+
+            # 尝试使用 SenseVoice 草稿作为降级方案
+            try:
+                self.logger.warning(f"Chunk {chunk_index}: 尝试使用 SenseVoice 草稿作为降级方案")
+                sv_result = await self._run_sensevoice(chunk)
+                draft_sentences = self._split_sentences(sv_result, chunk, is_draft=False)
+
+                # 设置为定稿状态（作为最终结果）
+                for sentence in draft_sentences:
+                    sentence.is_finalized = True
+                    sentence.is_draft = False
+
+                # 推送定稿
+                self.subtitle_manager.replace_chunk(chunk_index, draft_sentences)
+
+                self.logger.info(f"Chunk {chunk_index}: 降级方案成功，使用 SenseVoice 草稿")
+
+                return ChunkProcessingResult(
+                    chunk_index=chunk_index,
+                    sentences=draft_sentences,
+                    alignment_level=AlignmentLevel.SENSEVOICE_ONLY,
+                    processing_time=processing_time,
+                    error=f"降级到 SenseVoice: {str(e)}"
+                )
+
+            except Exception as e2:
+                self.logger.error(f"Chunk {chunk_index}: 降级方案也失败: {e2}", exc_info=True)
+
+                return ChunkProcessingResult(
+                    chunk_index=chunk_index,
+                    sentences=[],
+                    alignment_level=AlignmentLevel.SENSEVOICE_ONLY,
+                    processing_time=processing_time,
+                    error=f"完全失败: {str(e)}, 降级失败: {str(e2)}"
+                )
 
     async def _run_sensevoice(self, chunk: AudioChunk) -> Dict[str, Any]:
         """
@@ -701,10 +744,23 @@ class DualAlignmentPipeline:
         self.logger.info("双流对齐流水线统计:")
         self.logger.info(f"  总 Chunk 数: {self.total_chunks}")
         self.logger.info(f"  已处理: {self.processed_chunks}")
-        self.logger.info(f"  对齐级别分布:")
-        for level, count in self.alignment_levels.items():
-            percentage = (count / self.processed_chunks * 100) if self.processed_chunks > 0 else 0
-            self.logger.info(f"    {level.value}: {count} ({percentage:.1f}%)")
+        self.logger.info(f"  成功: {self.processed_chunks - self.error_count}")
+        self.logger.info(f"  错误: {self.error_count}")
+
+        if self.processed_chunks > 0:
+            self.logger.info(f"  对齐级别分布:")
+            for level, count in self.alignment_levels.items():
+                percentage = (count / self.processed_chunks * 100)
+                self.logger.info(f"    {level.value}: {count} ({percentage:.1f}%)")
+
+        if self.error_details:
+            self.logger.info(f"  错误详情:")
+            for error in self.error_details:
+                self.logger.info(
+                    f"    Chunk {error['chunk_index']}: "
+                    f"{error['error_type']} - {error['error_message']}"
+                )
+
         self.logger.info("=" * 60)
 
     def get_statistics(self) -> Dict[str, Any]:
@@ -717,10 +773,13 @@ class DualAlignmentPipeline:
         return {
             "total_chunks": self.total_chunks,
             "processed_chunks": self.processed_chunks,
+            "success_chunks": self.processed_chunks - self.error_count,
+            "error_count": self.error_count,
             "alignment_levels": {
                 level.value: count
                 for level, count in self.alignment_levels.items()
-            }
+            },
+            "error_details": self.error_details
         }
 
 
