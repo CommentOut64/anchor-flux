@@ -211,6 +211,15 @@ class DualAlignmentPipeline:
         self.error_count = 0
         self.error_details: List[Dict[str, Any]] = []
 
+        # 显存使用统计
+        self.vram_usage: Dict[str, Any] = {
+            'initial_vram': 0,
+            'peak_vram': 0,
+            'final_vram': 0,
+            'sensevoice_vram': 0,
+            'whisper_vram': 0
+        }
+
     async def run(
         self,
         chunks: List[AudioChunk],
@@ -232,6 +241,9 @@ class DualAlignmentPipeline:
         """
         self.total_chunks = len(chunks)
         self.logger.info(f"开始双流对齐流水线: {self.total_chunks} 个 Chunk")
+
+        # 记录初始显存使用
+        self._record_vram_usage('initial')
 
         # 加载模型（如果尚未加载）
         try:
@@ -272,6 +284,10 @@ class DualAlignmentPipeline:
                 progress_callback(progress, f"处理 Chunk {i+1}/{self.total_chunks}")
 
         self.logger.info(f"双流对齐流水线完成: {self.processed_chunks}/{self.total_chunks} 个 Chunk")
+
+        # 记录最终显存使用
+        self._record_vram_usage('final')
+
         self._log_statistics()
 
         return results
@@ -303,6 +319,7 @@ class DualAlignmentPipeline:
             # 阶段 1: SenseVoice 快流推理 + 分句
             self.logger.debug(f"Chunk {chunk_index}: SenseVoice 快流推理")
             sv_result = await self._run_sensevoice(chunk)
+            self._record_vram_usage('peak')  # 记录 SenseVoice 后的显存
 
             # 分句（Layer 1 + Layer 2）
             draft_sentences = self._split_sentences(
@@ -320,6 +337,7 @@ class DualAlignmentPipeline:
             self.logger.debug(f"Chunk {chunk_index}: Whisper 慢流推理")
             whisper_prompt = self._build_whisper_prompt(draft_sentences, chunk_index)
             whisper_result = await self._run_whisper(chunk, whisper_prompt)
+            self._record_vram_usage('peak')  # 记录 Whisper 后的显存
 
             # 阶段 3: 双流对齐（三级降级策略）+ 分句
             self.logger.debug(f"Chunk {chunk_index}: 双流对齐")
@@ -738,6 +756,35 @@ class DualAlignmentPipeline:
 
         self.logger.debug(f"更新 Prompt 缓存: {len(self.previous_whisper_text)} 个字符")
 
+    def _record_vram_usage(self, stage: str):
+        """
+        记录显存使用情况
+
+        Args:
+            stage: 阶段标识（initial/peak/final）
+        """
+        try:
+            import torch
+            if torch.cuda.is_available():
+                vram_used = torch.cuda.memory_allocated() / 1024 / 1024  # MB
+                vram_reserved = torch.cuda.memory_reserved() / 1024 / 1024  # MB
+
+                if stage == 'initial':
+                    self.vram_usage['initial_vram'] = vram_used
+                elif stage == 'final':
+                    self.vram_usage['final_vram'] = vram_used
+
+                # 更新峰值
+                if vram_used > self.vram_usage['peak_vram']:
+                    self.vram_usage['peak_vram'] = vram_used
+
+                self.logger.debug(
+                    f"显存使用 ({stage}): {vram_used:.1f}MB (已分配), "
+                    f"{vram_reserved:.1f}MB (已保留)"
+                )
+        except Exception as e:
+            self.logger.debug(f"无法获取显存信息: {e}")
+
     def _log_statistics(self):
         """记录统计信息"""
         self.logger.info("=" * 60)
@@ -761,6 +808,13 @@ class DualAlignmentPipeline:
                     f"{error['error_type']} - {error['error_message']}"
                 )
 
+        # 显存使用统计
+        if self.vram_usage['peak_vram'] > 0:
+            self.logger.info(f"  显存使用:")
+            self.logger.info(f"    初始: {self.vram_usage['initial_vram']:.1f}MB")
+            self.logger.info(f"    峰值: {self.vram_usage['peak_vram']:.1f}MB")
+            self.logger.info(f"    最终: {self.vram_usage['final_vram']:.1f}MB")
+
         self.logger.info("=" * 60)
 
     def get_statistics(self) -> Dict[str, Any]:
@@ -779,7 +833,8 @@ class DualAlignmentPipeline:
                 level.value: count
                 for level, count in self.alignment_levels.items()
             },
-            "error_details": self.error_details
+            "error_details": self.error_details,
+            "vram_usage": self.vram_usage
         }
 
 
