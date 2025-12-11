@@ -89,9 +89,9 @@ class DualAlignmentConfig:
                 prefer_punctuation_break=False,  # 不依赖标点
                 use_dynamic_pause=True,          # 使用动态停顿
                 pause_threshold=0.5,             # 停顿阈值
-                max_chars=50,                    # 最大字符数
                 max_duration=5.0,                # 最大时长
                 merge_short_sentences=True       # 合并短句
+                # max_chars 默认为 0，不启用字符数限制
             )
 
         # 快流语义分组：主要依赖物理约束（时间间隔、句子长度）
@@ -109,9 +109,9 @@ class DualAlignmentConfig:
                 prefer_punctuation_break=True,   # 依赖标点
                 use_dynamic_pause=True,          # 使用动态停顿
                 pause_threshold=0.5,             # 停顿阈值
-                max_chars=50,                    # 最大字符数
                 max_duration=5.0,                # 最大时长
                 merge_short_sentences=True       # 合并短句
+                # max_chars 默认为 0，不启用字符数限制
             )
 
         # 慢流语义分组：依赖语义完整性（续接词、从句判断）
@@ -544,6 +544,11 @@ class DualAlignmentPipeline:
         Returns:
             tuple[List[SentenceSegment], AlignmentLevel]: 最终句子列表和对齐级别
         """
+        # 获取 Whisper 检测到的语言，用于语义完整性检查
+        detected_language = whisper_result.get('language', 'auto')
+        self.final_splitter.config.language = detected_language
+        self.logger.debug(f"使用 Whisper 检测到的语言: {detected_language}")
+
         try:
             # Level 1: 尝试双模态对齐
             whisper_text = whisper_result.get('text', '').strip()

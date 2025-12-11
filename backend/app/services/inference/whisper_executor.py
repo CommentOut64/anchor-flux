@@ -86,20 +86,10 @@ class WhisperExecutor:
         # 估算置信度
         confidence = self.service.estimate_confidence(result)
 
-        # 调试：打印原始 segments
-        segments = result.get('segments', [])
-        self.logger.info(f'Whisper 原始 segments ({len(segments)} 个):')
-        for i, seg in enumerate(segments):
-            self.logger.info(
-                f'  Segment {i}: [{seg.get("start", 0):.2f}s - {seg.get("end", 0):.2f}s] '
-                f'"{seg.get("text", "")}" '
-                f'(no_speech_prob={seg.get("no_speech_prob", 0):.3f})'
-            )
-
         # 提取文本
         text = result.get('text', '').strip()
 
-        self.logger.info(f'Whisper 推理完成: text={text}, confidence={confidence:.2f}')
+        self.logger.debug(f'Whisper 推理完成: text={text}, confidence={confidence:.2f}')
         
         return {
             'text': text,

@@ -53,6 +53,26 @@ class LanguageStrategy(ABC):
         """判断文本是否以续接词开头"""
         pass
 
+    def is_semantically_complete(self, text: str) -> bool:
+        """
+        检查文本是否语义完整，避免在不完整位置切分
+        默认实现：总是返回 True（允许切分）
+        子类可重写此方法以提供语言特定的语义完整性检查
+        """
+        return True
+
+    def is_incomplete_ending(self, word: str) -> bool:
+        """
+        检查单个词是否为不完整结尾词
+
+        Args:
+            word: 单个词（token）
+
+        Returns:
+            True 表示该词是不完整结尾词，不应在此处切分
+        """
+        return False
+
 
 class ChineseStrategy(LanguageStrategy):
     """中文语言策略"""
@@ -74,6 +94,93 @@ class ChineseStrategy(LanguageStrategy):
 class EnglishStrategy(LanguageStrategy):
     """英文语言策略"""
 
+    # 不完整结尾词集合 - 这些词结尾的句子语义不完整，不应在此处切分
+    # 分类整理，便于维护和扩展
+    INCOMPLETE_ENDINGS = {
+        # ============ 1. 代词 ============
+        # 人称代词（主格）- 需要后接谓语动词
+        'i', 'you', 'he', 'she', 'it', 'we', 'they',
+        # 人称代词（宾格）- 某些情况下也不宜结尾（如 "give me" 后需接宾语）
+        'me', 'him', 'us', 'them',
+        # 反身代词 - 通常作为宾语，但某些结构需要后续
+        # 'myself', 'yourself', 'himself', 'herself', 'itself', 'ourselves', 'themselves',
+        # 关系代词/疑问代词 - 引导从句，需要后续内容
+        'who', 'whom', 'whose', 'which', 'what', 'whoever', 'whatever', 'whichever',
+        # 不定代词 - 部分情况下需要后续
+        'some', 'any', 'no', 'every', 'each', 'either', 'neither', 'both', 'all', 'none',
+        'someone', 'anyone', 'everyone', 'something', 'anything', 'everything',
+
+        # ============ 2. 限定词 ============
+        # 冠词 - 必须接名词
+        'the', 'a', 'an',
+        # 指示词 - 作为限定词时需要接名词
+        'this', 'that', 'these', 'those', 'such',
+        # 所有格 - 必须接名词
+        'my', 'your', 'his', 'her', 'its', 'our', 'their',
+        # 数量词/量词 - 通常需要接名词
+        'many', 'much', 'few', 'little', 'several', 'most', 'more', 'less', 'fewer',
+        'enough', 'plenty', 'lots', 'another', 'other',
+
+        # ============ 3. 介词 ============
+        # 常用介词 - 必须接宾语
+        'to', 'of', 'in', 'on', 'at', 'for', 'with', 'about', 'from', 'into',
+        'through', 'during', 'before', 'after', 'above', 'below', 'between', 'among',
+        'under', 'over', 'behind', 'beside', 'beyond', 'within', 'without',
+        'against', 'along', 'around', 'across', 'towards', 'toward', 'upon',
+        'like', 'unlike', 'except', 'besides', 'including', 'excluding',
+        'near', 'inside', 'outside', 'beneath', 'underneath', 'alongside',
+        # 复合介词（常见部分）
+        'onto', 'throughout', 'despite', 'regarding', 'concerning',
+
+        # ============ 4. 连词 ============
+        # 并列连词
+        'and', 'or', 'but', 'nor', 'yet', 'so',
+        # 从属连词 - 引导从句，需要后续
+        'because', 'if', 'when', 'while', 'although', 'though', 'unless', 'until',
+        'since', 'whether', 'whereas', 'wherever', 'whenever', 'however',
+        'as', 'than', 'once', 'provided', 'supposing', 'considering',
+        # 关联连词组件
+        'either', 'neither', 'both', 'not',
+
+        # ============ 5. 动词（必须后接内容的形式）============
+        # be动词 - 必须需要补语（不能独立结尾）
+        'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+        # 助动词 - 必须后接动词（不能独立结尾）
+        'have', 'has', 'had',  # 注: having 可独立使用
+        'will', 'would', 'shall', 'should',
+        'can', 'could', 'may', 'might', 'must',
+        'do', 'does', 'did',  # 注: doing 可独立使用
+        # 注意: 及物动词（如 want, get, make 等）虽然通常需要宾语，
+        # 但它们可以在句末独立出现（如 "That's what I wanted."），
+        # 因此不应加入此集合
+
+        # ============ 6. 副词（修饰后续内容）============
+        # 程度副词 - 通常修饰形容词或动词
+        'very', 'really', 'quite', 'rather', 'pretty', 'fairly', 'extremely',
+        'absolutely', 'completely', 'totally', 'entirely', 'perfectly',
+        'almost', 'nearly', 'barely', 'hardly', 'scarcely',
+        # 频率/时间副词（某些位置）
+        'just', 'only', 'even', 'still', 'already', 'also', 'always', 'never',
+        'ever', 'often', 'usually', 'sometimes', 'rarely', 'seldom',
+        # 方式/情态副词
+        'maybe', 'perhaps', 'probably', 'possibly', 'certainly', 'definitely',
+        'obviously', 'clearly', 'apparently', 'actually', 'basically', 'essentially',
+        # 否定副词
+        "don't", "doesn't", "didn't", "won't", "wouldn't", "can't", "couldn't",
+        "shouldn't", "mustn't", "isn't", "aren't", "wasn't", "weren't", "haven't",
+        "hasn't", "hadn't",
+
+        # ============ 7. 特殊结构词 ============
+        # There be 结构
+        'there',
+        # It 形式主语结构
+        # 'it' 已在代词中
+        # 比较结构
+        'more', 'less', 'most', 'least', 'better', 'worse', 'best', 'worst',
+        # 不定式标记
+        # 'to' 已在介词中
+    }
+
     def get_sentence_end_chars(self) -> Set[str]:
         return {'.', '?', '!'}
 
@@ -87,6 +194,57 @@ class EnglishStrategy(LanguageStrategy):
     def is_continuation(self, text: str) -> bool:
         first_word = text.strip().split()[0].lower() if text.strip() else ''
         return first_word in self.get_continuation_words()
+
+    def is_incomplete_ending(self, word: str) -> bool:
+        """
+        检查单个词是否为不完整结尾词
+
+        Args:
+            word: 单个词（token），可能包含标点
+
+        Returns:
+            True 表示该词是不完整结尾词，不应在此处切分
+        """
+        # 清理词：去除标点和空格标记
+        clean_word = word.strip().lower().rstrip('.,;:!?').lstrip('▁')
+        return clean_word in self.INCOMPLETE_ENDINGS
+
+    def is_semantically_complete(self, text: str) -> bool:
+        """
+        检查文本是否语义完整，避免在不完整位置切分
+
+        Args:
+            text: 待检查的文本（可能包含 ▁ 作为空格标记，或无空格）
+
+        Returns:
+            True 表示语义完整可以切分，False 表示语义不完整不应切分
+        """
+        import re
+
+        if not text or not text.strip():
+            return True
+
+        # 处理可能的 ▁ 空格标记（SentencePiece tokenizer 格式）
+        normalized_text = text.replace('▁', ' ').strip()
+
+        # 尝试用空格分词
+        words = normalized_text.split()
+
+        # 如果只有一个"词"（可能是无空格拼接的文本），用正则提取最后一个英文单词
+        if len(words) == 1:
+            # 匹配最后一个英文单词（字母序列）
+            match = re.search(r"[a-zA-Z']+$", normalized_text.rstrip('.,;:!?'))
+            if match:
+                last_word = match.group().lower().rstrip("'")
+            else:
+                return True  # 无法提取单词，默认允许切分
+        else:
+            last_word = words[-1].lower().rstrip('.,;:!?')
+
+        # 检查是否为不完整结尾词
+        is_incomplete = last_word in self.INCOMPLETE_ENDINGS
+
+        return not is_incomplete
 
 
 class JapaneseStrategy(LanguageStrategy):
@@ -127,12 +285,13 @@ class SplitConfig:
     clause_punctuation: str = "，；：,;:"        # 分句标点（可选切分点）
 
     # 停顿切分
-    pause_threshold: float = 0.5                 # 停顿阈值（秒）
-    long_pause_threshold: float = 1.0            # 长停顿阈值（强制切分）
+    pause_threshold: float = 0.7                 # 停顿阈值（秒），从0.5提高到0.7
+    long_pause_threshold: float = 1.5            # 长停顿阈值（强制切分），从1.0提高到1.5
 
     # 长度限制
-    max_duration: float = 5.0                    # 最大时长（秒）
-    max_chars: int = 50                          # 最大字符数
+    max_duration: float = 5.0                    # 最大时长（秒），软上限，会检查语义完整性
+    max_duration_hard_ratio: float = 1.5         # 硬上限比例，超过 max_duration * 此比例 无论如何都切分
+    max_chars: int = 0                           # 最大字符数，0表示不启用字符数限制
     min_chars: int = 2                           # 最小字符数（避免过短）
 
     # 特殊处理
@@ -154,11 +313,16 @@ class SplitConfig:
     use_dynamic_pause: bool = True               # 启用动态停顿阈值
     speech_rate_window: int = 10                 # 语速计算窗口(字数)
     pause_multiplier: float = 2.5                # 停顿阈值 = 百分位字间隔 * multiplier (提高至2.5)
-    min_pause_threshold: float = 0.3             # 最小停顿阈值(秒)，避免快语速场景下过度分句
+    min_pause_threshold: float = 0.5             # 最小停顿阈值(秒)，从0.3提高到0.5，避免自然语流中短停顿触发切分
 
     # 智能分句
     prefer_punctuation_break: bool = True        # 优先在标点处断句
     soft_break_threshold: float = 0.8            # 软断点阈值(秒)
+
+    # max_duration 延迟切分到标点符号
+    delay_split_to_punctuation: bool = True      # 达到 max_duration 后延迟切分，等待遇到标点符号
+    delay_split_ignore_clause_punct: bool = True # 忽略从句标点(逗号、顿号等)，只等待句末标点(.?!)
+    delay_split_max_wait: float = 2.0            # 延迟等待的最大额外时长(秒)，超过则强制切分
 
     # 语义分组 (预留给 Layer 2)
     enable_semantic_grouping: bool = True        # 启用语义分组
@@ -195,6 +359,9 @@ class SentenceSplitter:
         if not words:
             return []
 
+        # 调试日志：确认当前语言配置
+        logger.info(f"分句器语言配置: language={self.config.language}, strategy={type(self.config.get_strategy()).__name__}")
+
         sentences = []
         current_words: List[WordTimestamp] = []
         current_start = words[0].start
@@ -226,19 +393,79 @@ class SentenceSplitter:
                 elif pause >= dynamic_threshold:
                     # 动态停顿 + 分句标点
                     if word.word in self.config.clause_punctuation:
-                        should_split = True
-                        split_reason = "dynamic_pause_with_clause"
+                        # 方案C: 直接检查最后一个词是否为不完整结尾词
+                        strategy = self.config.get_strategy()
+                        last_word = current_words[-1].word if current_words else ''
+                        if not strategy.is_incomplete_ending(last_word):
+                            should_split = True
+                            split_reason = "dynamic_pause_with_clause"
+                        else:
+                            # 语义不完整，跳过切分
+                            logger.debug(f"语义不完整(词='{last_word}')，跳过切分")
 
             # 3. 强制长度切分
             current_duration = word.end - current_start
-            current_text = "".join(w.word for w in current_words)
 
-            if current_duration >= self.config.max_duration:
+            # 计算硬上限时长
+            hard_limit_duration = self.config.max_duration * self.config.max_duration_hard_ratio
+            # 计算延迟等待的最大时长
+            delay_max_duration = self.config.max_duration + self.config.delay_split_max_wait
+
+            if current_duration >= hard_limit_duration:
+                # 超过硬上限，无论如何都要切分
                 should_split = True
-                split_reason = "max_duration"
-            elif len(current_text) >= self.config.max_chars:
-                should_split = True
-                split_reason = "max_chars"
+                split_reason = "max_duration_hard_limit"
+            elif current_duration >= self.config.max_duration:
+                # 超过软上限，检查是否应该延迟切分
+                strategy = self.config.get_strategy()
+                last_word = current_words[-1].word if current_words else ''
+                is_incomplete = strategy.is_incomplete_ending(last_word)
+
+                # 检查当前词是否带标点
+                last_word_stripped = last_word.rstrip()
+                has_sentence_end_punct = any(last_word_stripped.endswith(p) for p in '.?!')
+                has_clause_punct = any(last_word_stripped.endswith(p) for p in ',;:')
+
+                logger.info(f"max_duration 检查: duration={current_duration:.2f}s, last_word='{last_word}', "
+                           f"is_incomplete={is_incomplete}, has_end_punct={has_sentence_end_punct}, has_clause_punct={has_clause_punct}")
+
+                # 决定是否延迟切分
+                should_delay = False
+
+                # 检查1: 语义不完整 -> 延迟
+                if is_incomplete:
+                    should_delay = True
+                    logger.info(f"max_duration 语义不完整(词='{last_word}')，延迟切分...")
+
+                # 检查2: 启用了延迟到标点功能，且当前词没有结束标点 -> 延迟
+                elif self.config.delay_split_to_punctuation:
+                    if self.config.delay_split_ignore_clause_punct:
+                        # 只等待句末标点，忽略从句标点
+                        if not has_sentence_end_punct:
+                            # 检查是否超过延迟等待上限
+                            if current_duration < delay_max_duration:
+                                should_delay = True
+                                logger.info(f"max_duration 等待句末标点(当前词='{last_word}')，延迟切分...")
+                            else:
+                                logger.info(f"max_duration 延迟等待超时({current_duration:.2f}s >= {delay_max_duration:.2f}s)，强制切分")
+                    else:
+                        # 等待任意标点（包括逗号等）
+                        if not has_sentence_end_punct and not has_clause_punct:
+                            if current_duration < delay_max_duration:
+                                should_delay = True
+                                logger.info(f"max_duration 等待任意标点(当前词='{last_word}')，延迟切分...")
+                            else:
+                                logger.info(f"max_duration 延迟等待超时({current_duration:.2f}s >= {delay_max_duration:.2f}s)，强制切分")
+
+                if not should_delay:
+                    should_split = True
+                    split_reason = "max_duration"
+            elif self.config.max_chars > 0:
+                # max_chars > 0 时才启用字符数限制
+                current_text = "".join(w.word for w in current_words)
+                if len(current_text) >= self.config.max_chars:
+                    should_split = True
+                    split_reason = "max_chars"
 
             # 4. 最后一个词强制切分
             if i == len(words) - 1:
@@ -250,7 +477,7 @@ class SentenceSplitter:
                 sentence = self._create_sentence(current_words)
                 if sentence:
                     sentences.append(sentence)
-                    logger.debug(f"分句: '{sentence.text}' ({split_reason})")
+                    logger.info(f"分句: '{sentence.text[-50:]}' (原因: {split_reason}, 时长: {current_duration:.2f}s)")
 
                 # 重置
                 current_words = []
