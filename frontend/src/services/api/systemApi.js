@@ -62,12 +62,31 @@ export async function shutdownSystem(options = {}) {
   })
 }
 
+// Phase 5: 硬件信息获取
+/**
+ * 获取硬件信息和优化配置
+ * @returns {Promise<{success: boolean, hardware: Object, optimization: Object}>}
+ */
+export async function getHardwareInfo() {
+  return apiClient.get('/api/hardware/status')
+}
+
+/**
+ * 获取基础硬件信息
+ * @returns {Promise<{success: boolean, hardware: Object}>}
+ */
+export async function getHardwareBasic() {
+  return apiClient.get('/api/hardware/basic')
+}
+
 const systemApi = {
   hasActiveClients,
   registerClient,
   heartbeat,
   unregisterClient,
-  shutdownSystem
+  shutdownSystem,
+  getHardwareInfo,
+  getHardwareBasic
 }
 
 export default systemApi

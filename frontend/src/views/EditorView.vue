@@ -13,6 +13,7 @@
       :can-redo="canRedo"
       :active-tasks="activeTasks"
       :last-saved="lastSaved"
+      :dual-stream-progress="dualStreamProgress"
       @undo="undo"
       @redo="redo"
       @pause="pauseTranscription"
@@ -294,6 +295,9 @@ const activeTasks = computed(() =>
   taskStore.tasks.filter(t => ['processing', 'queued'].includes(t.status)).length
 )
 
+// Phase 5: 双流进度（从 projectStore 获取）
+const dualStreamProgress = computed(() => projectStore.dualStreamProgress)
+
 // Grid 布局样式
 const gridStyle = computed(() => ({
   gridTemplateColumns: `1fr 4px ${sidebarWidth.value}px`
@@ -305,6 +309,9 @@ const gridStyle = computed(() => ({
 async function loadProject() {
   isLoading.value = true
   loadError.value = null
+
+  // 先重置项目状态，确保不同任务数据隔离
+  projectStore.resetProject()
 
   try {
     // 1. 获取任务状态
@@ -562,6 +569,18 @@ function subscribeSSE() {
       handleStreamingSubtitle(data)
     },
 
+    // Phase 5: 草稿字幕事件（快流/SenseVoice）
+    onDraft(data) {
+      console.log('[EditorView] 收到草稿字幕:', data)
+      handleDraftSubtitle(data)
+    },
+
+    // Phase 5: 替换 Chunk 事件（慢流/Whisper）
+    onReplaceChunk(data) {
+      console.log('[EditorView] 收到替换 Chunk:', data)
+      handleReplaceChunk(data)
+    },
+
     // 新增：BGM 检测事件
     onBgmDetected(data) {
       console.log('[EditorView] BGM 检测结果:', data)
@@ -634,6 +653,63 @@ function handleStreamingSubtitle(data) {
   }
 
   console.log(`[EditorView] 字幕 #${sentenceIndex} 已更新，来源: ${source}`)
+}
+
+// Phase 5: 处理草稿字幕（快流/SenseVoice）
+function handleDraftSubtitle(data) {
+  if (!data) return
+
+  // 后端数据格式: { index, chunk_index, sentence: { text, start, end, confidence, words, ... } }
+  const chunkIndex = data.chunk_index
+  const sentenceIndex = data.index
+  const sentence = data.sentence
+
+  if (!sentence) {
+    console.warn('[EditorView] 草稿数据缺少 sentence 字段:', data)
+    return
+  }
+
+  // 构建 sentenceData，匹配 projectStore.appendOrUpdateDraft 的参数格式
+  const sentenceData = {
+    index: sentenceIndex,
+    text: sentence.text || '',
+    start: sentence.start ?? 0,
+    end: sentence.end ?? 0,
+    confidence: sentence.confidence ?? 0.8,
+    words: sentence.words || [],
+    warning_type: sentence.warning_type || 'none'
+  }
+
+  // 调用 projectStore 的草稿处理方法，传递两个参数
+  projectStore.appendOrUpdateDraft(chunkIndex, sentenceData)
+
+  console.log(`[EditorView] 处理草稿字幕，chunk_index: ${chunkIndex}, sentence_index: ${sentenceIndex}`)
+}
+
+// Phase 5: 处理替换 Chunk（慢流/Whisper）
+function handleReplaceChunk(data) {
+  if (!data) return
+
+  // 后端数据格式: { chunk_index, old_indices, new_indices, sentences: [...] }
+  const chunkIndex = data.chunk_index
+  const sentences = Array.isArray(data.sentences) ? data.sentences : []
+
+  // 转换为 projectStore 需要的格式
+  const formattedSentences = sentences.map((sentence, idx) => ({
+    index: data.new_indices?.[idx] ?? idx,
+    text: sentence.text || '',
+    start: sentence.start ?? 0,
+    end: sentence.end ?? 0,
+    confidence: sentence.confidence ?? 1.0,
+    words: sentence.words || [],
+    warning_type: sentence.warning_type || 'none',
+    source: sentence.source || 'whisper'
+  }))
+
+  // 调用 projectStore 的替换方法
+  projectStore.replaceChunk(chunkIndex, formattedSentences)
+
+  console.log(`[EditorView] 替换 Chunk ${chunkIndex}，共 ${formattedSentences.length} 条定稿字幕`)
 }
 
 // 刷新任务进度（用于SSE重连后的状态同步）

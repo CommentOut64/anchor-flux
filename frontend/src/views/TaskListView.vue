@@ -254,7 +254,7 @@
         </el-tab-pane>
       </el-tabs>
 
-      <!-- 转录设置区域 -->
+      <!-- 转录设置区域 - v3.5 预设模式 -->
       <div class="transcription-settings">
         <div class="settings-header" @click="showAdvancedSettings = !showAdvancedSettings">
           <span>转录设置</span>
@@ -262,31 +262,12 @@
         </div>
 
         <div class="settings-content" v-if="showAdvancedSettings">
-          <!-- 引擎选择 -->
-          <div class="setting-row">
-            <label>转录引擎</label>
-            <el-radio-group v-model="transcriptionEngine" size="small">
-              <el-radio-button value="whisper">Whisper</el-radio-button>
-              <el-radio-button value="sensevoice">SenseVoice</el-radio-button>
-            </el-radio-group>
-          </div>
-
-          <!-- SenseVoice 预设选择（仅 SenseVoice 引擎时显示） -->
-          <div v-if="transcriptionEngine === 'sensevoice'" class="sensevoice-presets">
-            <div class="preset-grid">
-              <div
-                v-for="preset in sensevoicePresets"
-                :key="preset.id"
-                class="preset-card"
-                :class="{ active: selectedPresetId === preset.id }"
-                @click="selectedPresetId = preset.id"
-              >
-                <div class="preset-icon">{{ preset.icon }}</div>
-                <div class="preset-name">{{ preset.name }}</div>
-                <div class="preset-desc">{{ preset.desc }}</div>
-              </div>
-            </div>
-          </div>
+          <!-- v3.5 预设选择器组件 -->
+          <PresetSelector
+            v-model="taskConfig"
+            :compact="true"
+            @change="handlePresetChange"
+          />
         </div>
       </div>
 
@@ -354,6 +335,7 @@ import { useUnifiedTaskStore } from "@/stores/unifiedTaskStore";
 import { transcriptionApi, systemApi } from "@/services/api";
 import fileApi from "@/services/api/fileApi"; // 导入文件 API
 import sseChannelManager from "@/services/sseChannelManager"; // 导入 SSE 频道管理器
+import PresetSelector from "@/components/editor/PresetSelector.vue"; // v3.5 预设选择器
 
 const router = useRouter();
 const taskStore = useUnifiedTaskStore();
@@ -380,32 +362,43 @@ const editingTitle = ref(""); // 编辑中的标题
 const originalTitle = ref(""); // 原始标题（用于恢复）
 const titleInputRef = ref(null); // 输入框引用
 
-// 转录设置相关
+// 转录设置相关 - v3.5 预设模式
 const showAdvancedSettings = ref(false); // 是否显示高级设置
-const transcriptionEngine = ref("sensevoice"); // 转录引擎: whisper | sensevoice（默认 SenseVoice）
-const selectedPresetId = ref("default"); // SenseVoice 预设 ID
+// v3.5 任务配置（默认使用 balanced 预设）
+const taskConfig = ref({
+  preset_id: 'balanced',
+  preprocessing: {
+    demucs_strategy: 'auto',
+    demucs_model: 'htdemucs',
+    demucs_shifts: 1,
+    spectrum_threshold: 0.35,
+    vad_filter: true
+  },
+  transcription: {
+    transcription_profile: 'sv_whisper_patch',
+    sensevoice_device: 'auto',
+    whisper_model: 'medium',
+    patching_threshold: 0.60
+  },
+  refinement: {
+    llm_task: 'proofread',
+    llm_scope: 'sparse',
+    sparse_threshold: 0.70,
+    target_language: 'zh',
+    llm_provider: 'openai_compatible',
+    llm_model_name: 'gpt-4o-mini'
+  },
+  compute: {
+    concurrency_strategy: 'auto',
+    gpu_id: 0,
+    output_formats: ['srt'],
+    temp_file_policy: 'delete_on_complete'
+  }
+});
 
-// SenseVoice 预设配置
-const sensevoicePresets = [
-  { id: "default", name: "极速", desc: "仅 SenseVoice", icon: "S" },
-  { id: "preset1", name: "补刀", desc: "SV + Whisper", icon: "W" },
-  { id: "preset2", name: "轻校", desc: "补刀 + 按需校对", icon: "L" },
-  { id: "preset3", name: "精校", desc: "补刀 + 全文精修", icon: "P" },
-  { id: "preset4", name: "全译", desc: "精校 + 全文翻译", icon: "T" },
-  { id: "preset5", name: "重译", desc: "精校 + 重点翻译", icon: "R" },
-];
-
-// 获取 SenseVoice 预设的具体配置
-function getSenseVoicePresetConfig(presetId) {
-  const configs = {
-    default: { enhancement: "off", proofread: "off", translate: "off" },
-    preset1: { enhancement: "smart_patch", proofread: "off", translate: "off" },
-    preset2: { enhancement: "smart_patch", proofread: "sparse", translate: "off" },
-    preset3: { enhancement: "smart_patch", proofread: "full", translate: "off" },
-    preset4: { enhancement: "smart_patch", proofread: "full", translate: "full" },
-    preset5: { enhancement: "smart_patch", proofread: "full", translate: "partial" },
-  };
-  return configs[presetId] || configs.default;
+// 处理预设变更事件
+function handlePresetChange(newConfig) {
+  taskConfig.value = { ...newConfig };
 }
 
 // 计算属性 - 使用 computed 包装确保响应式
@@ -470,11 +463,38 @@ async function handleBatchCreate() {
     const filenames = selectedFiles.value.map((file) => file.name);
     const result = await fileApi.createJobsBatch(filenames);
 
-    // 处理成功的任务
+    // 处理成功的任务 - 为每个任务启动转录
     if (result.succeeded > 0) {
+      // v3.5: 构建转录设置，使用 task_config 格式
+      const transcriptionSettings = {
+        task_config: {
+          preset_id: taskConfig.value.preset_id,
+          preprocessing: { ...taskConfig.value.preprocessing },
+          transcription: { ...taskConfig.value.transcription },
+          refinement: { ...taskConfig.value.refinement },
+          compute: { ...taskConfig.value.compute }
+        },
+        // 保留旧版字段用于兼容
+        engine: 'sensevoice',
+        model: taskConfig.value.transcription.whisper_model || 'medium',
+        compute_type: 'float16',
+        device: 'cuda',
+        batch_size: 16,
+        word_timestamps: false
+      };
+
+      // 为每个成功创建的任务启动转录
+      for (const job of result.jobs) {
+        try {
+          await transcriptionApi.startJob(job.job_id, transcriptionSettings);
+        } catch (startError) {
+          console.warn(`启动任务 ${job.job_id} 失败:`, startError);
+        }
+      }
+
       // 同步任务列表
       await taskStore.syncTasksFromBackend();
-      ElMessage.success(`成功创建 ${result.succeeded} 个任务`);
+      ElMessage.success(`成功创建并启动 ${result.succeeded} 个任务`);
     }
 
     // 处理失败的任务
@@ -578,24 +598,23 @@ async function handleUpload() {
   const failCount = ref(0);
 
   try {
-    // 构建转录设置
-    const defaultSettings = {
-      engine: transcriptionEngine.value,
-      model: "medium",
-      compute_type: "float16",
-      device: "cuda",
+    // v3.5: 构建转录设置，使用 task_config 格式
+    const transcriptionSettings = {
+      task_config: {
+        preset_id: taskConfig.value.preset_id,
+        preprocessing: { ...taskConfig.value.preprocessing },
+        transcription: { ...taskConfig.value.transcription },
+        refinement: { ...taskConfig.value.refinement },
+        compute: { ...taskConfig.value.compute }
+      },
+      // 保留旧版字段用于兼容
+      engine: 'sensevoice',
+      model: taskConfig.value.transcription.whisper_model || 'medium',
+      compute_type: 'float16',
+      device: 'cuda',
       batch_size: 16,
-      word_timestamps: false,
+      word_timestamps: false
     };
-
-    // 如果选择 SenseVoice 引擎，添加预设配置
-    if (transcriptionEngine.value === "sensevoice") {
-      const presetConfig = getSenseVoicePresetConfig(selectedPresetId.value);
-      defaultSettings.sensevoice = {
-        preset_id: selectedPresetId.value,
-        ...presetConfig,
-      };
-    }
 
     // 逐个上传文件
     for (const file of uploadFiles.value) {
@@ -615,11 +634,11 @@ async function handleUpload() {
           phase: "uploading",
           progress: 0,
           message: `已加入队列 (位置: ${queue_position})`,
-          settings: {},
+          settings: transcriptionSettings,
         });
 
         // 启动转录任务
-        await transcriptionApi.startJob(job_id, defaultSettings);
+        await transcriptionApi.startJob(job_id, transcriptionSettings);
 
         // 更新任务状态
         taskStore.updateTask(job_id, {
@@ -1656,71 +1675,4 @@ async function handleExit() {
   }
 }
 
-// SenseVoice 预设网格
-.sensevoice-presets {
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border-default);
-}
-
-.preset-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
-}
-
-.preset-card {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 10px 8px;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  transition: all var(--transition-fast);
-
-  &:hover {
-    background: var(--bg-tertiary);
-    border-color: var(--border-hover);
-  }
-
-  &.active {
-    border-color: var(--primary);
-    background: rgba(88, 166, 255, 0.1);
-  }
-
-  .preset-icon {
-    width: 28px;
-    height: 28px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: var(--bg-tertiary);
-    border-radius: var(--radius-sm);
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin-bottom: 6px;
-  }
-
-  &.active .preset-icon {
-    background: var(--primary);
-    color: white;
-  }
-
-  .preset-name {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-normal);
-    margin-bottom: 2px;
-  }
-
-  .preset-desc {
-    font-size: 10px;
-    color: var(--text-muted);
-    text-align: center;
-    line-height: 1.3;
-  }
-}
 </style>

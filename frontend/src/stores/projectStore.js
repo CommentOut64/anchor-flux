@@ -38,6 +38,19 @@ export const useProjectStore = defineStore("project", () => {
   // ========== 2. 字幕数据（Single Source of Truth） ==========
   const subtitles = ref([]);
 
+  // ========== 2.1 双模态架构: Chunk 索引映射 ==========
+  // chunk_id -> [subtitle_id_1, subtitle_id_2, ...]
+  const chunkSubtitleMap = ref(new Map());
+
+  // 双流进度状态
+  const dualStreamProgress = ref({
+    fastStream: 0,     // 快流(SenseVoice)进度 0-100
+    slowStream: 0,     // 慢流(Whisper)进度 0-100
+    totalChunks: 0,    // 总 Chunk 数
+    draftChunks: 0,    // 草稿 Chunk 数
+    finalizedChunks: 0 // 定稿 Chunk 数
+  });
+
   // ========== 3. Undo/Redo 历史记录 ==========
   const {
     history,
@@ -143,6 +156,30 @@ export const useProjectStore = defineStore("project", () => {
       }
     });
 
+    // 检测低置信度词
+    const LOW_CONFIDENCE_THRESHOLD = 0.5;
+    const CRITICAL_CONFIDENCE_THRESHOLD = 0.3;
+    subtitles.value.forEach((sub, i) => {
+      if (!sub.words || sub.words.length === 0) return;
+
+      const lowConfWords = sub.words.filter(w =>
+        w.confidence !== undefined && w.confidence < LOW_CONFIDENCE_THRESHOLD
+      );
+
+      if (lowConfWords.length > 0) {
+        const criticalCount = lowConfWords.filter(w => w.confidence < CRITICAL_CONFIDENCE_THRESHOLD).length;
+        const wordList = lowConfWords.map(w => w.word).join(', ');
+
+        errors.push({
+          type: "low_confidence",
+          index: i,
+          message: `字幕 #${i + 1} 有 ${lowConfWords.length} 个低置信度词: ${wordList}`,
+          severity: criticalCount > 0 ? "error" : "warning",
+          words: lowConfWords
+        });
+      }
+    });
+
     return errors;
   });
 
@@ -213,6 +250,13 @@ export const useProjectStore = defineStore("project", () => {
       end: item.end,
       text: item.text,
       isDirty: false,
+      // Phase 5: 双模态架构新增字段
+      chunk_id: null,          // 物理切片ID
+      isDraft: false,          // 已导入的SRT都是定稿
+      words: [],               // 字级置信度数据
+      confidence: 1.0,         // 句子置信度
+      warning_type: 'none',    // 警告类型: none/low_confidence/high_perplexity/both
+      source: 'imported'       // 来源: sensevoice/whisper/imported
     }));
 
     meta.value = {
@@ -224,6 +268,8 @@ export const useProjectStore = defineStore("project", () => {
 
     // 清除历史记录，避免撤销到空状态
     clearHistory();
+    // 清除 Chunk 映射
+    chunkSubtitleMap.value.clear();
   }
 
   /**
@@ -280,6 +326,13 @@ export const useProjectStore = defineStore("project", () => {
       end: payload.end || 0,
       text: payload.text || "",
       isDirty: true,
+      // Phase 5: 双模态架构新增字段
+      chunk_id: payload.chunk_id || null,
+      isDraft: payload.isDraft ?? false,
+      words: payload.words || [],
+      confidence: payload.confidence ?? 1.0,
+      warning_type: payload.warning_type || 'none',
+      source: payload.source || 'manual'
     };
     subtitles.value.splice(insertIndex, 0, newSubtitle);
     meta.value.isDirty = true;
@@ -295,6 +348,194 @@ export const useProjectStore = defineStore("project", () => {
       meta.value.isDirty = true;
     }
   }
+
+  // ========== Phase 5: 双模态架构专用方法 ==========
+
+  /**
+   * 添加或更新草稿字幕（快流推送）
+   *
+   * 当收到 subtitle.draft 事件时调用
+   * 按时间顺序插入，保持字幕列表有序
+   *
+   * @param {string} chunk_id - Chunk ID
+   * @param {object} sentenceData - 句子数据
+   */
+  function appendOrUpdateDraft(chunk_id, sentenceData) {
+    const {
+      index: sentenceIndex,
+      text,
+      start,
+      end,
+      confidence = 0.8,
+      words = [],
+      warning_type = 'none'
+    } = sentenceData;
+
+    // 生成唯一ID
+    const subtitleId = `draft-${chunk_id}-${sentenceIndex}`;
+
+    // 查找是否已存在
+    const existingIndex = subtitles.value.findIndex(s => s.id === subtitleId);
+
+    const subtitleData = {
+      id: subtitleId,
+      start,
+      end,
+      text,
+      isDirty: false,
+      chunk_id,
+      isDraft: true,       // 标记为草稿
+      words,
+      confidence,
+      warning_type,
+      source: 'sensevoice',
+      sentenceIndex       // 保留原始句子索引
+    };
+
+    if (existingIndex >= 0) {
+      // 更新现有草稿
+      subtitles.value[existingIndex] = subtitleData;
+      console.log(`[ProjectStore] 更新草稿字幕: ${subtitleId}`);
+    } else {
+      // 按时间顺序插入
+      const insertIndex = findInsertIndex(start);
+      subtitles.value.splice(insertIndex, 0, subtitleData);
+
+      // 更新 Chunk 映射
+      if (!chunkSubtitleMap.value.has(chunk_id)) {
+        chunkSubtitleMap.value.set(chunk_id, []);
+      }
+      chunkSubtitleMap.value.get(chunk_id).push(subtitleId);
+
+      console.log(`[ProjectStore] 添加草稿字幕: ${subtitleId}, 位置: ${insertIndex}`);
+    }
+
+    // 更新双流进度
+    updateDualStreamProgress();
+  }
+
+  /**
+   * 替换 Chunk 的所有字幕（慢流推送）
+   *
+   * 当收到 subtitle.replace_chunk 事件时调用
+   * 删除旧的草稿字幕，添加新的定稿字幕
+   *
+   * @param {string} chunk_id - Chunk ID
+   * @param {Array} sentences - 定稿句子列表
+   */
+  function replaceChunk(chunk_id, sentences) {
+    // 1. 删除该 Chunk 的所有旧字幕
+    const oldSubtitleIds = chunkSubtitleMap.value.get(chunk_id) || [];
+    subtitles.value = subtitles.value.filter(s => !oldSubtitleIds.includes(s.id));
+
+    console.log(`[ProjectStore] 删除 Chunk ${chunk_id} 的 ${oldSubtitleIds.length} 个旧字幕`);
+
+    // 2. 添加新的定稿字幕
+    const newSubtitleIds = [];
+    sentences.forEach((sentence, idx) => {
+      const subtitleId = `final-${chunk_id}-${idx}`;
+      const subtitleData = {
+        id: subtitleId,
+        start: sentence.start,
+        end: sentence.end,
+        text: sentence.text,
+        isDirty: false,
+        chunk_id,
+        isDraft: false,      // 定稿
+        words: sentence.words || [],
+        confidence: sentence.confidence ?? 1.0,
+        warning_type: sentence.warning_type || 'none',
+        source: 'whisper'
+      };
+
+      // 按时间顺序插入
+      const insertIndex = findInsertIndex(sentence.start);
+      subtitles.value.splice(insertIndex, 0, subtitleData);
+      newSubtitleIds.push(subtitleId);
+    });
+
+    // 3. 更新 Chunk 映射
+    chunkSubtitleMap.value.set(chunk_id, newSubtitleIds);
+
+    console.log(`[ProjectStore] 替换 Chunk ${chunk_id}: 添加 ${sentences.length} 个定稿字幕`);
+
+    // 更新双流进度
+    updateDualStreamProgress();
+  }
+
+  /**
+   * 查找按时间顺序的插入位置
+   */
+  function findInsertIndex(startTime) {
+    let left = 0;
+    let right = subtitles.value.length;
+
+    while (left < right) {
+      const mid = Math.floor((left + right) / 2);
+      if (subtitles.value[mid].start < startTime) {
+        left = mid + 1;
+      } else {
+        right = mid;
+      }
+    }
+    return left;
+  }
+
+  /**
+   * 更新双流进度统计
+   */
+  function updateDualStreamProgress() {
+    const chunks = new Set();
+    let draftCount = 0;
+    let finalCount = 0;
+
+    subtitles.value.forEach(s => {
+      if (s.chunk_id) {
+        chunks.add(s.chunk_id);
+        if (s.isDraft) {
+          draftCount++;
+        } else {
+          finalCount++;
+        }
+      }
+    });
+
+    // 统计 Chunk 级别的草稿/定稿
+    let draftChunks = 0;
+    let finalizedChunks = 0;
+
+    chunkSubtitleMap.value.forEach((ids, chunk_id) => {
+      const chunkSubtitles = subtitles.value.filter(s => s.chunk_id === chunk_id);
+      const hasDraft = chunkSubtitles.some(s => s.isDraft);
+      if (hasDraft) {
+        draftChunks++;
+      } else if (chunkSubtitles.length > 0) {
+        finalizedChunks++;
+      }
+    });
+
+    dualStreamProgress.value = {
+      fastStream: chunks.size > 0 ? Math.round((draftCount + finalCount) / chunks.size * 10) : 0,
+      slowStream: chunks.size > 0 ? Math.round(finalizedChunks / chunks.size * 100) : 0,
+      totalChunks: chunks.size,
+      draftChunks,
+      finalizedChunks
+    };
+  }
+
+  /**
+   * 获取草稿字幕数量
+   */
+  const draftSubtitleCount = computed(() =>
+    subtitles.value.filter(s => s.isDraft).length
+  );
+
+  /**
+   * 获取定稿字幕数量
+   */
+  const finalizedSubtitleCount = computed(() =>
+    subtitles.value.filter(s => !s.isDraft && s.chunk_id).length
+  );
 
   /**
    * 导出SRT字符串
@@ -374,6 +615,15 @@ export const useProjectStore = defineStore("project", () => {
       isSeeking: false,
     };
     clearHistory();
+    // Phase 5: 清除双模态架构状态
+    chunkSubtitleMap.value.clear();
+    dualStreamProgress.value = {
+      fastStream: 0,
+      slowStream: 0,
+      totalChunks: 0,
+      draftChunks: 0,
+      finalizedChunks: 0
+    };
     console.log("[ProjectStore] 项目已重置");
   }
 
@@ -433,11 +683,19 @@ export const useProjectStore = defineStore("project", () => {
     player,
     view,
 
+    // Phase 5: 双模态架构状态
+    chunkSubtitleMap,
+    dualStreamProgress,
+
     // 计算属性
     totalSubtitles,
     currentSubtitle,
     isDirty,
     validationErrors,
+
+    // Phase 5: 双模态架构计算属性
+    draftSubtitleCount,
+    finalizedSubtitleCount,
 
     // 历史记录
     canUndo,
@@ -456,6 +714,11 @@ export const useProjectStore = defineStore("project", () => {
     seekTo,
     saveProject,
     resetProject,
+
+    // Phase 5: 双模态架构方法
+    appendOrUpdateDraft,
+    replaceChunk,
+    updateDualStreamProgress,
 
     // 辅助方法
     formatTimestamp,

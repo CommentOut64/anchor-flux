@@ -87,7 +87,10 @@ class SSEChannelManager extends EventEmitter {
    *     onSignal: (signal, data) => void,
    *     onComplete: (data) => void,
    *     onFailed: (data) => void,
-   *     onProxyProgress: (progress) => void
+   *     onProxyProgress: (progress) => void,
+   *     // Phase 5: 双模态架构新增
+   *     onDraft: (data) => void,           // 草稿字幕（快流/SenseVoice）
+   *     onReplaceChunk: (data) => void     // 替换 Chunk（慢流/Whisper）
    *   }
    * @returns {Function} 取消订阅函数
    */
@@ -193,6 +196,22 @@ class SSEChannelManager extends EventEmitter {
       // === 字幕流式事件（新格式带命名空间前缀） ===
       'subtitle.segment': handleSegment,
       'subtitle.aligned': handleAligned,
+
+      // Phase 5: 双模态架构 - 草稿事件（快流/SenseVoice）
+      'subtitle.draft': (data) => {
+        console.log(`[SSE Job ${jobId}] 草稿字幕:`, data)
+        handlers.onDraft?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+
+      // Phase 5: 双模态架构 - 替换 Chunk 事件（慢流/Whisper）
+      'subtitle.replace_chunk': (data) => {
+        console.log(`[SSE Job ${jobId}] 替换 Chunk:`, data)
+        handlers.onReplaceChunk?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+
+      // 旧版事件 (兼容)
       'subtitle.sv_sentence': (data) => {
         console.log(`[SSE Job ${jobId}] SenseVoice 句子:`, data)
         handlers.onSvSentence?.(data)

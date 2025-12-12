@@ -65,7 +65,8 @@ class StreamingSubtitleManager:
             "start": sentence.start,
             "end": sentence.end,
             "confidence": sentence.confidence,
-            "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source)
+            "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
+            "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
         }
 
         push_subtitle_event(
@@ -277,7 +278,8 @@ class StreamingSubtitleManager:
                 "end": sentence.end,
                 "confidence": sentence.confidence,
                 "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
-                "is_draft": True
+                "is_draft": True,
+                "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
             }
 
             push_subtitle_event(
@@ -352,7 +354,8 @@ class StreamingSubtitleManager:
                 "confidence": sentence.confidence,
                 "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
                 "is_draft": False,
-                "is_finalized": True
+                "is_finalized": True,
+                "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
             }
             for i, sentence in enumerate(sentences)
         ]

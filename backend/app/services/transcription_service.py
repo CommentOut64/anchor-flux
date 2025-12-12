@@ -4351,9 +4351,9 @@ class TranscriptionService:
 
             # 5. 处理决策
             if decision.action == FuseAction.ACCEPT:
-                # 接受结果，推送 SSE，返回
-                for sent in sentences:
-                    subtitle_manager.add_sentence(sent)
+                # 接受结果，推送草稿事件（Phase 5: 双模态架构）
+                # 使用 add_draft_sentences 批量推送，触发 subtitle.draft 事件
+                subtitle_manager.add_draft_sentences(chunk_state.chunk_index, sentences)
                 return sentences
 
             elif decision.action == FuseAction.UPGRADE_SEPARATION:
@@ -4374,8 +4374,7 @@ class TranscriptionService:
 
             else:
                 # 未知动作，接受当前结果
-                for sent in sentences:
-                    subtitle_manager.add_sentence(sent)
+                subtitle_manager.add_draft_sentences(chunk_state.chunk_index, sentences)
                 return sentences
 
     async def _whisper_text_patch_with_arbitration(

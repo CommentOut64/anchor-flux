@@ -52,8 +52,41 @@ class TranscriptionAPI {
 
   /**
    * 启动转录任务（加入队列）
+   *
+   * v3.5 支持两种配置格式:
+   * 1. 新版 (推荐): 使用 task_config 字段
+   * 2. 旧版 (兼容): 使用 engine/model/sensevoice 字段
+   *
    * @param {string} jobId - 任务ID
    * @param {Object} settings - 转录设置
+   *
+   * === v3.5 新版配置 (推荐) ===
+   * @param {Object} [settings.task_config] - v3.5 任务配置
+   * @param {string} [settings.task_config.preset_id] - 预设ID (fast/balanced/quality/custom)
+   * @param {Object} [settings.task_config.preprocessing] - 预处理设置
+   * @param {string} [settings.task_config.preprocessing.demucs_strategy] - 人声分离策略 (off/auto/force_on)
+   * @param {string} [settings.task_config.preprocessing.demucs_model] - Demucs 模型
+   * @param {number} [settings.task_config.preprocessing.demucs_shifts] - 分离预测次数 (1-5)
+   * @param {number} [settings.task_config.preprocessing.spectrum_threshold] - 分诊灵敏度 (0.0-1.0)
+   * @param {boolean} [settings.task_config.preprocessing.vad_filter] - VAD 静音过滤
+   * @param {Object} [settings.task_config.transcription] - 转录设置
+   * @param {string} [settings.task_config.transcription.transcription_profile] - 转录流水线 (sensevoice_only/sv_whisper_patch/sv_whisper_dual)
+   * @param {string} [settings.task_config.transcription.sensevoice_device] - SenseVoice 设备 (auto/cpu)
+   * @param {string} [settings.task_config.transcription.whisper_model] - Whisper 模型 (tiny/small/medium/large-v3)
+   * @param {number} [settings.task_config.transcription.patching_threshold] - 补刀触发阈值 (0.0-1.0)
+   * @param {Object} [settings.task_config.refinement] - 增强设置
+   * @param {string} [settings.task_config.refinement.llm_task] - LLM 任务 (off/proofread/translate)
+   * @param {string} [settings.task_config.refinement.llm_scope] - LLM 范围 (sparse/global)
+   * @param {number} [settings.task_config.refinement.sparse_threshold] - 稀疏校对阈值 (0.0-1.0)
+   * @param {string} [settings.task_config.refinement.target_language] - 目标语言
+   * @param {string} [settings.task_config.refinement.llm_provider] - LLM 提供商
+   * @param {string} [settings.task_config.refinement.llm_model_name] - LLM 模型名称
+   * @param {Object} [settings.task_config.compute] - 计算设置
+   * @param {string} [settings.task_config.compute.concurrency_strategy] - 并发策略 (auto/parallel/serial)
+   * @param {number} [settings.task_config.compute.gpu_id] - GPU ID
+   * @param {string} [settings.task_config.compute.temp_file_policy] - 临时文件策略
+   *
+   * === 旧版配置 (兼容) ===
    * @param {string} settings.engine - 转录引擎 (whisper, sensevoice)
    * @param {string} settings.model - 模型名称 (tiny, base, small, medium, large-v2, large-v3)
    * @param {string} settings.compute_type - 计算类型 (float16, int8, etc.)
@@ -61,11 +94,7 @@ class TranscriptionAPI {
    * @param {number} settings.batch_size - 批次大小
    * @param {boolean} settings.word_timestamps - 是否生成词级时间戳
    * @param {Object} settings.sensevoice - SenseVoice 配置（可选）
-   * @param {string} settings.sensevoice.preset_id - 预设ID (default, preset1-5)
-   * @param {string} settings.sensevoice.enhancement - 增强模式 (off, smart_patch, deep_listen)
-   * @param {string} settings.sensevoice.proofread - 校对模式 (off, sparse, full)
-   * @param {string} settings.sensevoice.translate - 翻译模式 (off, full, partial)
-   * @param {string} settings.sensevoice.target_language - 翻译目标语言
+   *
    * @returns {Promise<{job_id: string, started: boolean, queue_position: number}>}
    */
   async startJob(jobId, settings) {

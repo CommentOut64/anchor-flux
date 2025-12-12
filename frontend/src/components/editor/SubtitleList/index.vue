@@ -4,6 +4,8 @@
     <div class="list-toolbar">
       <div class="toolbar-left">
         <span class="subtitle-count">{{ totalSubtitles }} 条字幕</span>
+        <!-- Phase 5: 草稿/定稿计数 -->
+        <span v-if="draftCount > 0" class="draft-count">({{ draftCount }} 草稿)</span>
       </div>
 
       <div class="toolbar-center">
@@ -34,7 +36,7 @@
       </div>
     </div>
 
-    <!-- 字幕列表 -->
+    <!-- 字幕列表 (Phase 5: 使用 SubtitleItem 组件) -->
     <div class="list-container" ref="listRef">
       <div v-if="filteredSubtitles.length === 0" class="empty-state">
         <svg viewBox="0 0 24 24" fill="currentColor">
@@ -44,109 +46,23 @@
         <button class="add-first-btn" @click="addNewSubtitle">添加第一条字幕</button>
       </div>
 
-      <div
+      <!-- Phase 5: 使用 SubtitleItem 组件替代内联渲染 -->
+      <SubtitleItem
         v-for="(subtitle, index) in filteredSubtitles"
         :key="subtitle.id"
-        class="subtitle-item"
-        :class="{
-          'is-active': activeSubtitleId === subtitle.id,
-          'is-current': currentSubtitleId === subtitle.id,
-          'has-error': hasError(index),
-          'warning-low-confidence': subtitle.warning_type === 'low_transcription',
-          'warning-high-perplexity': subtitle.warning_type === 'high_perplexity',
-          'warning-both': subtitle.warning_type === 'both'
-        }"
-        @click="onSubtitleClick(subtitle)"
-      >
-        <!-- 序号 -->
-        <div class="item-index">{{ index + 1 }}</div>
-
-        <!-- 主内容 -->
-        <div class="item-content">
-          <!-- 时间行 -->
-          <div class="time-row">
-            <input
-              type="text"
-              class="time-input"
-              :value="formatTime(subtitle.start)"
-              @change="e => updateTime(subtitle.id, 'start', parseTime(e.target.value))"
-              @focus="e => e.target.select()"
-            />
-            <span class="time-arrow">
-              <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M16.01 11H4v2h12.01v3L20 12l-3.99-4z"/>
-              </svg>
-            </span>
-            <input
-              type="text"
-              class="time-input"
-              :value="formatTime(subtitle.end)"
-              @change="e => updateTime(subtitle.id, 'end', parseTime(e.target.value))"
-              @focus="e => e.target.select()"
-            />
-            <span class="duration-tag">{{ formatDuration(subtitle.end - subtitle.start) }}</span>
-          </div>
-
-          <!-- 文本行（Toggle Mode：只读高亮视图 ⇄ 编辑模式） -->
-          <div class="text-row">
-            <!-- 只读高亮视图 -->
-            <div
-              v-if="editingSubtitleId !== subtitle.id"
-              class="text-display"
-              :class="{ 'can-edit': props.editable }"
-              @click="startEditing(subtitle.id)"
-              v-html="renderTextWithHighlight(subtitle)"
-            ></div>
-
-            <!-- 编辑模式 -->
-            <textarea
-              v-else
-              ref="editTextarea"
-              class="text-input"
-              :value="subtitle.text"
-              @input="e => updateText(subtitle.id, e.target.value)"
-              @blur="stopEditing"
-              placeholder="输入字幕文本..."
-              rows="2"
-            ></textarea>
-
-            <span class="char-count" :class="{ warning: subtitle.text.length > 30 }">
-              {{ subtitle.text.length }}
-            </span>
-          </div>
-
-          <!-- 错误提示 -->
-          <div v-if="getItemErrors(index).length > 0" class="error-tags">
-            <span
-              v-for="error in getItemErrors(index)"
-              :key="error.type"
-              class="error-tag"
-              :class="error.severity"
-            >
-              {{ error.message }}
-            </span>
-          </div>
-        </div>
-
-        <!-- 操作按钮 -->
-        <div class="item-actions">
-          <button class="action-btn" @click.stop="insertBefore(index)" title="在前面插入">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M7 14l5-5 5 5z"/>
-            </svg>
-          </button>
-          <button class="action-btn" @click.stop="insertAfter(index)" title="在后面插入">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M7 10l5 5 5-5z"/>
-            </svg>
-          </button>
-          <button class="action-btn action-btn--danger" @click.stop="deleteSubtitle(subtitle.id)" title="删除">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
-            </svg>
-          </button>
-        </div>
-      </div>
+        :subtitle="subtitle"
+        :index="index"
+        :is-active="activeSubtitleId === subtitle.id"
+        :is-current="currentSubtitleId === subtitle.id"
+        :editable="props.editable"
+        :errors="getItemErrors(index)"
+        @click="onSubtitleClick"
+        @update-time="updateTime"
+        @update-text="updateText"
+        @delete="deleteSubtitle"
+        @insert-before="insertBefore(index)"
+        @insert-after="insertAfter(index)"
+      />
     </div>
   </div>
 </template>
@@ -154,6 +70,8 @@
 <script setup>
 import { ref, computed, watch, nextTick } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+// Phase 5: 导入 SubtitleItem 组件
+import SubtitleItem from './SubtitleItem.vue'
 
 // Props
 const props = defineProps({
@@ -168,12 +86,9 @@ const projectStore = useProjectStore()
 
 // Refs
 const listRef = ref(null)
-const editTextarea = ref(null)
 
 // State
 const searchText = ref('')
-const editingSubtitleId = ref(null)
-const originalTexts = ref(new Map())  // 记录原始文本，用于检测修改
 
 // Computed
 const subtitles = computed(() => projectStore.subtitles)
@@ -181,6 +96,8 @@ const totalSubtitles = computed(() => projectStore.totalSubtitles)
 const validationErrors = computed(() => projectStore.validationErrors)
 const currentSubtitleId = computed(() => projectStore.currentSubtitle?.id)
 const activeSubtitleId = computed(() => projectStore.view.selectedSubtitleId)
+// Phase 5: 草稿计数
+const draftCount = computed(() => projectStore.draftSubtitleCount)
 
 const filteredSubtitles = computed(() => {
   if (!searchText.value) return subtitles.value
@@ -189,10 +106,6 @@ const filteredSubtitles = computed(() => {
 })
 
 // Methods
-function hasError(index) {
-  return validationErrors.value.some(e => e.index === index)
-}
-
 function getItemErrors(index) {
   return validationErrors.value.filter(e => e.index === index)
 }
@@ -212,65 +125,6 @@ function updateTime(id, field, value) {
 function updateText(id, text) {
   projectStore.updateSubtitle(id, { text })
   emit('subtitle-edit', id, 'text', text)
-
-  // 标记文本已修改（清除高亮数据关联）
-  if (!originalTexts.value.has(id)) {
-    const subtitle = subtitles.value.find(s => s.id === id)
-    if (subtitle) {
-      originalTexts.value.set(id, subtitle.text)
-    }
-  }
-}
-
-function startEditing(id) {
-  if (!props.editable) return
-  editingSubtitleId.value = id
-  nextTick(() => {
-    if (editTextarea.value) {
-      editTextarea.value.focus()
-    }
-  })
-}
-
-function stopEditing() {
-  editingSubtitleId.value = null
-}
-
-function renderTextWithHighlight(subtitle) {
-  // 如果文本被修改过，不显示高亮
-  if (originalTexts.value.has(subtitle.id)) {
-    return escapeHtml(subtitle.text)
-  }
-
-  // 如果没有字级数据，直接返回文本
-  if (!subtitle.words || subtitle.words.length === 0) {
-    return escapeHtml(subtitle.text)
-  }
-
-  const WARN_THRESHOLD = 0.5
-  const CRITICAL_THRESHOLD = 0.3
-
-  let html = ''
-  for (const word of subtitle.words) {
-    const conf = word.confidence !== undefined ? word.confidence : 1.0
-    const text = escapeHtml(word.word)
-
-    if (conf < CRITICAL_THRESHOLD) {
-      html += `<span class="word-critical">${text}</span>`
-    } else if (conf < WARN_THRESHOLD) {
-      html += `<span class="word-warning">${text}</span>`
-    } else {
-      html += text
-    }
-  }
-  return html
-}
-
-function escapeHtml(text) {
-  if (!text) return ''
-  const div = document.createElement('div')
-  div.textContent = text
-  return div.innerHTML
 }
 
 function deleteSubtitle(id) {
@@ -331,29 +185,6 @@ watch(currentSubtitleId, (id) => {
     nextTick(() => scrollToItem(index))
   }
 })
-
-// 时间格式化
-function formatTime(seconds) {
-  if (isNaN(seconds)) return '00:00.000'
-  const m = Math.floor(seconds / 60)
-  const s = Math.floor(seconds % 60)
-  const ms = Math.round((seconds % 1) * 1000)
-  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`
-}
-
-function parseTime(str) {
-  const match = str.match(/(\d+):(\d+)\.?(\d*)/)
-  if (!match) return NaN
-  const m = parseInt(match[1])
-  const s = parseInt(match[2])
-  const ms = match[3] ? parseInt(match[3].padEnd(3, '0')) : 0
-  return m * 60 + s + ms / 1000
-}
-
-function formatDuration(seconds) {
-  if (isNaN(seconds) || seconds < 0) return '0.0s'
-  return seconds.toFixed(1) + 's'
-}
 </script>
 
 <style lang="scss" scoped>
@@ -379,6 +210,12 @@ function formatDuration(seconds) {
       font-size: 12px;
       color: var(--text-secondary);
       white-space: nowrap;
+    }
+    // Phase 5: 草稿计数样式
+    .draft-count {
+      font-size: 12px;
+      color: var(--warning);
+      margin-left: 4px;
     }
   }
 

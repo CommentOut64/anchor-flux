@@ -789,6 +789,8 @@ class SenseVoiceONNXService:
             if is_new_word:
                 # 归档上一个词
                 if current_word is not None:
+                    # 清理 SentencePiece 符号 ▁ 和前导空格
+                    current_word["word"] = current_word["word"].lstrip("▁ ")
                     merged_words.append(current_word)
 
                 # 开始新词
@@ -812,8 +814,9 @@ class SenseVoiceONNXService:
                 if token.get("is_pseudo"):
                     current_word["is_pseudo"] = True
 
-        # 归档最后一个词
+        # 归档最后一个词（同样清理前缀）
         if current_word is not None:
+            current_word["word"] = current_word["word"].lstrip("▁ ")
             merged_words.append(current_word)
 
         return merged_words

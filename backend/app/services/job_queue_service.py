@@ -315,11 +315,23 @@ class JobQueueService:
                 logger.info(f" 开始执行任务: {self.running_job_id}")
 
                 try:
-                    # 根据引擎选择流水线
+                    # 根据引擎和预设选择流水线
                     engine = getattr(job.settings, 'engine', 'sensevoice')
-                    if engine == 'sensevoice':
-                        # SenseVoice 流水线（异步，使用频谱分诊）
-                        logger.info(f"使用 SenseVoice 流水线")
+                    preset_id = getattr(job.settings.sensevoice, 'preset_id', 'default') if hasattr(job.settings, 'sensevoice') else 'default'
+
+                    # Phase 5: 对于非 default 预设，使用双流对齐流水线
+                    # default: SenseVoice Only (旧流水线)
+                    # preset1+: SenseVoice + Whisper 双流对齐 (新流水线)
+                    use_dual_alignment = preset_id != 'default' and engine == 'sensevoice'
+
+                    if use_dual_alignment:
+                        # 双流对齐流水线 (V3.0+ 新架构)
+                        logger.info(f"使用双流对齐流水线 (preset={preset_id})")
+                        import asyncio
+                        asyncio.run(self._run_dual_alignment_pipeline(job, preset_id))
+                    elif engine == 'sensevoice':
+                        # SenseVoice 流水线（旧架构，仅 default 预设）
+                        logger.info(f"使用 SenseVoice 流水线 (极速模式)")
                         import asyncio
                         asyncio.run(self.transcription_service._process_video_sensevoice(job))
                     else:
@@ -386,7 +398,118 @@ class JobQueueService:
                 logger.error(f"Worker循环异常: {e}", exc_info=True)
                 time.sleep(1)
 
-        logger.info("🛑 Worker循环已停止")
+        logger.info("Worker循环已停止")
+
+    async def _run_dual_alignment_pipeline(self, job: 'JobState', preset_id: str):
+        """
+        运行双流对齐流水线 (V3.0+ 新架构)
+
+        Args:
+            job: 任务状态对象
+            preset_id: 预设 ID
+        """
+        from app.pipelines import (
+            AudioProcessingPipeline,
+            AudioProcessingConfig,
+            DualAlignmentPipeline,
+            DualAlignmentConfig,
+            get_audio_processing_pipeline,
+            get_dual_alignment_pipeline
+        )
+        from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
+        from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
+        from app.services.sse_service import get_sse_manager
+        from pathlib import Path
+
+        def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
+            """推送信号事件"""
+            sse_manager.broadcast_sync(
+                f"job:{job_id}",
+                f"signal.{signal_code}",
+                {"signal": signal_code, "message": message}
+            )
+
+        # 初始化管理器
+        subtitle_manager = get_streaming_subtitle_manager(job.job_id)
+        progress_tracker = get_progress_tracker(job.job_id, preset_id)
+        sse_manager = get_sse_manager()
+
+        try:
+            logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}")
+
+            # 阶段 1: 音频前处理
+            progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "音频前处理...")
+
+            audio_config = AudioProcessingConfig()
+            audio_pipeline = get_audio_processing_pipeline(
+                job_id=job.job_id,
+                config=audio_config,
+                logger=logger
+            )
+
+            audio_result = await audio_pipeline.process(job.input_path)
+
+            # 保存音频文件供波形图使用
+            import soundfile as sf
+            audio_path = Path(job.dir) / "audio.wav"
+            sf.write(str(audio_path), audio_result.audio_array, audio_result.sample_rate)
+            logger.info(f"音频文件已保存: {audio_path}")
+
+            progress_tracker.complete_phase(ProcessPhase.EXTRACT)
+
+            # 阶段 2: 双流对齐处理
+            total_chunks = len(audio_result.chunks)
+            progress_tracker.start_phase(ProcessPhase.SENSEVOICE, total_chunks, "双流对齐...")
+
+            dual_config = DualAlignmentConfig()
+            dual_pipeline = get_dual_alignment_pipeline(
+                job_id=job.job_id,
+                config=dual_config,
+                logger=logger
+            )
+
+            # 处理所有 Chunks (使用 run 方法)
+            results = await dual_pipeline.run(audio_result.chunks)
+
+            progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
+
+            # 阶段 3: 生成字幕文件
+            progress_tracker.start_phase(ProcessPhase.SRT, 1, "生成字幕...")
+
+            all_sentences = []
+            for result in results:
+                all_sentences.extend(result.sentences)
+
+            # 按时间排序
+            all_sentences.sort(key=lambda s: s.start)
+
+            # 生成 SRT
+            output_path = str(Path(job.dir) / f"{job.job_id}.srt")
+            self.transcription_service._generate_subtitle_from_sentences(
+                all_sentences,
+                output_path,
+                include_translation=False
+            )
+
+            progress_tracker.complete_phase(ProcessPhase.SRT)
+
+            # 完成
+            job.status = 'completed'
+            push_signal_event(sse_manager, job.job_id, "job_complete", "处理完成")
+
+            logger.info(f"[双流对齐] 任务完成: {job.job_id}")
+
+        except Exception as e:
+            logger.error(f"[双流对齐] 任务失败: {e}", exc_info=True)
+            job.status = 'failed'
+            job.error = str(e)
+            push_signal_event(sse_manager, job.job_id, "job_failed", str(e))
+            raise
+
+        finally:
+            # 清理资源
+            remove_streaming_subtitle_manager(job.job_id)
+            remove_progress_tracker(job.job_id)
 
     def _cleanup_resources(self):
         """
