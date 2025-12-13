@@ -359,6 +359,21 @@ class SenseVoiceONNXService:
                 sess_options = ort.SessionOptions()
                 sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
+                # CPU 线程限制（防止卡顿）
+                # 原理：ONNX Runtime 默认会占满所有 CPU 核心，导致 Whisper 的 CUDA 调度线程无核可用
+                # 解决：保留 2 个核心给操作系统和 Whisper 调度
+                import multiprocessing
+                total_cores = multiprocessing.cpu_count()
+                intra_op_threads = max(1, total_cores - 2)  # 保留 2 个核心
+
+                sess_options.intra_op_num_threads = intra_op_threads  # 算子内部并行度（最关键）
+                sess_options.inter_op_num_threads = 1  # 算子间并行度（通常设为 1）
+
+                self.logger.info(
+                    f"CPU 线程配置: 总核心={total_cores}, "
+                    f"SenseVoice 使用={intra_op_threads}, 预留={total_cores - intra_op_threads}"
+                )
+
                 # 选择执行提供者
                 providers = self._get_execution_providers()
                 self.logger.info(f"执行提供者: {providers}")
