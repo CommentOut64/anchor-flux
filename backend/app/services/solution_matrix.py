@@ -3,6 +3,8 @@
 
 提供高度模块化的配置，允许在"速度、成本、质量"之间自由组合。
 前端预设对应后端具体配置。
+
+v3.5 更新: 支持从新版 transcription_profile 和 refinement 配置创建 SolutionConfig
 """
 from dataclasses import dataclass
 from enum import Enum
@@ -44,7 +46,7 @@ class SolutionConfig:
 
     @classmethod
     def from_preset(cls, preset_id: str) -> 'SolutionConfig':
-        """根据预设ID创建配置"""
+        """根据预设ID创建配置 (兼容旧版)"""
         presets = {
             'default': cls(
                 preset_id='default',
@@ -85,6 +87,68 @@ class SolutionConfig:
             ),
         }
         return presets.get(preset_id, cls())
+
+    @classmethod
+    def from_job_settings(cls, job_settings) -> 'SolutionConfig':
+        """
+        从 v3.5 JobSettings 创建配置
+
+        映射关系:
+        - transcription_profile -> enhancement
+          - sensevoice_only -> OFF
+          - sv_whisper_patch -> SMART_PATCH
+          - sv_whisper_dual -> DEEP_LISTEN
+        - llm_task + llm_scope -> proofread/translate
+          - off -> proofread=OFF, translate=OFF
+          - proofread + sparse -> proofread=SPARSE
+          - proofread + global -> proofread=FULL
+          - translate -> translate=FULL (含校对)
+        """
+        # 获取 transcription_profile (默认 sensevoice_only)
+        transcription_profile = getattr(
+            job_settings.transcription, 'transcription_profile', 'sensevoice_only'
+        )
+
+        # 映射 transcription_profile -> enhancement
+        profile_to_enhancement = {
+            'sensevoice_only': EnhancementMode.OFF,
+            'sv_whisper_patch': EnhancementMode.SMART_PATCH,
+            'sv_whisper_dual': EnhancementMode.DEEP_LISTEN,
+        }
+        enhancement = profile_to_enhancement.get(transcription_profile, EnhancementMode.OFF)
+
+        # 获取 refinement 配置
+        llm_task = getattr(job_settings.refinement, 'llm_task', 'off')
+        llm_scope = getattr(job_settings.refinement, 'llm_scope', 'sparse')
+        target_language = getattr(job_settings.refinement, 'target_language', 'zh')
+
+        # 映射 llm_task + llm_scope -> proofread/translate
+        proofread = ProofreadMode.OFF
+        translate = TranslateMode.OFF
+
+        if llm_task == 'translate':
+            # 翻译任务，同时包含校对
+            translate = TranslateMode.FULL
+            proofread = ProofreadMode.FULL
+        elif llm_task == 'proofread':
+            if llm_scope == 'global':
+                proofread = ProofreadMode.FULL
+            else:  # sparse
+                proofread = ProofreadMode.SPARSE
+
+        # 获取置信度阈值
+        confidence_threshold = getattr(
+            job_settings.transcription, 'patching_threshold', 0.6
+        )
+
+        return cls(
+            preset_id=job_settings.preset_id,
+            enhancement=enhancement,
+            proofread=proofread,
+            translate=translate,
+            target_language=target_language if translate != TranslateMode.OFF else None,
+            confidence_threshold=confidence_threshold
+        )
 
 
 # ========== 方案矩阵描述 ==========

@@ -354,6 +354,8 @@ async function loadProject() {
     // 3. 根据任务状态从后端加载字幕数据
     if (jobStatus.status === 'finished') {
       await loadCompletedSRT()
+      // 检查视频状态，必要时订阅 SSE 等待 proxy 完成
+      await checkAndSubscribeProxySSE()
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
       isTranscribing.value = true
       await loadTranscribingSegments()
@@ -453,6 +455,67 @@ function formatSRTTime(seconds) {
 }
 
 // ========== SSE 实时更新 ==========
+
+/**
+ * 检查视频状态，必要时订阅 SSE 等待 proxy 完成
+ * 用于 finished 状态的任务，解决 H265 转码完成后 URL 不更新的问题
+ */
+async function checkAndSubscribeProxySSE() {
+  try {
+    // 1. 获取当前视频状态
+    const progressiveStatus = await mediaApi.getProgressiveStatus(props.jobId)
+
+    // 2. 检查是否需要等待转码
+    const needsProxy = progressiveStatus.needs_transcode &&
+                       !progressiveStatus.proxy_720p?.exists
+
+    // 3. 检查是否正在转码中
+    const isProxyProcessing = progressiveStatus.proxy_720p?.status?.progress > 0 &&
+                              progressiveStatus.proxy_720p?.status?.progress < 100
+
+    if (needsProxy || isProxyProcessing) {
+      console.log('[EditorView] 视频需要转码或正在转码，订阅 SSE 等待 proxy 完成')
+      subscribeProxySSE()
+    } else {
+      console.log('[EditorView] 视频已就绪，无需订阅 proxy SSE')
+    }
+  } catch (error) {
+    console.warn('[EditorView] 检查视频状态失败:', error)
+  }
+}
+
+/**
+ * 仅订阅 proxy 相关事件的精简 SSE
+ * 用于 finished 任务等待视频转码完成
+ */
+function subscribeProxySSE() {
+  // 如果已经订阅，先取消
+  if (sseUnsubscribe) {
+    console.log('[EditorView] 已存在SSE订阅，先取消')
+    sseUnsubscribe()
+    sseUnsubscribe = null
+  }
+
+  console.log('[EditorView] 订阅 Proxy SSE:', props.jobId)
+
+  sseUnsubscribe = sseChannelManager.subscribeJob(props.jobId, {
+    onProxyProgress(data) {
+      console.log('[EditorView] Proxy 转码进度:', data.progress)
+      videoStatus.handleProxyProgress(data)
+    },
+
+    onProxyComplete(data) {
+      console.log('[EditorView] Proxy 转码完成:', data)
+      videoStatus.handleProxyComplete(data)
+      // 转码完成后关闭 SSE
+      cleanupSSE()
+    },
+
+    onConnected() {
+      console.log('[EditorView] Proxy SSE 连接成功')
+    }
+  })
+}
 
 function subscribeSSE() {
   // 如果已经订阅，先取消避免重复订阅
@@ -617,11 +680,13 @@ function handleStreamingSubtitle(data) {
   if (!data) return
 
   // 解析字幕数据格式
-  const sentenceIndex = data.sentence_index ?? data.index
-  const text = data.text ?? data.content
-  const start = data.start_time ?? data.start
-  const end = data.end_time ?? data.end
-  const warningType = data.warning_type ?? 'none'
+  // 兼容两种格式: 直接字段(sv_sentence) 和 嵌套sentence对象(whisper_patch/llm_proof等)
+  const sentence = data.sentence || {}
+  const sentenceIndex = data.sentence_index ?? data.index ?? sentence.index
+  const text = sentence.text ?? data.text ?? data.content
+  const start = sentence.start ?? data.start_time ?? data.start
+  const end = sentence.end ?? data.end_time ?? data.end
+  const warningType = sentence.warning_type ?? data.warning_type ?? 'none'
   const source = data.source ?? data.event_type ?? 'unknown'
 
   if (sentenceIndex === undefined || !text) {

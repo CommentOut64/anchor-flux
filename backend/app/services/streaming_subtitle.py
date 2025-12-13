@@ -225,18 +225,18 @@ class StreamingSubtitleManager:
 
     def get_context_window(self, index: int, window_size: int = 3) -> str:
         """
-        获取上下文窗口（用于 LLM 校对）
+        获取上下文窗口（用于 LLM 校对和 Whisper 补刀）
 
         Args:
             index: 当前句子索引
             window_size: 上下文窗口大小
 
         Returns:
-            str: 上下文文本
+            str: 上下文文本（清洗后的文本，避免传递 SenseVoice 原始 token）
         """
         context_indices = range(max(0, index - window_size), index)
         context_texts = [
-            self.sentences[i].text
+            self.sentences[i].text_clean or self.sentences[i].text  # 优先使用清洗后的文本，避免传递下划线等原始 token
             for i in context_indices
             if i in self.sentences
         ]

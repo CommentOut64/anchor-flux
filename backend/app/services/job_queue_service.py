@@ -437,6 +437,9 @@ class JobQueueService:
         try:
             logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}")
 
+            # === 预触发 Proxy 生成（不阻塞主流程）===
+            await self._maybe_trigger_proxy_generation(job)
+
             # 阶段 1: 音频前处理
             progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "音频前处理...")
 
@@ -510,6 +513,50 @@ class JobQueueService:
             # 清理资源
             remove_streaming_subtitle_manager(job.job_id)
             remove_progress_tracker(job.job_id)
+
+    async def _maybe_trigger_proxy_generation(self, job: 'JobState'):
+        """
+        预检视频格式，提前触发 Proxy 生成（不阻塞主流程）
+
+        在转录任务开始时调用，让 H265 等不兼容格式的视频提前开始转码，
+        用户打开编辑器时可能已完成转码。
+        """
+        from app.services.media_prep_service import get_media_prep_service
+        from app.api.routes.media_routes import (
+            _get_video_codec, NEED_TRANSCODE_CODECS, NEED_TRANSCODE_FORMATS,
+            BROWSER_COMPATIBLE_FORMATS, _find_video_file
+        )
+
+        try:
+            job_dir = Path(job.dir)
+
+            # 查找视频文件
+            video_file = _find_video_file(job_dir)
+            if not video_file:
+                return
+
+            # 检查是否需要转码
+            needs_transcode = False
+            if video_file.suffix.lower() in NEED_TRANSCODE_FORMATS:
+                needs_transcode = True
+            elif video_file.suffix.lower() in BROWSER_COMPATIBLE_FORMATS:
+                codec = _get_video_codec(video_file)
+                if codec and codec in NEED_TRANSCODE_CODECS:
+                    needs_transcode = True
+
+            if needs_transcode:
+                proxy_path = job_dir / "proxy.mp4"
+                if not proxy_path.exists():
+                    # 提前入队（低优先级20，不抢转录任务的资源）
+                    media_prep = get_media_prep_service()
+                    enqueued = media_prep.enqueue_proxy(
+                        job.job_id, video_file, proxy_path, priority=20
+                    )
+                    if enqueued:
+                        logger.info(f"[Proxy预生成] 检测到不兼容格式，提前入队: {job.job_id}")
+        except Exception as e:
+            # 预触发失败不影响主流程
+            logger.warning(f"[Proxy预生成] 预触发失败，忽略: {e}")
 
     def _cleanup_resources(self):
         """

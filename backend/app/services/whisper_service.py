@@ -400,7 +400,8 @@ class WhisperService:
         vad_filter: bool = True,
         vad_parameters: dict = None,
         temperature: float = 0.0,
-        condition_on_previous_text: bool = True
+        condition_on_previous_text: bool = True,
+        suppress_tokens: list = None  # 幻觉抑制 Token ID 列表
     ) -> Dict[str, Any]:
         """
         转录音频
@@ -415,6 +416,7 @@ class WhisperService:
             vad_parameters: VAD 参数
             temperature: 采样温度
             condition_on_previous_text: 是否基于前文条件生成
+            suppress_tokens: 幻觉抑制 Token ID 列表（None 则自动从配置获取）
 
         Returns:
             dict: {
@@ -431,6 +433,13 @@ class WhisperService:
         if language is None or language == 'auto' or language == '':
             language = None
 
+        # 获取幻觉抑制 Token ID（如果未指定）
+        if suppress_tokens is None:
+            from app.config.model_config import get_whisper_suppress_tokens
+            suppress_tokens = get_whisper_suppress_tokens(self._model_name)
+            if suppress_tokens:
+                logger.debug(f"启用幻觉抑制: {len(suppress_tokens)} 个 Token ID")
+
         # 执行转录
         segments_generator, info = self.model.transcribe(
             audio,
@@ -441,7 +450,8 @@ class WhisperService:
             vad_filter=vad_filter,
             vad_parameters=vad_parameters,
             temperature=temperature,
-            condition_on_previous_text=condition_on_previous_text
+            condition_on_previous_text=condition_on_previous_text,
+            suppress_tokens=suppress_tokens if suppress_tokens else None  # 幻觉抑制
         )
 
         # 转换生成器为列表

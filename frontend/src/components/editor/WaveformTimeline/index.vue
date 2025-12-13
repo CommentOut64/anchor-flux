@@ -166,6 +166,9 @@ let scrollbarDragStartScroll = 0;
 let scrollbarRafId = null;
 let pendingScrollEvent = null;
 
+// 时间同步节流状态
+let lastSyncTime = 0;
+
 // DOM查询缓存
 let cachedScrollWidth = 0;
 let cachedClientWidth = 0;

@@ -648,7 +648,23 @@ async def get_video(job_id: str, request: Request):
             print(f"[media] 检测到不兼容编码: {codec}，需要转码为H.264")
 
     if needs_transcode:
-        # 检查是否已在生成中
+        # 使用 MediaPrepService 管理转码任务
+        from app.services.media_prep_service import get_media_prep_service
+        media_prep = get_media_prep_service()
+
+        # 检查是否已在 MediaPrepService 队列中或处理中
+        proxy_status = media_prep.get_proxy_status(job_id)
+        if proxy_status and proxy_status.get("status") in ["queued", "processing"]:
+            raise HTTPException(
+                status_code=202,
+                detail={
+                    "message": "Proxy视频生成中...",
+                    "progress": proxy_status.get("progress", 0),
+                    "proxy_generating": True
+                }
+            )
+
+        # 兼容检查: 也检查旧的 _proxy_generation_status（过渡期兼容）
         if job_id in _proxy_generation_status and _proxy_generation_status[job_id]["status"] == "processing":
             raise HTTPException(
                 status_code=202,
@@ -659,8 +675,8 @@ async def get_video(job_id: str, request: Request):
                 }
             )
 
-        # 异步生成Proxy视频（带进度追踪）
-        asyncio.create_task(_generate_proxy_video_with_progress(video_file, proxy_video, job_id))
+        # 通过 MediaPrepService 异步生成 Proxy（独立线程，不阻塞主流程）
+        media_prep.enqueue_proxy(job_id, video_file, proxy_video, priority=10)
 
         raise HTTPException(
             status_code=202,

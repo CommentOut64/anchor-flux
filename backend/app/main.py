@@ -117,6 +117,11 @@ async def startup_event():
         queue_service = get_queue_service(transcription_service)
         logger.info("任务队列服务已启动")
 
+        # 4.5. 初始化媒体准备服务（独立线程执行转码，不阻塞主流程）
+        from app.services.media_prep_service import get_media_prep_service
+        media_prep_service = get_media_prep_service()
+        logger.info("媒体准备服务已启动")
+
         # 5. 清理无效的任务索引映射（第一阶段修复：数据同步）
         logger.info("清理无效的任务索引映射...")
         try:
@@ -145,6 +150,14 @@ async def startup_event():
 async def shutdown_event():
     """应用关闭事件 - 清理资源"""
     try:
+        # 停止媒体准备服务
+        from app.services.media_prep_service import shutdown_media_prep_service
+        try:
+            shutdown_media_prep_service()
+            logger.info("媒体准备服务已停止")
+        except:
+            pass
+
         # 停止队列服务（新增）
         from app.services.job_queue_service import get_queue_service
         try:
