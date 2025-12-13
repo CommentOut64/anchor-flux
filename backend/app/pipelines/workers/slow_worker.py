@@ -63,7 +63,7 @@ class SlowWorker:
 
         流程：
         1. 构建安全的 Whisper Prompt
-        2. Whisper 推理
+        2. Whisper 推理（带 Audio Overlap）
         3. 幻觉检测
         4. 填充 ctx.whisper_result
 
@@ -76,9 +76,9 @@ class SlowWorker:
         self.logger.debug(f"Chunk {ctx.chunk_index}: 构建 Whisper Prompt")
         prompt = self._build_safe_prompt()
 
-        # 阶段 2: Whisper 推理
-        self.logger.debug(f"Chunk {ctx.chunk_index}: Whisper 慢流推理")
-        whisper_result = await self._run_whisper(chunk, prompt)
+        # 阶段 2: Whisper 推理（带 Audio Overlap）
+        self.logger.debug(f"Chunk {ctx.chunk_index}: Whisper 慢流推理（带 Audio Overlap）")
+        whisper_result = await self._run_whisper_with_overlap(ctx, prompt)
 
         # 阶段 3: 幻觉检测
         if self._is_hallucination(whisper_result, prompt):
@@ -119,38 +119,78 @@ class SlowWorker:
 
         return prompt
 
-    async def _run_whisper(
+    async def _run_whisper_with_overlap(
         self,
-        chunk: AudioChunk,
+        ctx: ProcessingContext,
         initial_prompt: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        运行 Whisper 推理
+        运行 Whisper 推理（带前向音频重叠）
+
+        实现 Audio Overlap 策略：
+        - 向前取 0.5 秒音频作为上下文预热
+        - 避免 Whisper 在音频开头产生幻觉（冷启动问题）
 
         Args:
-            chunk: AudioChunk
+            ctx: ProcessingContext（包含 full_audio_array）
             initial_prompt: 初始提示词
 
         Returns:
             Dict: Whisper 推理结果
         """
+        chunk = ctx.audio_chunk
+        full_audio = ctx.full_audio_array
+        sr = ctx.full_audio_sr
+
+        # Audio Overlap 配置
+        WHISPER_OVERLAP_SEC = 0.5  # 前向重叠 0.5 秒
+
+        # 如果有完整音频数组，使用 Audio Overlap
+        if full_audio is not None:
+            # 计算重叠后的起始位置（不小于0）
+            overlap_start = max(0.0, chunk.start - WHISPER_OVERLAP_SEC)
+            start_sample = int(overlap_start * sr)
+            end_sample = int(chunk.end * sr)
+
+            # 确保不超出数组范围
+            start_sample = max(0, start_sample)
+            end_sample = min(len(full_audio), end_sample)
+
+            # 从完整音频中提取重叠片段
+            audio_with_overlap = full_audio[start_sample:end_sample]
+
+            # 记录日志
+            if overlap_start < chunk.start:
+                self.logger.debug(
+                    f"Whisper 添加 {chunk.start - overlap_start:.2f}s 前向重叠: "
+                    f"[{overlap_start:.2f}s, {chunk.end:.2f}s]"
+                )
+        else:
+            # 无完整音频，直接使用 chunk 音频
+            audio_with_overlap = chunk.audio
+            self.logger.debug("无完整音频数组，跳过 Audio Overlap")
+
+        # 执行 Whisper 推理
         result = await self.whisper_executor.execute(
-            audio=chunk.audio,
+            audio=audio_with_overlap,
             start_time=chunk.start,
             end_time=chunk.end,
             language=self.whisper_language,
             initial_prompt=initial_prompt,
             condition_on_previous_text=False  # 防止双重提示词增益
         )
+
         return result
 
     def _is_hallucination(self, result: Dict[str, Any], prompt: Optional[str]) -> bool:
         """
-        检测 Whisper 幻觉（下划线、重复 prompt）
+        检测 Whisper 幻觉（四道检测防线）
 
         幻觉特征：
         1. 输出包含大量下划线（> 30%）
         2. 输出重复了 prompt 内容（相似度 > 80%）
+        3. avg_logprob 过低（< -1.0，模型不确信）
+        4. no_speech_prob 过高（> 0.6，静音段误识别）
 
         Args:
             result: Whisper 推理结果
@@ -185,6 +225,31 @@ class SlowWorker:
                         f"prompt='{prompt[:30]}...', text='{text[:30]}...'"
                     )
                     return True
+
+        # 检测 3 & 4：Dual-Stream Gating（置信度门控）
+        raw_result = result.get('raw_result', {})
+        segments = raw_result.get('segments', [])
+
+        if segments:
+            # 计算平均 logprob 和 no_speech_prob
+            avg_logprob = sum(s.get('avg_logprob', -0.5) for s in segments) / len(segments)
+            avg_no_speech = sum(s.get('no_speech_prob', 0.0) for s in segments) / len(segments)
+
+            # 检测 3：avg_logprob 过低（模型在瞎猜）
+            if avg_logprob < -1.0:
+                self.logger.warning(
+                    f"检测到低置信度幻觉: avg_logprob={avg_logprob:.2f} < -1.0, "
+                    f"text='{text[:50]}...'"
+                )
+                return True
+
+            # 检测 4：no_speech_prob 过高（静音段误识别）
+            if avg_no_speech > 0.6 and text:
+                self.logger.warning(
+                    f"检测到静音段误识别: no_speech_prob={avg_no_speech:.2f} > 0.6, "
+                    f"text='{text[:50]}...'"
+                )
+                return True
 
         return False
 

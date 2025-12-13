@@ -23,6 +23,11 @@ from app.pipelines.dual_alignment_pipeline import (
     get_dual_alignment_pipeline
 )
 
+from app.pipelines.async_dual_pipeline import (
+    AsyncDualPipeline,
+    get_async_dual_pipeline
+)
+
 __all__ = [
     # 音频前处理流水线
     'AudioProcessingPipeline',
@@ -31,10 +36,14 @@ __all__ = [
     'SeparationStrategy',
     'get_audio_processing_pipeline',
 
-    # 双流对齐流水线
+    # 双流对齐流水线（V3.0 - 串行）
     'DualAlignmentPipeline',
     'DualAlignmentConfig',
     'ChunkProcessingResult',
     'AlignmentLevel',
     'get_dual_alignment_pipeline',
+
+    # 异步双流流水线（V3.1.0 - 流水线）
+    'AsyncDualPipeline',
+    'get_async_dual_pipeline',
 ]

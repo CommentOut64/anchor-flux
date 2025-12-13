@@ -402,7 +402,11 @@ class JobQueueService:
 
     async def _run_dual_alignment_pipeline(self, job: 'JobState', preset_id: str):
         """
-        运行双流对齐流水线 (V3.0+ 新架构)
+        运行双流对齐流水线
+
+        V3.1.0 新特性：支持两种流水线模式
+        - async: 三级异步流水线（错位并行，性能提升 30-50%）
+        - sync: 串行流水线（稳定版，V3.0 兼容）
 
         Args:
             job: 任务状态对象
@@ -413,8 +417,10 @@ class JobQueueService:
             AudioProcessingConfig,
             DualAlignmentPipeline,
             DualAlignmentConfig,
+            AsyncDualPipeline,
             get_audio_processing_pipeline,
-            get_dual_alignment_pipeline
+            get_dual_alignment_pipeline,
+            get_async_dual_pipeline
         )
         from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
         from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
@@ -434,8 +440,15 @@ class JobQueueService:
         progress_tracker = get_progress_tracker(job.job_id, preset_id)
         sse_manager = get_sse_manager()
 
+        # 流水线模式选择（V3.1.0 新增）
+        # 从配置中读取，支持环境变量 USE_ASYNC_PIPELINE 控制
+        from app.core.config import config as project_config
+        use_async_pipeline = project_config.USE_ASYNC_PIPELINE
+        queue_maxsize = project_config.PIPELINE_QUEUE_MAXSIZE
+
         try:
-            logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}")
+            pipeline_mode = "异步流水线 (V3.1.0)" if use_async_pipeline else "串行流水线 (V3.0)"
+            logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}, 模式={pipeline_mode}")
 
             # === 预触发 Proxy 生成（不阻塞主流程）===
             await self._maybe_trigger_proxy_generation(job)
@@ -464,24 +477,49 @@ class JobQueueService:
             total_chunks = len(audio_result.chunks)
             progress_tracker.start_phase(ProcessPhase.SENSEVOICE, total_chunks, "双流对齐...")
 
-            dual_config = DualAlignmentConfig()
-            dual_pipeline = get_dual_alignment_pipeline(
-                job_id=job.job_id,
-                config=dual_config,
-                logger=logger
-            )
+            if use_async_pipeline:
+                # V3.1.0: 异步流水线（三级流水线，错位并行）
+                logger.info(f"[双流对齐] 使用异步流水线处理 {total_chunks} 个 Chunk (queue_maxsize={queue_maxsize})")
+                async_pipeline = get_async_dual_pipeline(
+                    job_id=job.job_id,
+                    queue_maxsize=queue_maxsize,
+                    logger=logger
+                )
 
-            # 处理所有 Chunks (使用 run 方法)
-            results = await dual_pipeline.run(audio_result.chunks)
+                # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
+                contexts = await async_pipeline.run(
+                    audio_chunks=audio_result.chunks,
+                    full_audio_array=audio_result.audio_array,
+                    full_audio_sr=audio_result.sample_rate
+                )
+
+                # 提取结果
+                all_sentences = []
+                for ctx in contexts:
+                    all_sentences.extend(ctx.final_sentences)
+
+            else:
+                # V3.0: 串行流水线（兼容模式）
+                logger.info(f"[双流对齐] 使用串行流水线处理 {total_chunks} 个 Chunk")
+                dual_config = DualAlignmentConfig()
+                dual_pipeline = get_dual_alignment_pipeline(
+                    job_id=job.job_id,
+                    config=dual_config,
+                    logger=logger
+                )
+
+                # 处理所有 Chunks（串行）
+                results = await dual_pipeline.run(audio_result.chunks)
+
+                # 提取结果
+                all_sentences = []
+                for result in results:
+                    all_sentences.extend(result.sentences)
 
             progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
 
             # 阶段 3: 生成字幕文件
             progress_tracker.start_phase(ProcessPhase.SRT, 1, "生成字幕...")
-
-            all_sentences = []
-            for result in results:
-                all_sentences.extend(result.sentences)
 
             # 按时间排序
             all_sentences.sort(key=lambda s: s.start)

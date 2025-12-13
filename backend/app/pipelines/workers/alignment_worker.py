@@ -167,9 +167,44 @@ class AlignmentWorker:
         self.final_splitter.config.language = detected_language
         self.logger.debug(f"使用 Whisper 检测到的语言: {detected_language}")
 
+        # ========== 早期拦截：长度暴涨检测 ==========
+        whisper_text = whisper_result.get('text', '').strip()
+        sv_text_clean = sv_result.get('text_clean', '').strip()
+
+        # 检测 Whisper 输出是否异常膨胀
+        if sv_text_clean:  # 仅当 SenseVoice 有输出时检查
+            len_w = len(whisper_text)
+            len_sv = len(sv_text_clean)
+
+            # 长度暴涨公式: len(whisper) > 3 * len(sensevoice) + 10
+            if len_w > 3 * len_sv + 10:
+                # 检查 Whisper 置信度
+                whisper_confidence = whisper_result.get('confidence', 0.5)
+
+                # 置信度阈值：0.5 对应 avg_logprob ≈ -0.5
+                if whisper_confidence < 0.5:
+                    self.logger.warning(
+                        f"Whisper 长度暴涨且置信度低，直接降级到 Level 3: "
+                        f"len(whisper)={len_w} > 3*{len_sv}+10, "
+                        f"confidence={whisper_confidence:.2f} < 0.5, "
+                        f"whisper='{whisper_text[:50]}...', sv='{sv_text_clean[:50]}...'"
+                    )
+                    # 直接降级到 Level 3（SenseVoice 草稿）
+                    sentences = self._split_sentences_from_sv(sv_result, chunk)
+                    for sentence in sentences:
+                        sentence.is_finalized = True
+                        sentence.is_draft = False
+                    return sentences, AlignmentLevel.SENSEVOICE_ONLY
+                else:
+                    # 特权放行：置信度高，可能是 SenseVoice 漏识别
+                    self.logger.info(
+                        f"Whisper 长度暴涨但置信度高，特权放行: "
+                        f"len(whisper)={len_w} > 3*{len_sv}+10, "
+                        f"confidence={whisper_confidence:.2f} >= 0.5"
+                    )
+
         try:
             # Level 1: 尝试双模态对齐
-            whisper_text = whisper_result.get('text', '').strip()
             sv_words_data = sv_result.get('words', [])
 
             if not whisper_text or not sv_words_data:

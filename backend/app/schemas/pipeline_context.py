@@ -5,6 +5,7 @@
 """
 from dataclasses import dataclass, field
 from typing import Optional, List, Any
+import numpy as np
 
 
 @dataclass
@@ -19,6 +20,7 @@ class ProcessingContext:
         job_id: 任务 ID
         chunk_index: Chunk 索引
         audio_chunk: AudioChunk 对象
+        full_audio_array: 完整音频数组（用于 Audio Overlap）
 
         sv_result: FastWorker 产出（SenseVoice 推理结果）
         whisper_result: SlowWorker 产出（Whisper 推理结果）
@@ -31,6 +33,10 @@ class ProcessingContext:
     job_id: str
     chunk_index: int
     audio_chunk: Any  # AudioChunk 对象
+
+    # 音频上下文（用于 Audio Overlap）
+    full_audio_array: Optional[np.ndarray] = None  # 完整音频数组（16kHz，单声道）
+    full_audio_sr: int = 16000                     # 完整音频采样率
 
     # 阶段产物
     sv_result: Optional[dict] = None      # FastWorker 产出

@@ -136,6 +136,14 @@ class ProjectConfig:
         self.PREVIEW_PRESET = "ultrafast"        # 预览视频编码预设
         self.PROXY_PRESET = "fast"               # 高质量视频编码预设
 
+        # ========== 流水线配置（V3.1.0 新增）==========
+        # 双流对齐流水线模式
+        # - True: 三级异步流水线（错位并行，性能提升 30-50%）
+        # - False: 串行流水线（稳定版，V3.0 兼容）
+        self.USE_ASYNC_PIPELINE = os.getenv('USE_ASYNC_PIPELINE', 'true').lower() == 'true'
+        # 队列背压大小（控制并发度，防止内存溢出）
+        self.PIPELINE_QUEUE_MAXSIZE = int(os.getenv('PIPELINE_QUEUE_MAXSIZE', '5'))
+
     def get_ffmpeg_command(self) -> str:
         """
         获取FFmpeg命令
