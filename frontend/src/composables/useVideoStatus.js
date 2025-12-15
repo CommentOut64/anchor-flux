@@ -36,13 +36,15 @@ export function useVideoStatus(jobId) {
   const preview360p = ref({
     exists: false,
     url: null,
-    progress: 0
+    progress: 0,
+    status: null  // 'queued' | 'processing' | 'completed' | 'failed' | null
   })
 
   const proxy720p = ref({
     exists: false,
     url: null,
-    progress: 0
+    progress: 0,
+    status: null  // 'queued' | 'processing' | 'completed' | 'failed' | null
   })
 
   const source = ref({
@@ -94,13 +96,20 @@ export function useVideoStatus(jobId) {
       if (data.preview_360p) {
         preview360p.value.exists = data.preview_360p.exists
         preview360p.value.url = data.preview_360p.url
+        // 读取 360p 转码状态和进度
+        if (data.preview_360p.status) {
+          preview360p.value.status = data.preview_360p.status.status || null
+          preview360p.value.progress = data.preview_360p.status.progress || 0
+        }
       }
 
       // 更新 720p 代理状态
       if (data.proxy_720p) {
         proxy720p.value.exists = data.proxy_720p.exists
         proxy720p.value.url = data.proxy_720p.url
+        // 读取 720p 转码状态和进度
         if (data.proxy_720p.status) {
+          proxy720p.value.status = data.proxy_720p.status.status || null
           proxy720p.value.progress = data.proxy_720p.status.progress || 0
         }
       }
@@ -116,6 +125,10 @@ export function useVideoStatus(jobId) {
       if (data.recommended_url) {
         currentUrl.value = data.recommended_url
         currentResolution.value = data.current_resolution
+      } else {
+        // 如果没有推荐URL（正在转码中），清空当前URL避免加载无效视频
+        currentUrl.value = null
+        currentResolution.value = null
       }
 
       // 更新阶段
@@ -132,14 +145,32 @@ export function useVideoStatus(jobId) {
    * 更新当前阶段
    */
   function updateStage() {
+    // 检查是否正在转码（通过 status 或 progress 判断）
+    const isPreviewInProgress = preview360p.value.status === 'queued' || preview360p.value.status === 'processing'
+    const isPreviewGenerating = isPreviewInProgress || (preview360p.value.progress > 0 && preview360p.value.progress < 100)
+    const isProxyInProgress = proxy720p.value.status === 'queued' || proxy720p.value.status === 'processing'
+    const isProxyGenerating = isProxyInProgress || (proxy720p.value.progress > 0 && proxy720p.value.progress < 100)
+    const isAnyTranscoding = isPreviewGenerating || isProxyGenerating
+
     if (proxy720p.value.exists) {
+      // 720p 已存在，最高质量
       currentStage.value = VIDEO_STAGES.HIGH_QUALITY
+      isUpgrading.value = false
     } else if (preview360p.value.exists) {
+      // 360p 已存在，可能正在生成 720p
       currentStage.value = VIDEO_STAGES.PREVIEW
-      isUpgrading.value = proxy720p.value.progress > 0
+      isUpgrading.value = isProxyGenerating
       upgradeProgress.value = proxy720p.value.progress
     } else if (source.value.exists && source.value.compatible) {
+      // 原始视频兼容，无需转码
       currentStage.value = VIDEO_STAGES.SOURCE
+      isUpgrading.value = false
+    } else if (isAnyTranscoding || (needsTranscode.value && !preview360p.value.exists && !proxy720p.value.exists)) {
+      // 正在转码或需要转码但尚未开始
+      currentStage.value = VIDEO_STAGES.LOADING
+      isUpgrading.value = true
+      // 优先显示 360p 进度（因为它先完成）
+      upgradeProgress.value = isPreviewGenerating ? preview360p.value.progress : proxy720p.value.progress
     } else if (isGenerating.value) {
       currentStage.value = VIDEO_STAGES.LOADING
     } else {
@@ -153,6 +184,39 @@ export function useVideoStatus(jobId) {
    */
   function subscribeEvents() {
     console.warn('[useVideoStatus] subscribeEvents已废弃，请在父组件中统一处理SSE事件')
+  }
+
+  /**
+   * 处理 360p 预览进度更新（由父组件调用）
+   */
+  function handlePreview360pProgress(data) {
+    preview360p.value.progress = data.progress || 0
+    isUpgrading.value = true
+    upgradeProgress.value = data.progress || 0
+    console.log('[useVideoStatus] 360p 预览进度:', data.progress)
+  }
+
+  /**
+   * 处理 360p 预览完成事件（由父组件调用）
+   */
+  function handlePreview360pComplete(data) {
+    console.log('[useVideoStatus] 收到 360p 预览完成事件:', data)
+
+    preview360p.value.exists = true
+    preview360p.value.url = data.video_url || '/api/media/' + (jobId.value || jobId) + '/video/preview'
+    preview360p.value.progress = 100
+
+    // 立即切换到 360p 预览视频（快速展示）
+    currentUrl.value = preview360p.value.url
+    currentResolution.value = '360p'
+    currentStage.value = VIDEO_STAGES.PREVIEW
+    isUpgrading.value = false
+
+    console.log('[useVideoStatus] 360p 预览视频已就绪:', {
+      url: preview360p.value.url,
+      currentUrl: currentUrl.value,
+      resolution: currentResolution.value
+    })
   }
 
   /**
@@ -233,8 +297,10 @@ export function useVideoStatus(jobId) {
     // 方法
     fetchProgressiveStatus,
     triggerPreviewGeneration,
-    handleProxyProgress,      // 新增：处理Proxy进度（由父组件调用）
-    handleProxyComplete,      // 新增：处理Proxy完成（由父组件调用）
+    handlePreview360pProgress,  // 新增：处理 360p 预览进度（由父组件调用）
+    handlePreview360pComplete,  // 新增：处理 360p 预览完成（由父组件调用）
+    handleProxyProgress,        // 处理 720p Proxy 进度（由父组件调用）
+    handleProxyComplete,        // 处理 720p Proxy 完成（由父组件调用）
 
     // 常量
     VIDEO_STAGES

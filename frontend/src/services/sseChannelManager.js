@@ -238,11 +238,23 @@ class SSEChannelManager extends EventEmitter {
         handlers.onSubtitleUpdate?.(data)
       },
 
-      // === Proxy 相关事件 ===
+      // === 视频转码相关事件 ===
+      // 360p 预览进度
+      preview_360p_progress: (data) => {
+        console.log(`[SSE Job ${jobId}] 360p 预览进度:`, data.progress)
+        handlers.onPreview360pProgress?.(data)
+      },
+      // 360p 预览完成
+      preview_360p_complete: (data) => {
+        console.log(`[SSE Job ${jobId}] 360p 预览完成:`, data)
+        handlers.onPreview360pComplete?.(data)
+      },
+      // 720p Proxy 进度
       proxy_progress: (data) => {
         console.log(`[SSE Job ${jobId}] Proxy 进度:`, data.progress)
         handlers.onProxyProgress?.(data)
       },
+      // 720p Proxy 完成
       proxy_complete: (data) => {
         console.log(`[SSE Job ${jobId}] Proxy 完成:`, data)
         handlers.onProxyComplete?.(data)

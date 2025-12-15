@@ -8,9 +8,11 @@
           <div class="transcoding-spinner"></div>
           <h3>视频画面正在解码</h3>
           <p>{{ transcodingMessage }}</p>
-          <div v-if="transcodingProgress > 0 && transcodingProgress < 100" class="progress-bar">
-            <div class="progress-fill" :style="{ width: transcodingProgress + '%' }"></div>
-            <span>{{ transcodingProgress.toFixed(1) }}%</span>
+          <div v-if="props.isUpgrading" class="progress-bar">
+            <div v-if="transcodingProgress > 0 && transcodingProgress < 100" class="progress-fill" :style="{ width: transcodingProgress + '%' }"></div>
+            <div v-else class="progress-fill indeterminate"></div>
+            <span v-if="transcodingProgress > 0">{{ transcodingProgress.toFixed(1) }}%</span>
+            <span v-else>准备中...</span>
           </div>
         </div>
       </transition>
@@ -59,9 +61,9 @@
         </div>
       </transition>
 
-      <!-- 错误提示 -->
+      <!-- 错误提示（转码中不显示） -->
       <transition name="fade">
-        <div v-if="hasError" class="video-overlay error-overlay">
+        <div v-if="hasError && !isUpgrading" class="video-overlay error-overlay">
           <svg class="error-icon" viewBox="0 0 24 24" fill="currentColor">
             <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
           </svg>
@@ -146,10 +148,15 @@ const videoSource = computed(() => {
   return projectStore.meta.videoPath || ''
 })
 
+// 标记当前是否启用了渐进式模式（父组件传入 progressiveUrl 即表示受控模式）
+const isProgressiveMode = computed(() => props.progressiveUrl !== undefined)
+
 // 实际使用的视频源（支持渐进式加载）
 const effectiveVideoSource = computed(() => {
-  // 优先使用渐进式 URL
-  if (props.progressiveUrl) return props.progressiveUrl
+  if (isProgressiveMode.value) {
+    // 渐进式模式下，当后端仍未提供 URL（通常是转码中）时不再退回原始 H265，让界面回到提示状态
+    return props.progressiveUrl || null
+  }
   return videoSource.value
 })
 
@@ -185,8 +192,12 @@ const isPlaying = computed(() => projectStore.player.isPlaying)
 
 // 转码占位符相关
 const showTranscodingPlaceholder = computed(() => {
-  // 当视频源为空或正在升级时显示（且没有严重错误）
-  return (!effectiveVideoSource.value || props.isUpgrading) && !hasError.value
+  // 当正在升级转码时，始终显示占位符（即使有错误）
+  // 当视频源为空时也显示（且没有错误）
+  if (props.isUpgrading) {
+    return true  // 转码中始终显示提示，不显示错误
+  }
+  return !effectiveVideoSource.value && !hasError.value
 })
 
 const transcodingMessage = computed(() => {
@@ -221,21 +232,45 @@ function showResolutionHint() {
   }, 3000)
 }
 
+// 追踪当前的 play() Promise，用于避免 AbortError 导致的状态不一致
+let currentPlayPromise = null
+
 // 监听 Store 播放状态（单向：Store → Video）
 watch(() => projectStore.player.isPlaying, async (playing) => {
   if (!videoRef.value) return
 
-  const isPaused = videoRef.value.paused
+  const video = videoRef.value
+  const isPaused = video.paused
 
   if (playing && isPaused) {
     try {
-      await videoRef.value.play()
+      // 保存 play() 返回的 Promise
+      currentPlayPromise = video.play()
+      await currentPlayPromise
     } catch (error) {
+      // AbortError 是由于 play() 被 pause() 中断，这是正常行为，不需要处理
+      if (error.name === 'AbortError') {
+        console.debug('[VideoStage] 播放被中断（用户快速切换播放/暂停）')
+        // 不需要重置 isPlaying，因为 pause 事件处理器会处理
+        return
+      }
+      // 其他错误才是真正的播放失败
       console.error('[VideoStage] 播放失败:', error)
       projectStore.player.isPlaying = false
+    } finally {
+      currentPlayPromise = null
     }
   } else if (!playing && !isPaused) {
-    videoRef.value.pause()
+    // 在调用 pause() 之前，等待当前 play() 完成或失败
+    // 这样可以避免 AbortError
+    if (currentPlayPromise) {
+      try {
+        await currentPlayPromise
+      } catch {
+        // 忽略错误，我们只是等待 Promise 完成
+      }
+    }
+    video.pause()
   }
 })
 
@@ -257,6 +292,17 @@ watch(() => projectStore.player.playbackRate, (rate) => {
 // 监听音量
 watch(() => projectStore.player.volume, (volume) => {
   if (videoRef.value) videoRef.value.volume = volume
+})
+
+// 监听转码状态变化（刷新后恢复时清除错误状态）
+watch(() => props.isUpgrading, (isUpgrading) => {
+  if (isUpgrading) {
+    // 正在转码时，清除错误状态，显示转码提示
+    console.log('[VideoStage] 检测到转码状态，清除错误提示')
+    hasError.value = false
+    errorMessage.value = ''
+    retryCount.value = 0
+  }
 })
 
 // 监听视频源变化（渐进式加载升级时）
@@ -411,11 +457,14 @@ function onError() {
 
   console.error('[VideoStage] 视频加载错误:', error?.code, errorMessage.value)
 
-  // 自动重试机制
+  // 自动重试机制（但先检查是否是转码导致的 404）
   if (canRetry.value && retryCount.value < maxRetries) {
     retryCount.value++
-    console.log(`[VideoStage] 视频加载失败，自动重试 ${retryCount.value}/${maxRetries}`)
-    errorMessage.value = `${errorMessage.value}，正在重试 (${retryCount.value}/${maxRetries})...`
+    console.log(`[VideoStage] 视频加载失败，将检查转码状态并重试 ${retryCount.value}/${maxRetries}`)
+    errorMessage.value = `${errorMessage.value}，正在检查视频状态...`
+
+    // 触发父组件刷新视频状态（检查是否正在转码）
+    emit('check-status')
 
     setTimeout(() => {
       hasError.value = false
@@ -430,10 +479,18 @@ function onError() {
 }
 
 function retryLoad() {
+  console.log('[VideoStage] 手动重试，先刷新视频状态')
   hasError.value = false
   errorMessage.value = ''
   retryCount.value = 0
-  videoRef.value?.load()
+
+  // 触发父组件刷新视频状态（检查是否正在转码）
+  emit('check-status')
+
+  // 短暂延迟后重新加载，给父组件时间更新状态
+  setTimeout(() => {
+    videoRef.value?.load()
+  }, 500)
 }
 
 // 控制方法
@@ -676,6 +733,23 @@ onUnmounted(() => {
       height: 100%;
       background: linear-gradient(90deg, var(--primary), var(--primary-hover));
       transition: width 0.3s ease;
+
+      &.indeterminate {
+        width: 40%;
+        animation: indeterminate 1.5s infinite ease-in-out;
+      }
+    }
+
+    @keyframes indeterminate {
+      0% {
+        transform: translateX(-100%);
+      }
+      50% {
+        transform: translateX(250%);
+      }
+      100% {
+        transform: translateX(-100%);
+      }
     }
 
     span {

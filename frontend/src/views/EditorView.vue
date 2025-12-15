@@ -55,6 +55,7 @@
             :upgrade-progress="videoStatus.upgradeProgress.value"
             @loaded="handleVideoLoaded"
             @error="handleVideoError"
+            @check-status="handleCheckVideoStatus"
             @resolution-change="handleResolutionChange"
           />
         </div>
@@ -347,6 +348,10 @@ async function loadProject() {
         // 暂停状态也需要订阅SSE，以便接收恢复信号
         console.log('[EditorView] 任务已暂停，订阅SSE以接收恢复信号')
         subscribeSSE()
+      } else if (jobStatus.status === 'finished') {
+        // 任务已完成但视频可能仍在后台转码，此时需要重新拉取转码状态并订阅proxy事件
+        console.log('[EditorView] 本地恢复后任务已完成，检查视频转码状态')
+        await checkAndSubscribeProxySSE()
       }
       return
     }
@@ -613,13 +618,25 @@ function subscribeSSE() {
       refreshTaskProgress()
     },
 
-    // 新增：视频生成进度
+    // 新增：360p 预览进度
+    onPreview360pProgress(data) {
+      console.log('[EditorView] 收到 360p 预览进度事件:', data.progress)
+      videoStatus.handlePreview360pProgress(data)
+    },
+
+    // 新增：360p 预览完成
+    onPreview360pComplete(data) {
+      console.log('[EditorView] 收到 360p 预览完成事件:', data)
+      videoStatus.handlePreview360pComplete(data)
+    },
+
+    // 新增：720p Proxy 进度
     onProxyProgress(data) {
       console.log('[EditorView] 收到SSE Proxy进度事件:', data.progress)
       videoStatus.handleProxyProgress(data)
     },
 
-    // 新增：视频生成完成
+    // 新增：720p Proxy 完成
     onProxyComplete(data) {
       console.log('[EditorView] 收到SSE Proxy完成事件，完整数据:', data)
       videoStatus.handleProxyComplete(data)
@@ -995,6 +1012,27 @@ function handleVideoLoaded(duration) {
 
 function handleVideoError(error) {
   console.error('视频加载错误:', error)
+}
+
+async function handleCheckVideoStatus() {
+  console.log('[EditorView] 视频加载失败，检查转码状态...')
+  try {
+    // 刷新视频状态，检查是否正在转码
+    await videoStatus.fetchProgressiveStatus()
+    console.log('[EditorView] 视频状态已更新:', {
+      isUpgrading: videoStatus.isUpgrading.value,
+      currentStage: videoStatus.currentStage.value,
+      needsTranscode: videoStatus.needsTranscode.value
+    })
+
+    // 如果检测到正在转码，确保订阅 SSE 事件
+    if (videoStatus.needsTranscode.value || videoStatus.isUpgrading.value) {
+      console.log('[EditorView] 检测到视频正在转码，确保订阅 SSE 事件')
+      await checkAndSubscribeProxySSE()
+    }
+  } catch (error) {
+    console.error('[EditorView] 检查视频状态失败:', error)
+  }
 }
 
 function handleResolutionChange(resolution) {
