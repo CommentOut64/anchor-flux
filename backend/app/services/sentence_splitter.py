@@ -360,7 +360,7 @@ class SentenceSplitter:
             return []
 
         # 调试日志：确认当前语言配置
-        logger.info(f"分句器语言配置: language={self.config.language}, strategy={type(self.config.get_strategy()).__name__}")
+        logger.debug(f"分句器语言配置: language={self.config.language}, strategy={type(self.config.get_strategy()).__name__}")
 
         sentences = []
         current_words: List[WordTimestamp] = []
@@ -426,7 +426,7 @@ class SentenceSplitter:
                 has_sentence_end_punct = any(last_word_stripped.endswith(p) for p in '.?!')
                 has_clause_punct = any(last_word_stripped.endswith(p) for p in ',;:')
 
-                logger.info(f"max_duration 检查: duration={current_duration:.2f}s, last_word='{last_word}', "
+                logger.debug(f"max_duration 检查: duration={current_duration:.2f}s, last_word='{last_word}', "
                            f"is_incomplete={is_incomplete}, has_end_punct={has_sentence_end_punct}, has_clause_punct={has_clause_punct}")
 
                 # 决定是否延迟切分
@@ -435,7 +435,7 @@ class SentenceSplitter:
                 # 检查1: 语义不完整 -> 延迟
                 if is_incomplete:
                     should_delay = True
-                    logger.info(f"max_duration 语义不完整(词='{last_word}')，延迟切分...")
+                    logger.debug(f"max_duration 语义不完整(词='{last_word}')，延迟切分...")
 
                 # 检查2: 启用了延迟到标点功能，且当前词没有结束标点 -> 延迟
                 elif self.config.delay_split_to_punctuation:
@@ -445,9 +445,9 @@ class SentenceSplitter:
                             # 检查是否超过延迟等待上限
                             if current_duration < delay_max_duration:
                                 should_delay = True
-                                logger.info(f"max_duration 等待句末标点(当前词='{last_word}')，延迟切分...")
+                                logger.debug(f"max_duration 等待句末标点(当前词='{last_word}')，延迟切分...")
                             else:
-                                logger.info(f"max_duration 延迟等待超时({current_duration:.2f}s >= {delay_max_duration:.2f}s)，强制切分")
+                                logger.debug(f"max_duration 延迟等待超时({current_duration:.2f}s >= {delay_max_duration:.2f}s)，强制切分")
                     else:
                         # 等待任意标点（包括逗号等）
                         if not has_sentence_end_punct and not has_clause_punct:
@@ -477,7 +477,7 @@ class SentenceSplitter:
                 sentence = self._create_sentence(current_words)
                 if sentence:
                     sentences.append(sentence)
-                    logger.info(f"分句: '{sentence.text[-50:]}' (原因: {split_reason}, 时长: {current_duration:.2f}s)")
+                    logger.debug(f"分句: '{sentence.text[-50:]}' (原因: {split_reason}, 时长: {current_duration:.2f}s)")
 
                 # 重置
                 current_words = []

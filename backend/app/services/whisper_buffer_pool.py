@@ -543,7 +543,7 @@ class WhisperBufferAligner:
                 "word_count": len(words_in_chunk)
             })
 
-        logger.info(f"Needleman-Wunsch 对齐完成: {len(whisper_words)} Whisper词 -> {len(chunk_boundaries)} Chunks")
+        logger.debug(f"Needleman-Wunsch 对齐完成: {len(whisper_words)} Whisper词 -> {len(chunk_boundaries)} Chunks")
         return result
 
     def _timestamp_based_alignment(
@@ -824,7 +824,7 @@ class WhisperBufferService:
         audio, pool_start, pool_end = self.pool.get_concatenated_audio()
         chunk_boundaries = self.pool.get_chunk_boundaries()
 
-        logger.info(
+        logger.debug(
             f"Whisper 缓冲池推理: {len(chunk_boundaries)} 个 Chunk, "
             f"时长 {pool_end - pool_start:.2f}s [{pool_start:.2f}s - {pool_end:.2f}s]"
         )
@@ -840,7 +840,7 @@ class WhisperBufferService:
         )
 
         whisper_text = result.get("text", "").strip()
-        logger.info(f"Whisper 缓冲池输出: '{whisper_text[:100]}...' (共 {len(whisper_text)} 字符)")
+        logger.debug(f"Whisper 缓冲池输出: '{whisper_text[:100]}...' (共 {len(whisper_text)} 字符)")
 
         # 3. 对齐回填
         aligned_results = self.aligner.align_text_to_chunks(

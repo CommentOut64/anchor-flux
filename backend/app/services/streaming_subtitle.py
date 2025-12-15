@@ -296,7 +296,7 @@ class StreamingSubtitleManager:
         # 记录 Chunk 级别的索引映射
         self.chunk_sentences[chunk_index] = sentence_indices
 
-        logger.info(
+        logger.debug(
             f"添加草稿句子: Chunk {chunk_index}, "
             f"{len(sentences)} 个句子, 索引 {sentence_indices}"
         )

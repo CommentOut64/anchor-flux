@@ -7,13 +7,18 @@ Faster-Whisper 转录服务
 - 自动检测并下载缺失的 Whisper 模型（默认 medium）
 - 自动使用 HuggingFace 镜像源（hf-mirror.com）
 """
-from faster_whisper import WhisperModel
-from typing import Optional, Dict, Any, Union, Tuple
+# 延迟导入 faster_whisper，避免启动时加载 ctranslate2 导致首次启动卡死
+# from faster_whisper import WhisperModel  # 已移至 load_model() 内部延迟导入
+from typing import Optional, Dict, Any, Union, Tuple, TYPE_CHECKING
 import numpy as np
 import logging
 import gc
 import os
 from pathlib import Path
+
+# 用于类型检查的条件导入（不会在运行时触发导入）
+if TYPE_CHECKING:
+    from faster_whisper import WhisperModel
 
 from app.core import config
 
@@ -181,6 +186,9 @@ class WhisperService:
                     model_repo_id = model_path
 
             # 加载模型
+            # 延迟导入 faster_whisper，避免启动时加载 ctranslate2 导致首次启动卡死
+            from faster_whisper import WhisperModel
+
             self.model = WhisperModel(
                 model_repo_id,
                 device=device,

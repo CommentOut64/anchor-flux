@@ -81,7 +81,10 @@ class ThirdPartyFilter(logging.Filter):
         "Warning: audio is shorter than 30s, language detection may be inaccurate",
         "Using `TRANSFORMERS_CACHE` is deprecated",
         "ReproducibilityWarning",
-        "FutureWarning"
+        "FutureWarning",
+        # Windows asyncio ProactorEventLoop 已知问题，无害
+        "_ProactorBasePipeTransport._call_connection_lost",
+        "Exception in callback _ProactorBasePipeTransport",
     ]
 
     def filter(self, record):

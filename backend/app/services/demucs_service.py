@@ -1072,7 +1072,7 @@ class DemucsService:
         if vocals.ndim > 1:
             vocals = vocals.mean(axis=0)
 
-        self.logger.info(f"Chunk 分离完成 (model={self.config.model_name})")
+        self.logger.debug(f"Chunk 分离完成 (model={self.config.model_name})")
         return vocals
 
 

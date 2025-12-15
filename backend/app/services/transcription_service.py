@@ -3958,7 +3958,7 @@ class TranscriptionService:
         from app.services.sensevoice_onnx_service import get_sensevoice_service
         from app.models.sensevoice_models import SenseVoiceResult, WordTimestamp
 
-        self.logger.info("调用 SenseVoice 转录服务")
+        self.logger.debug("调用 SenseVoice 转录服务")
 
         try:
             service = get_sensevoice_service()
@@ -3994,7 +3994,7 @@ class TranscriptionService:
                 raw_result=result_dict
             )
 
-            self.logger.info(f"SenseVoice 转录完成: {len(result.text_clean)} 字符, {len(words)} 个字")
+            self.logger.debug(f"SenseVoice 转录完成: {len(result.text_clean)} 字符, {len(words)} 个字")
             return result
 
         except Exception as e:
@@ -4023,7 +4023,7 @@ class TranscriptionService:
         from app.models.sensevoice_models import SentenceSegment, TextSource
         from app.services.sentence_splitter import SentenceSplitter, SplitConfig
 
-        self.logger.info(f"开始句子切分: {len(sv_result.words)} 个字")
+        self.logger.debug(f"开始句子切分: {len(sv_result.words)} 个字")
 
         if not sv_result.words:
             return []
@@ -4071,7 +4071,7 @@ class TranscriptionService:
                 word.start += chunk_start_time
                 word.end += chunk_start_time
 
-        self.logger.info(f"句子切分完成: {len(sentences)} 句")
+        self.logger.debug(f"句子切分完成: {len(sentences)} 句")
         return sentences
 
     def _split_text_by_punctuation(self, text: str) -> List[str]:
@@ -4189,6 +4189,10 @@ class TranscriptionService:
             lines.append("")
 
         # 写入文件
+        # 确保父目录存在
+        from pathlib import Path
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
 
