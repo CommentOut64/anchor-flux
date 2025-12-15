@@ -31,6 +31,19 @@ class TextNormalizer:
         '【': '[', '】': ']', '《': '<', '》': '>',
     }
 
+    # Whisper 幻觉检测模式
+    # 重复子串检测: 长度>=4 且重复>=3次的子串
+    REPEATED_PATTERN = re.compile(r'(.{4,})\1{2,}')
+
+    # 特定幻觉句式（开头匹配）
+    HALLUCINATION_PATTERNS = [
+        re.compile(r'^Questions?\s+\d+', re.IGNORECASE),           # "Questions 19..."
+        re.compile(r'^Subtitles?\s+by', re.IGNORECASE),            # "Subtitles by..."
+        re.compile(r'^Copyright\s+', re.IGNORECASE),               # "Copyright 2024..."
+        re.compile(r'^Thanks?\s+for\s+watching', re.IGNORECASE),   # "Thanks for watching"
+        re.compile(r'^Please\s+subscribe', re.IGNORECASE),         # "Please subscribe"
+    ]
+
     @staticmethod
     def clean(text: str) -> str:
         """
@@ -58,6 +71,67 @@ class TextNormalizer:
         text = TextNormalizer.EXTRA_SPACES.sub(' ', text)
 
         return text.strip()
+
+    @classmethod
+    def is_whisper_hallucination(cls, text: str) -> bool:
+        """
+        检测 Whisper 输出是否为幻觉文本
+
+        Args:
+            text: Whisper 输出的文本
+
+        Returns:
+            bool: True 表示检测到幻觉
+        """
+        if not text:
+            return False
+
+        text = text.strip()
+
+        # 检测1: 重复子串模式
+        if cls.REPEATED_PATTERN.search(text):
+            return True
+
+        # 检测2: 特定幻觉句式
+        for pattern in cls.HALLUCINATION_PATTERNS:
+            if pattern.match(text):
+                return True
+
+        # 检测3: 纯下划线/符号（清洗后为空或大幅缩减）
+        cleaned = cls.clean(text)
+        if not cleaned:
+            # 清洗后完全为空
+            return True
+        
+        # 如果清洗后损失严重(>60%)且原文或清洗后很短，可能是垃圾字符
+        loss_ratio = 1.0 - (len(cleaned) / len(text))
+        if loss_ratio > 0.6 and (len(text) <= 10 or len(cleaned) <= 3):
+            return True
+
+        return False
+
+    @classmethod
+    def clean_whisper_output(cls, text: str) -> str:
+        """
+        清洗 Whisper 输出（比 SenseVoice 清洗更激进）
+
+        Args:
+            text: Whisper 原始输出
+
+        Returns:
+            str: 清洗后的文本，如果是幻觉则返回空字符串
+        """
+        if not text:
+            return ""
+
+        # 先用基础清洗
+        cleaned = cls.clean(text)
+
+        # 再检测是否为幻觉
+        if cls.is_whisper_hallucination(text):
+            return ""
+
+        return cleaned
 
     @staticmethod
     def normalize_punctuation(text: str, to_fullwidth: bool = True) -> str:
