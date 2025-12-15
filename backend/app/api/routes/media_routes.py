@@ -33,8 +33,7 @@ NEED_TRANSCODE_FORMATS = {'.mkv', '.avi', '.mov', '.wmv', '.flv', '.m4v'}
 # 浏览器不兼容的视频编码（需要转码为H.264）
 NEED_TRANSCODE_CODECS = {'hevc', 'h265', 'vp9', 'av1'}
 
-# Proxy生成状态追踪（job_id -> {progress, status, start_time}）
-_proxy_generation_status = {}
+# 注意：旧的 _proxy_generation_status 已废弃，改用 MediaPrepService 管理状态
 
 
 def _find_video_file(job_dir: Path) -> Optional[Path]:
@@ -218,123 +217,6 @@ async def _get_video_duration(video_path: Path) -> float:
         print(f"[media] 获取视频时长异常: {e}, 路径: {video_path}")
         return 0.0
 
-
-async def _generate_proxy_video_with_progress(source: Path, output: Path, job_id: str):
-    """
-    异步生成Proxy视频（带进度追踪和SSE推送）
-    720p, H.264, 适合浏览器预览
-    """
-    global _proxy_generation_status
-
-    if output.exists():
-        return True
-
-    # 初始化状态
-    _proxy_generation_status[job_id] = {
-        "status": "starting",
-        "progress": 0,
-        "start_time": time.time(),
-        "duration": 0
-    }
-
-    try:
-        # 获取视频时长（用于计算进度）
-        duration = await _get_video_duration(source)
-        _proxy_generation_status[job_id]["duration"] = duration
-
-        ffmpeg_cmd = config.get_ffmpeg_command()
-        cmd = [
-            ffmpeg_cmd,
-            '-i', str(source),
-            '-vf', 'scale=-2:720',
-            '-c:v', 'libx264',
-            '-preset', 'fast',
-            '-crf', '23',               # 高质量 (优化拖动体验)
-            '-g', '30',                  # 关键帧间隔 (每秒1个,假设30fps,优化拖动)
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-movflags', '+faststart',   # moov atom 前置 (优化拖动响应)
-            '-progress', 'pipe:1',       # 输出进度到stdout
-            '-y',
-            str(output)
-        ]
-
-        print(f"[media] 开始生成Proxy视频: {source.name} -> proxy.mp4")
-        _proxy_generation_status[job_id]["status"] = "processing"
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        # 解析FFmpeg进度输出
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                break
-
-            line_str = line.decode().strip()
-            if line_str.startswith('out_time_ms='):
-                try:
-                    out_time_ms = int(line_str.split('=')[1])
-                    if duration > 0:
-                        progress = min(100, (out_time_ms / 1000000) / duration * 100)
-                        _proxy_generation_status[job_id]["progress"] = round(progress, 1)
-
-                        # 推送SSE进度（如果有连接的话）
-                        _push_proxy_progress(job_id, progress)
-                except:
-                    pass
-
-        await process.wait()
-
-        if process.returncode == 0 and output.exists():
-            _proxy_generation_status[job_id]["status"] = "completed"
-            _proxy_generation_status[job_id]["progress"] = 100
-            print(f"[media] Proxy视频生成完成: {output}")
-            _push_proxy_progress(job_id, 100, completed=True)
-            return True
-        else:
-            _proxy_generation_status[job_id]["status"] = "failed"
-            print(f"[media] Proxy视频生成失败")
-            return False
-
-    except Exception as e:
-        _proxy_generation_status[job_id]["status"] = "failed"
-        print(f"[media] 生成Proxy视频异常: {e}")
-        return False
-
-
-def _push_proxy_progress(job_id: str, progress: float, completed: bool = False):
-    """推送Proxy生成进度到SSE"""
-    try:
-        from app.services.sse_service import get_sse_manager
-        sse_manager = get_sse_manager()
-
-        channel_id = f"job:{job_id}"
-        event_type = "proxy_complete" if completed else "proxy_progress"
-
-        # 构建事件数据
-        data = {
-            "job_id": job_id,
-            "progress": progress,
-            "completed": completed
-        }
-
-        # 如果是完成事件，添加视频URL（关键修复！）
-        if completed:
-            data["video_url"] = f"/api/media/{job_id}/video"
-            print(f"[media] 推送Proxy完成事件，video_url: {data['video_url']}")
-
-        sse_manager.broadcast_sync(
-            channel_id,
-            event_type,
-            data
-        )
-    except Exception as e:
-        # SSE推送失败不影响Proxy生成
-        pass
 
 
 def _generate_peaks_with_ffmpeg(audio_path: Path, samples: int = 2000) -> Tuple[list, float]:
@@ -617,6 +499,7 @@ async def get_video(job_id: str, request: Request):
     对于不兼容的格式或编码（如HEVC/H.265），会触发异步生成Proxy
     """
     job_dir = config.JOBS_DIR / job_id
+    print(f"[media] 收到视频请求: {job_id}")
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -624,12 +507,16 @@ async def get_video(job_id: str, request: Request):
     # 1. 查找Proxy视频（优先）
     proxy_video = job_dir / "proxy.mp4"
     if proxy_video.exists():
+        print(f"[media] 返回已存在的720p Proxy: {proxy_video.name}")
         return _serve_file_with_range(proxy_video, request, 'video/mp4')
 
     # 2. 查找源视频
     video_file = _find_video_file(job_dir)
     if not video_file:
+        print(f"[media] 视频文件不存在: {job_id}")
         raise HTTPException(status_code=404, detail="视频文件不存在")
+
+    print(f"[media] 找到源视频: {video_file.name}, 扩展名: {video_file.suffix.lower()}")
 
     # 3. 检查是否需要生成Proxy（先检查扩展名，再检查编码）
     needs_transcode = False
@@ -639,55 +526,80 @@ async def get_video(job_id: str, request: Request):
     if video_file.suffix.lower() in NEED_TRANSCODE_FORMATS:
         needs_transcode = True
         transcode_reason = f"格式不兼容 ({video_file.suffix})"
+        print(f"[media] 扩展名需要转码: {video_file.suffix.lower()} 属于 {NEED_TRANSCODE_FORMATS}")
     # 3.2 即使是 .mp4/.webm，也需检查实际编码是否兼容
     elif video_file.suffix.lower() in BROWSER_COMPATIBLE_FORMATS:
+        print(f"[media] 扩展名兼容，检查视频编码...")
         codec = _get_video_codec(video_file)
+        print(f"[media] 检测到视频编码: {codec}")
         if codec and codec in NEED_TRANSCODE_CODECS:
             needs_transcode = True
             transcode_reason = f"编码不兼容 ({codec.upper()})"
-            print(f"[media] 检测到不兼容编码: {codec}，需要转码为H.264")
+            print(f"[media] 编码需要转码: {codec} 属于 {NEED_TRANSCODE_CODECS}")
+        else:
+            print(f"[media] 编码兼容，无需转码")
 
     if needs_transcode:
-        # 使用 MediaPrepService 管理转码任务
+        print(f"[media] 视频需要转码: {transcode_reason}")
+        # 使用 MediaPrepService 管理转码任务（渐进式：360p 优先，720p 后续）
         from app.services.media_prep_service import get_media_prep_service
         media_prep = get_media_prep_service()
 
-        # 检查是否已在 MediaPrepService 队列中或处理中
+        # 360p 预览视频路径
+        preview_360p = proxy_video.parent / "preview_360p.mp4"
+
+        # 检查 360p 预览状态
+        preview_status = media_prep.get_preview_status(job_id)
+        preview_in_progress = preview_status and preview_status.get("status") in ["queued", "processing"]
+        preview_completed = preview_status and preview_status.get("status") == "completed"
+        print(f"[media] 360p预览状态: {preview_status}, 进行中={preview_in_progress}, 已完成={preview_completed}")
+
+        # 检查 720p Proxy 状态
         proxy_status = media_prep.get_proxy_status(job_id)
-        if proxy_status and proxy_status.get("status") in ["queued", "processing"]:
+        proxy_in_progress = proxy_status and proxy_status.get("status") in ["queued", "processing"]
+        print(f"[media] 720p Proxy状态: {proxy_status}, 进行中={proxy_in_progress}")
+
+        # 如果 360p 已完成但 720p 还在处理，返回 360p 视频
+        if preview_completed and preview_360p.exists():
+            if proxy_in_progress:
+                # 返回 360p 视频，并提示 720p 正在生成
+                print(f"[media] 返回已完成的360p预览视频（720p还在转码中）")
+                return _serve_file_with_range(preview_360p, request, 'video/mp4')
+
+        # 如果有任务正在处理，返回进度信息
+        if preview_in_progress or proxy_in_progress:
+            # 优先显示 360p 进度（因为它更快完成）
+            current_progress = preview_status.get("progress", 0) if preview_in_progress else proxy_status.get("progress", 0)
+            current_stage = "360p预览" if preview_in_progress else "720p高清"
+            print(f"[media] 转码进行中: {current_stage}, 进度={current_progress}%")
             raise HTTPException(
                 status_code=202,
                 detail={
-                    "message": "Proxy视频生成中...",
-                    "progress": proxy_status.get("progress", 0),
-                    "proxy_generating": True
+                    "message": f"正在生成{current_stage}版本...",
+                    "progress": current_progress,
+                    "proxy_generating": True,
+                    "stage": "preview_360p" if preview_in_progress else "proxy_720p"
                 }
             )
 
-        # 兼容检查: 也检查旧的 _proxy_generation_status（过渡期兼容）
-        if job_id in _proxy_generation_status and _proxy_generation_status[job_id]["status"] == "processing":
-            raise HTTPException(
-                status_code=202,
-                detail={
-                    "message": "Proxy视频生成中...",
-                    "progress": _proxy_generation_status[job_id].get("progress", 0),
-                    "proxy_generating": True
-                }
-            )
-
-        # 通过 MediaPrepService 异步生成 Proxy（独立线程，不阻塞主流程）
-        media_prep.enqueue_proxy(job_id, video_file, proxy_video, priority=10)
+        # 只启动 360p 预览转码（快速让用户看到视频）
+        # 720p 高清转码将在转录完成后、队列空闲时自动触发
+        print(f"[media] 调用 enqueue_preview() 启动360p转码: {video_file} -> {preview_360p}")
+        success = media_prep.enqueue_preview(job_id, video_file, preview_360p, priority=5)
+        print(f"[media] enqueue_preview() 返回: {success}")
 
         raise HTTPException(
             status_code=202,
             detail={
                 "message": f"视频{transcode_reason}，正在生成预览版本...",
                 "format": video_file.suffix,
-                "proxy_generating": True
+                "proxy_generating": True,
+                "stage": "preview_360p"
             }
         )
 
     # 4. 返回兼容格式的源视频
+    print(f"[media] 无需转码，直接返回源视频")
     return _serve_file_with_range(video_file, request, 'video/mp4')
 
 
@@ -823,16 +735,18 @@ async def check_proxy_status(job_id: str):
             "status": "completed"
         })
 
-    # 检查生成状态
-    if job_id in _proxy_generation_status:
-        status_info = _proxy_generation_status[job_id]
+    # 检查 MediaPrepService 中的生成状态
+    from app.services.media_prep_service import get_media_prep_service
+    media_prep = get_media_prep_service()
+    proxy_status = media_prep.get_proxy_status(job_id)
+
+    if proxy_status and proxy_status.get("status") in ["queued", "processing"]:
         return JSONResponse({
             "exists": False,
             "size": 0,
-            "generating": status_info["status"] == "processing",
-            "progress": status_info.get("progress", 0),
-            "status": status_info["status"],
-            "elapsed": time.time() - status_info.get("start_time", time.time())
+            "generating": True,
+            "progress": proxy_status.get("progress", 0),
+            "status": proxy_status["status"]
         })
 
     # 检查源视频是否需要转码
@@ -1157,13 +1071,46 @@ async def get_progressive_status(job_id: str):
     preview_status = None
     proxy_status = None
 
-    if job_id in _proxy_generation_status:
-        status_info = _proxy_generation_status[job_id]
-        # 这里的状态主要是 720p 的状态
-        proxy_status = {
-            "status": status_info.get("status", "not_started"),
-            "progress": status_info.get("progress", 0)
+    # 从 MediaPrepService 获取转码状态
+    from app.services.media_prep_service import get_media_prep_service
+    media_prep = get_media_prep_service()
+
+    # 获取 360p 预览状态
+    preview_status_info = media_prep.get_preview_status(job_id)
+    if preview_status_info:
+        preview_status = {
+            "status": preview_status_info.get("status", "not_started"),
+            "progress": preview_status_info.get("progress", 0)
         }
+
+    # 获取 720p proxy 状态
+    proxy_status_info = media_prep.get_proxy_status(job_id)
+    if proxy_status_info:
+        proxy_status = {
+            "status": proxy_status_info.get("status", "not_started"),
+            "progress": proxy_status_info.get("progress", 0)
+        }
+
+    # 关键修复：如果需要转码但没有转码任务，自动触发 360p 预览转码
+    if needs_transcode and video_file:
+        # 检查是否需要启动转码
+        preview_exists = preview_360p.exists()
+        preview_in_progress = preview_status_info and preview_status_info.get("status") in ["queued", "processing"]
+
+        if not preview_exists and not preview_in_progress:
+            # 启动360p预览转码
+            print(f"[media] progressive-status 检测到需要转码，自动触发: {job_id}")
+            success = media_prep.enqueue_preview(job_id, video_file, preview_360p, priority=5)
+            print(f"[media] enqueue_preview() 返回: {success}")
+
+            # 更新状态为已入队
+            if success:
+                preview_status_info = media_prep.get_preview_status(job_id)
+                if preview_status_info:
+                    preview_status = {
+                        "status": preview_status_info.get("status", "queued"),
+                        "progress": preview_status_info.get("progress", 0)
+                    }
 
     # 构建响应
     result = {
@@ -1173,7 +1120,8 @@ async def get_progressive_status(job_id: str):
         "preview_360p": {
             "exists": preview_360p.exists(),
             "url": f"/api/media/{job_id}/video/preview" if preview_360p.exists() else None,
-            "size": preview_360p.stat().st_size if preview_360p.exists() else 0
+            "size": preview_360p.stat().st_size if preview_360p.exists() else 0,
+            "status": preview_status  # 包含转码状态和进度
         },
         "proxy_720p": {
             "exists": proxy_720p.exists(),
@@ -1299,7 +1247,10 @@ async def post_process_transcription(job_id: str):
         results["proxy_needed"] = True
         proxy_video = job_dir / "proxy.mp4"
         if not proxy_video.exists():
-            asyncio.create_task(_generate_proxy_video_with_progress(video_file, proxy_video, job_id))
+            # 使用 MediaPrepService 管理转码
+            from app.services.media_prep_service import get_media_prep_service
+            media_prep = get_media_prep_service()
+            media_prep.enqueue_proxy(job_id, video_file, proxy_video, priority=20)
             results["proxy"] = True
 
     return JSONResponse(results)
@@ -1435,10 +1386,10 @@ async def get_media_info(job_id: str, retry_missing: bool = True):
         if video_codec and video_codec in NEED_TRANSCODE_CODECS:
             needs_proxy = True
 
-    # 获取Proxy生成状态
-    proxy_status = None
-    if job_id in _proxy_generation_status:
-        proxy_status = _proxy_generation_status[job_id]
+    # 获取Proxy生成状态（从 MediaPrepService）
+    from app.services.media_prep_service import get_media_prep_service
+    media_prep = get_media_prep_service()
+    proxy_status = media_prep.get_proxy_status(job_id)
 
     # 智能重试：如果资源缺失且启用重试，则尝试异步生成
     if retry_missing:
@@ -1460,10 +1411,10 @@ async def get_media_info(job_id: str, retry_missing: bool = True):
 
         # 3. 如果需要Proxy但不存在且未在生成中，触发生成
         if needs_proxy and not proxy_video.exists():
-            if not (proxy_status and proxy_status.get("status") == "processing"):
+            if not (proxy_status and proxy_status.get("status") in ["queued", "processing"]):
                 try:
                     print(f"[media] 检测到Proxy缺失，尝试生成: {job_id}")
-                    asyncio.create_task(_generate_proxy_video_with_progress(video_file, proxy_video, job_id))
+                    media_prep.enqueue_proxy(job_id, video_file, proxy_video, priority=30)
                 except Exception as e:
                     print(f"[media] Proxy视频生成失败: {e}")
 
@@ -1600,4 +1551,5 @@ async def _auto_generate_thumbnail(job_id: str, video_file: Path, thumbnail_file
             print(f"[media] 缩略图自动生成成功: {job_id} (宽度: {thumb_width}px)")
     except Exception as e:
         print(f"[media] 缩略图自动生成失败 [{job_id}]: {e}")
+
 
