@@ -541,6 +541,20 @@ class TranscriptionService:
         # 持久化任务元信息（重启后可恢复）
         self.save_job_meta(job)
 
+        # 立即异步提取音频，确保前端能加载波形图（不阻塞响应）
+        audio_path = job_dir / 'audio.wav'
+        if not audio_path.exists():
+            self.logger.info(f"[{job_id}] 启动后台音频提取...")
+            import threading
+            threading.Thread(
+                target=self._extract_audio_async_wrapper,
+                args=(str(dest_path), str(audio_path), job_id),
+                daemon=True,
+                name=f"AudioExtract-{job_id[:8]}"
+            ).start()
+        else:
+            self.logger.debug(f"[{job_id}] 音频文件已存在，跳过提取")
+
         self.logger.info(f"任务已创建: {job_id} - {filename}")
         return job
 
@@ -1138,9 +1152,93 @@ class TranscriptionService:
 
             self.logger.info(f"已触发媒体预处理任务: {job_id}")
 
+            # 触发 720p 高清转码（队列空闲时执行）
+            self._trigger_720p_transcode_if_idle(job_id)
+
         except Exception as e:
             # 预处理失败不影响转录结果
             self.logger.warning(f"触发媒体预处理失败（非致命）: {e}")
+
+    def _trigger_720p_transcode_if_idle(self, job_id: str):
+        """
+        在转录完成后触发 720p 高清转码（仅在队列空闲时）
+
+        策略:
+        1. 检查视频是否需要转码（H.265 等）
+        2. 检查转录队列是否空闲
+        3. 如果空闲，立即启动 720p 转码
+        4. 如果队列有任务，延迟触发（使用低优先级）
+        """
+        try:
+            from pathlib import Path
+            from app.core.config import config
+            from app.services.media_prep_service import get_media_prep_service
+
+            job_dir = config.JOBS_DIR / job_id
+            if not job_dir.exists():
+                return
+
+            # 查找视频文件
+            video_file = None
+            video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
+            for file in job_dir.iterdir():
+                if file.is_file() and file.suffix.lower() in video_exts:
+                    video_file = file
+                    break
+
+            if not video_file:
+                return
+
+            proxy_video = job_dir / "proxy.mp4"
+
+            # 720p 已存在则跳过
+            if proxy_video.exists():
+                self.logger.info(f"[720p] 已存在，跳过: {job_id}")
+                return
+
+            media_prep = get_media_prep_service()
+
+            # 检查 720p 是否已在队列中
+            proxy_status = media_prep.get_proxy_status(job_id)
+            if proxy_status and proxy_status.get("status") in ["queued", "processing", "completed"]:
+                self.logger.info(f"[720p] 任务已存在或完成，跳过: {job_id}")
+                return
+
+            # 检查转录队列是否空闲
+            queue_idle = self._is_transcription_queue_idle()
+
+            if queue_idle:
+                # 队列空闲，立即启动（正常优先级）
+                self.logger.info(f"[720p] 队列空闲，立即启动转码: {job_id}")
+                media_prep.enqueue_proxy(job_id, video_file, proxy_video, priority=10)
+            else:
+                # 队列繁忙，使用低优先级（独立进程模式）
+                self.logger.info(f"[720p] 队列繁忙，低优先级排队: {job_id}")
+                media_prep.enqueue_proxy(job_id, video_file, proxy_video, priority=100)
+
+        except Exception as e:
+            self.logger.warning(f"[720p] 触发转码失败（非致命）: {e}")
+
+    def _is_transcription_queue_idle(self) -> bool:
+        """检查转录任务队列是否空闲"""
+        try:
+            from app.services.job_queue_service import get_job_queue
+
+            job_queue = get_job_queue()
+            if not job_queue:
+                return True
+
+            # 检查是否有正在处理或等待的任务
+            active_jobs = [
+                j for j in job_queue.jobs.values()
+                if j.status in ['pending', 'processing', 'queued']
+            ]
+
+            return len(active_jobs) == 0
+
+        except Exception as e:
+            self.logger.debug(f"检查队列状态失败: {e}")
+            return True  # 默认认为空闲
 
     def _push_sse_segment(self, job: JobState, segment_result: dict, processed: int, total: int):
         """
@@ -2896,6 +2994,21 @@ class TranscriptionService:
             self.logger.warning(f"Demucs重试失败: {e}")
 
         return result
+
+    def _extract_audio_async_wrapper(self, input_file: str, audio_out: str, job_id: str):
+        """
+        音频提取的异步包装器（在后台线程中调用）
+        用于在任务创建时立即提取音频，不阻塞响应
+        """
+        try:
+            self.logger.info(f"[{job_id}] 开始异步提取音频...")
+            success = self._extract_audio(input_file, audio_out)
+            if success:
+                self.logger.info(f"[{job_id}] 异步音频提取完成: {audio_out}")
+            else:
+                self.logger.error(f"[{job_id}] 异步音频提取失败")
+        except Exception as e:
+            self.logger.error(f"[{job_id}] 异步音频提取异常: {e}", exc_info=True)
 
     def _extract_audio(self, input_file: str, audio_out: str) -> bool:
         """
