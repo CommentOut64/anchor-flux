@@ -18,7 +18,7 @@ from app.core.config import config
 logger = logging.getLogger(__name__)
 
 # 任务类型
-TaskType = Literal["proxy_720p", "waveform", "thumbnail"]
+TaskType = Literal["preview_360p", "proxy_720p", "waveform", "thumbnail"]
 
 
 class MediaPrepService:
@@ -114,11 +114,63 @@ class MediaPrepService:
         logger.info(f"[MediaPrep] Proxy任务已入队: {job_id} (priority={priority})")
         return True
 
+    def enqueue_preview(self, job_id: str, video_path: Path, output_path: Path,
+                        priority: int = 5) -> bool:
+        """
+        将 360p 预览视频任务加入队列（高优先级，快速生成）
+
+        Args:
+            job_id: 任务ID
+            video_path: 源视频路径
+            output_path: 输出路径 (preview_360p.mp4)
+            priority: 优先级 (0最高，默认5，比720p更高)
+
+        Returns:
+            bool: 是否成功加入队列
+        """
+        # 检查是否已在队列或执行中
+        with self.lock:
+            if job_id in self.task_status:
+                status = self.task_status[job_id].get("preview_360p", {})
+                if status.get("status") in ["queued", "processing"]:
+                    logger.info(f"[MediaPrep] 360p预览任务已存在，跳过: {job_id}")
+                    return False
+
+            # 初始化状态
+            if job_id not in self.task_status:
+                self.task_status[job_id] = {}
+
+            self.task_status[job_id]["preview_360p"] = {
+                "status": "queued",
+                "progress": 0,
+                "video_path": str(video_path),
+                "output_path": str(output_path)
+            }
+
+        # 加入优先级队列 (priority越小越优先)
+        task = (priority, time.time(), {
+            "type": "preview_360p",
+            "job_id": job_id,
+            "video_path": video_path,
+            "output_path": output_path
+        })
+        self.task_queue.put(task)
+
+        logger.info(f"[MediaPrep] 360p预览任务已入队: {job_id} (priority={priority})")
+        return True
+
     def get_proxy_status(self, job_id: str) -> Optional[Dict]:
-        """获取 Proxy 任务状态"""
+        """获取 720p Proxy 任务状态"""
         with self.lock:
             if job_id in self.task_status:
                 return self.task_status[job_id].get("proxy_720p")
+        return None
+
+    def get_preview_status(self, job_id: str) -> Optional[Dict]:
+        """获取 360p 预览任务状态"""
+        with self.lock:
+            if job_id in self.task_status:
+                return self.task_status[job_id].get("preview_360p")
         return None
 
     def is_proxy_in_progress(self, job_id: str) -> bool:
@@ -146,7 +198,9 @@ class MediaPrepService:
 
                 logger.info(f"[MediaPrep] 开始执行任务: {task_type} - {job_id}")
 
-                if task_type == "proxy_720p":
+                if task_type == "preview_360p":
+                    self._execute_preview_task(task)
+                elif task_type == "proxy_720p":
                     self._execute_proxy_task(task)
 
                 self.task_queue.task_done()
@@ -156,9 +210,106 @@ class MediaPrepService:
 
         logger.info("[MediaPrep] 消费线程已停止")
 
+    def _execute_preview_task(self, task: dict):
+        """
+        执行 360p 预览视频转码任务（在独立线程中）
+        使用更快的编码预设，优先快速生成
+        """
+        job_id = task["job_id"]
+        video_path = Path(task["video_path"])
+        output_path = Path(task["output_path"])
+
+        # 更新状态
+        with self.lock:
+            self.task_status[job_id]["preview_360p"]["status"] = "processing"
+
+        try:
+            # 获取视频时长
+            duration = self._get_video_duration(video_path)
+
+            # 构建 FFmpeg 命令 - 360p 快速预览
+            ffmpeg_cmd = config.get_ffmpeg_command()
+            cmd = [
+                ffmpeg_cmd,
+                '-i', str(video_path),
+                '-vf', 'scale=-2:360',      # 360p 分辨率
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',     # 最快编码（牺牲质量）
+                '-crf', '28',               # 中等质量
+                '-g', '30',                 # 关键帧间隔
+                '-an',                      # 去掉音频（减小体积 + 加速）
+                '-movflags', '+faststart',  # 优化拖动
+                '-progress', 'pipe:1',
+                '-y',
+                str(output_path)
+            ]
+
+            logger.info(f"[MediaPrep] 开始转码 360p 预览: {video_path.name} -> preview_360p.mp4")
+
+            # 同步执行 FFmpeg
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=creationflags
+            )
+
+            # 解析进度
+            last_logged_progress = 0  # 记录上次日志输出的进度
+            for line in process.stdout:
+                line_str = line.decode().strip()
+                if line_str.startswith('out_time_ms='):
+                    try:
+                        out_time_ms = int(line_str.split('=')[1])
+                        if duration > 0:
+                            progress = min(100, (out_time_ms / 1000000) / duration * 100)
+                            progress = round(progress, 1)
+
+                            # 更新状态
+                            with self.lock:
+                                self.task_status[job_id]["preview_360p"]["progress"] = progress
+
+                            # 推送 SSE 进度
+                            self._push_preview_progress(job_id, progress)
+
+                            # 每10%输出一次日志
+                            if progress >= last_logged_progress + 10:
+                                logger.info(f"[MediaPrep] 360p 转码进度: {job_id} - {progress:.1f}%")
+                                last_logged_progress = int(progress / 10) * 10
+                    except:
+                        pass
+
+            process.wait()
+
+            if process.returncode == 0 and output_path.exists():
+                # 成功
+                with self.lock:
+                    self.task_status[job_id]["preview_360p"]["status"] = "completed"
+                    self.task_status[job_id]["preview_360p"]["progress"] = 100
+
+                logger.info(f"[MediaPrep] 360p预览转码完成: {output_path}")
+                self._push_preview_progress(job_id, 100, completed=True)
+            else:
+                # 失败
+                stderr = process.stderr.read().decode() if process.stderr else ""
+                with self.lock:
+                    self.task_status[job_id]["preview_360p"]["status"] = "failed"
+                    self.task_status[job_id]["preview_360p"]["error"] = stderr[:500]
+
+                logger.error(f"[MediaPrep] 360p预览转码失败: {stderr[:200]}")
+
+        except Exception as e:
+            with self.lock:
+                self.task_status[job_id]["preview_360p"]["status"] = "failed"
+                self.task_status[job_id]["preview_360p"]["error"] = str(e)
+
+            logger.error(f"[MediaPrep] 360p预览转码异常: {e}", exc_info=True)
+
     def _execute_proxy_task(self, task: dict):
         """
-        执行 Proxy 转码任务（在独立线程中）
+        执行 720p Proxy 转码任务（在独立线程中）
+        特点：检测转录队列状态，如有新任务则降低优先级，不阻塞转录
         """
         job_id = task["job_id"]
         video_path = Path(task["video_path"])
@@ -171,6 +322,9 @@ class MediaPrepService:
         try:
             # 获取视频时长
             duration = self._get_video_duration(video_path)
+
+            # 检查转录队列是否繁忙（有新任务进入）
+            queue_busy = self._is_transcription_queue_busy()
 
             # 构建 FFmpeg 命令
             ffmpeg_cmd = config.get_ffmpeg_command()
@@ -190,9 +344,12 @@ class MediaPrepService:
                 str(output_path)
             ]
 
-            logger.info(f"[MediaPrep] 开始转码: {video_path.name} -> proxy.mp4")
+            if queue_busy:
+                logger.info(f"[MediaPrep] 检测到队列繁忙，720p 转码将使用低优先级: {job_id}")
+            else:
+                logger.info(f"[MediaPrep] 开始 720p 转码: {video_path.name} -> proxy.mp4")
 
-            # 同步执行 FFmpeg
+            # 启动 FFmpeg 进程
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             process = subprocess.Popen(
                 cmd,
@@ -201,7 +358,12 @@ class MediaPrepService:
                 creationflags=creationflags
             )
 
+            # 如果队列繁忙，降低 FFmpeg 进程优先级
+            if queue_busy:
+                self._set_low_priority(process.pid)
+
             # 解析进度
+            last_logged_progress = 0  # 记录上次日志输出的进度
             for line in process.stdout:
                 line_str = line.decode().strip()
                 if line_str.startswith('out_time_ms='):
@@ -217,6 +379,11 @@ class MediaPrepService:
 
                             # 推送 SSE 进度
                             self._push_proxy_progress(job_id, progress)
+
+                            # 每10%输出一次日志
+                            if progress >= last_logged_progress + 10:
+                                logger.info(f"[MediaPrep] 720p 转码进度: {job_id} - {progress:.1f}%")
+                                last_logged_progress = int(progress / 10) * 10
                     except:
                         pass
 
@@ -228,7 +395,7 @@ class MediaPrepService:
                     self.task_status[job_id]["proxy_720p"]["status"] = "completed"
                     self.task_status[job_id]["proxy_720p"]["progress"] = 100
 
-                logger.info(f"[MediaPrep] 转码完成: {output_path}")
+                logger.info(f"[MediaPrep] 720p 转码完成: {output_path}")
                 self._push_proxy_progress(job_id, 100, completed=True)
             else:
                 # 失败
@@ -237,14 +404,66 @@ class MediaPrepService:
                     self.task_status[job_id]["proxy_720p"]["status"] = "failed"
                     self.task_status[job_id]["proxy_720p"]["error"] = stderr[:500]
 
-                logger.error(f"[MediaPrep] 转码失败: {stderr[:200]}")
+                logger.error(f"[MediaPrep] 720p 转码失败: {stderr[:200]}")
 
         except Exception as e:
             with self.lock:
                 self.task_status[job_id]["proxy_720p"]["status"] = "failed"
                 self.task_status[job_id]["proxy_720p"]["error"] = str(e)
 
-            logger.error(f"[MediaPrep] 转码异常: {e}", exc_info=True)
+            logger.error(f"[MediaPrep] 720p 转码异常: {e}", exc_info=True)
+
+    def _is_transcription_queue_busy(self) -> bool:
+        """检查转录队列是否繁忙（有活跃任务）"""
+        try:
+            from app.services.job_queue_service import get_job_queue
+
+            job_queue = get_job_queue()
+            if not job_queue:
+                return False
+
+            # 检查是否有正在处理或等待的任务
+            active_jobs = [
+                j for j in job_queue.jobs.values()
+                if j.status in ['pending', 'processing', 'queued']
+            ]
+
+            return len(active_jobs) > 0
+
+        except Exception as e:
+            logger.debug(f"[MediaPrep] 检查队列状态失败: {e}")
+            return False
+
+    def _set_low_priority(self, pid: int):
+        """设置进程为低优先级（Windows 和 Linux）"""
+        try:
+            if os.name == 'nt':
+                # Windows: 使用 psutil 设置为低于正常优先级
+                try:
+                    import psutil
+                    p = psutil.Process(pid)
+                    p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+                    logger.info(f"[MediaPrep] 已设置进程 {pid} 为低优先级（Windows）")
+                except ImportError:
+                    # 如果没有 psutil，使用 wmic（备选方案）
+                    subprocess.run(
+                        ['wmic', 'process', 'where', f'ProcessId={pid}', 'CALL', 'setpriority', '16384'],
+                        capture_output=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                    logger.info(f"[MediaPrep] 已设置进程 {pid} 为低优先级（wmic）")
+            else:
+                # Linux/Unix: 使用 nice 值
+                try:
+                    import psutil
+                    p = psutil.Process(pid)
+                    p.nice(10)  # nice 值 10（较低优先级）
+                    logger.info(f"[MediaPrep] 已设置进程 {pid} 为低优先级（nice=10）")
+                except:
+                    pass
+
+        except Exception as e:
+            logger.debug(f"[MediaPrep] 设置低优先级失败: {e}")
 
     def _get_video_duration(self, video_path: Path) -> float:
         """获取视频时长（秒）"""
@@ -266,6 +485,30 @@ class MediaPrepService:
             return float(result.stdout.strip())
         except:
             return 0
+
+    def _push_preview_progress(self, job_id: str, progress: float, completed: bool = False):
+        """推送 360p 预览进度到 SSE"""
+        try:
+            from app.services.sse_service import get_sse_manager
+            sse_manager = get_sse_manager()
+
+            channel_id = f"job:{job_id}"
+            event_type = "preview_360p_complete" if completed else "preview_360p_progress"
+
+            data = {
+                "job_id": job_id,
+                "progress": progress,
+                "completed": completed,
+                "resolution": "360p"
+            }
+
+            if completed:
+                data["video_url"] = f"/api/media/{job_id}/video/preview"
+
+            sse_manager.broadcast_sync(channel_id, event_type, data)
+        except Exception as e:
+            # SSE 推送失败不影响转码
+            pass
 
     def _push_proxy_progress(self, job_id: str, progress: float, completed: bool = False):
         """推送 Proxy 进度到 SSE"""
