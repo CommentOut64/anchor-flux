@@ -8,6 +8,8 @@ import logging
 import gc
 import json
 import os
+import sys
+import asyncio
 from collections import deque
 from typing import Dict, Optional, Literal
 from pathlib import Path
@@ -20,6 +22,56 @@ logger = logging.getLogger(__name__)
 
 # 插队模式类型
 PrioritizeMode = Literal["gentle", "force"]
+
+
+def _run_async_safely(coro):
+    """
+    安全地运行异步协程，处理 Windows ProactorEventLoop 的已知问题。
+
+    在 Windows 上，当使用 asyncio.run() 运行包含子进程的异步代码时，
+    事件循环关闭后可能会触发 _ProactorBasePipeTransport._call_connection_lost 回调，
+    导致 "Exception in callback" 错误。这是 Python asyncio 在 Windows 上的已知问题。
+
+    解决方案：
+    1. 手动创建和管理事件循环
+    2. 在关闭前等待所有传输完成
+    3. 忽略关闭时的无害异常
+    """
+    if sys.platform == 'win32':
+        # Windows 特殊处理
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            try:
+                # 取消所有待处理的任务
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                # 运行一次以让取消生效
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                # 关闭所有异步生成器
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                # Python 3.9+ 提供了 shutdown_default_executor
+                if hasattr(loop, 'shutdown_default_executor'):
+                    loop.run_until_complete(loop.shutdown_default_executor())
+            except Exception:
+                pass
+            finally:
+                # 关闭事件循环前等待一小段时间，让传输完成清理
+                try:
+                    # 给 ProactorEventLoop 一点时间完成管道清理
+                    import time
+                    time.sleep(0.1)
+                except Exception:
+                    pass
+                loop.close()
+                asyncio.set_event_loop(None)
+    else:
+        # 非 Windows 平台使用标准方式
+        return asyncio.run(coro)
 
 
 class JobQueueService:
@@ -327,13 +379,11 @@ class JobQueueService:
                     if use_dual_alignment:
                         # 双流对齐流水线 (V3.0+ 新架构)
                         logger.info(f"使用双流对齐流水线 (preset={preset_id})")
-                        import asyncio
-                        asyncio.run(self._run_dual_alignment_pipeline(job, preset_id))
+                        _run_async_safely(self._run_dual_alignment_pipeline(job, preset_id))
                     elif engine == 'sensevoice':
                         # SenseVoice 流水线（旧架构，仅 default 预设）
                         logger.info(f"使用 SenseVoice 流水线 (极速模式)")
-                        import asyncio
-                        asyncio.run(self.transcription_service._process_video_sensevoice(job))
+                        _run_async_safely(self.transcription_service._process_video_sensevoice(job))
                     else:
                         # Whisper 流水线（同步，使用三点采样）
                         logger.info(f"使用 Whisper 流水线")
