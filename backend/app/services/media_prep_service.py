@@ -441,6 +441,7 @@ class MediaPrepService:
             keyint_min = preview_config.get('keyint_min', gop // 2)
             tune = preview_config.get('tune', 'fastdecode')
             include_audio = preview_config.get('audio', False)
+            audio_bitrate = preview_config.get('audio_bitrate', '64k')
 
             # 构建 FFmpeg 命令 - 360p 快速预览（参数从配置读取）
             ffmpeg_cmd = config.get_ffmpeg_command()
@@ -459,7 +460,7 @@ class MediaPrepService:
 
             # 音频处理
             if include_audio:
-                cmd.extend(['-c:a', 'aac', '-b:a', '64k'])
+                cmd.extend(['-c:a', 'aac', '-b:a', audio_bitrate])
             else:
                 cmd.append('-an')  # 无音频
 
@@ -517,6 +518,30 @@ class MediaPrepService:
 
                 logger.info(f"[MediaPrep] 360p预览转码完成: {output_path}")
                 self._push_preview_progress(job_id, 100, completed=True)
+
+                # 【新增】360p完成后，延迟10秒检查队列是否空闲，如果空闲则自动启动720p
+                # 使用独立线程避免阻塞当前任务
+                import threading
+                def delayed_720p_check():
+                    import time
+                    time.sleep(10)  # 等待10秒
+
+                    # 检查队列是否空闲
+                    queue_idle = self._is_transcription_queue_idle()
+                    logger.info(f"[MediaPrep] 360p完成后10秒检查: 队列空闲={queue_idle}")
+
+                    if queue_idle:
+                        # 队列空闲，自动启动720p
+                        proxy_720p = output_path.parent / "proxy_720p.mp4"
+                        if not proxy_720p.exists():
+                            # 检查720p是否已在队列中
+                            proxy_status = self.get_proxy_status(job_id)
+                            if not proxy_status or proxy_status.get("status") not in ["queued", "processing"]:
+                                logger.info(f"[MediaPrep] 360p完成后队列空闲，自动启动720p: {job_id}")
+                                self.enqueue_proxy(job_id, video_path, proxy_720p, priority=10)
+
+                thread = threading.Thread(target=delayed_720p_check, daemon=True)
+                thread.start()
             else:
                 # 失败
                 error_msg = f"FFmpeg 返回码: {process.returncode}"

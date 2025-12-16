@@ -1174,8 +1174,11 @@ class TranscriptionService:
             from app.core.config import config
             from app.services.media_prep_service import get_media_prep_service
 
+            self.logger.info(f"[720p] 开始检查是否需要触发720p转码: {job_id}")
+
             job_dir = config.JOBS_DIR / job_id
             if not job_dir.exists():
+                self.logger.info(f"[720p] 任务目录不存在，跳过: {job_id}")
                 return
 
             # 查找视频文件
@@ -1187,12 +1190,16 @@ class TranscriptionService:
                     break
 
             if not video_file:
+                self.logger.info(f"[720p] 未找到视频文件，跳过: {job_id}")
                 return
 
-            proxy_video = job_dir / "proxy.mp4"
+            self.logger.info(f"[720p] 找到视频文件: {video_file.name}")
+
+            # 使用正确的文件名：proxy_720p.mp4
+            proxy_720p = job_dir / "proxy_720p.mp4"
 
             # 720p 已存在则跳过
-            if proxy_video.exists():
+            if proxy_720p.exists():
                 self.logger.info(f"[720p] 已存在，跳过: {job_id}")
                 return
 
@@ -1201,20 +1208,40 @@ class TranscriptionService:
             # 检查 720p 是否已在队列中
             proxy_status = media_prep.get_proxy_status(job_id)
             if proxy_status and proxy_status.get("status") in ["queued", "processing", "completed"]:
-                self.logger.info(f"[720p] 任务已存在或完成，跳过: {job_id}")
+                self.logger.info(f"[720p] 任务已存在或完成（状态={proxy_status.get('status')}），跳过: {job_id}")
+                return
+
+            # 检查 360p 预览是否已完成（必须先有360p才能启动720p）
+            # 修复：优先检查文件是否存在，因为内存状态可能在服务重启后丢失
+            preview_360p = job_dir / "preview_360p.mp4"
+
+            # 文件存在即认为360p已完成（内存状态可能丢失）
+            if preview_360p.exists():
+                preview_completed = True
+                self.logger.debug(f"[720p] 360p文件存在，认为已完成: {job_id}")
+            else:
+                # 文件不存在，检查内存状态（可能正在转码中）
+                preview_status = media_prep.get_preview_status(job_id)
+                preview_completed = preview_status and preview_status.get("status") == "completed"
+
+            if not preview_completed:
+                self.logger.info(f"[720p] 360p预览未完成，跳过720p转码: {job_id}")
                 return
 
             # 检查转录队列是否空闲
             queue_idle = self._is_transcription_queue_idle()
+            self.logger.info(f"[720p] 队列空闲状态: {queue_idle}")
 
             if queue_idle:
                 # 队列空闲，立即启动（正常优先级）
                 self.logger.info(f"[720p] 队列空闲，立即启动转码: {job_id}")
-                media_prep.enqueue_proxy(job_id, video_file, proxy_video, priority=10)
+                success = media_prep.enqueue_proxy(job_id, video_file, proxy_720p, priority=10)
+                self.logger.info(f"[720p] 入队结果: {success}")
             else:
                 # 队列繁忙，使用低优先级（独立进程模式）
                 self.logger.info(f"[720p] 队列繁忙，低优先级排队: {job_id}")
-                media_prep.enqueue_proxy(job_id, video_file, proxy_video, priority=100)
+                success = media_prep.enqueue_proxy(job_id, video_file, proxy_720p, priority=1)
+                self.logger.info(f"[720p] 入队结果: {success}")
 
         except Exception as e:
             self.logger.warning(f"[720p] 触发转码失败（非致命）: {e}")

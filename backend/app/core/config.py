@@ -146,7 +146,8 @@ class ProjectConfig:
                 "crf": 28,
                 "gop": 30,              # 关键帧间隔
                 "keyint_min": 15,       # 最小关键帧间隔
-                "audio": False,         # 无音频（加速生成）
+                "audio": True,          # 包含音频（字幕编辑必需）
+                "audio_bitrate": "64k", # 低码率音频（加速生成）
                 "tune": "fastdecode",   # 优化解码速度
             },
             # 720p 高清参数（平衡质量和速度）
