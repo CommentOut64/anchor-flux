@@ -264,6 +264,29 @@ provide('editorContext', {
   isVideoReady: computed(() => proxyVideo.isReady.value)
 })
 
+// 调试：监听 proxyVideo 状态变化
+watch(() => proxyVideo.currentUrl.value, (newUrl, oldUrl) => {
+  console.log('[EditorView] proxyVideo.currentUrl 变化:', {
+    oldUrl,
+    newUrl,
+    state: proxyVideo.state.value,
+    isReady: proxyVideo.isReady.value,
+    urls: {
+      preview360p: proxyVideo.urls.value.preview360p,
+      proxy720p: proxyVideo.urls.value.proxy720p,
+      source: proxyVideo.urls.value.source
+    }
+  })
+})
+
+watch(() => proxyVideo.state.value, (newState, oldState) => {
+  console.log('[EditorView] proxyVideo.state 变化:', {
+    oldState,
+    newState,
+    currentUrl: proxyVideo.currentUrl.value
+  })
+})
+
 // ========== 计算属性 ==========
 
 // 项目名称

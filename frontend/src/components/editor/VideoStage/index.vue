@@ -123,7 +123,7 @@ const props = defineProps({
   currentResolution: String,        // 当前分辨率 ('360p', '720p', 'source')
   isUpgrading: { type: Boolean, default: false },  // 是否正在升级
   upgradeProgress: { type: Number, default: 0 },    // 升级进度
-  // 新增：Proxy 状态（来自 useProxyVideo）
+  // Proxy 状态（来自 useProxyVideo）
   proxyState: { type: String, default: null },      // ProxyState 枚举值
   proxyError: { type: String, default: null }       // Proxy 错误信息
 })
@@ -371,6 +371,18 @@ watch(() => projectStore.player.volume, (volume) => {
   if (videoRef.value) videoRef.value.volume = volume
 })
 
+// 调试：监听 effectiveVideoSource 变化
+watch(effectiveVideoSource, (newUrl, oldUrl) => {
+  console.log('[VideoStage] effectiveVideoSource 变化:', {
+    oldUrl,
+    newUrl,
+    progressiveUrl: props.progressiveUrl,
+    proxyState: props.proxyState,
+    isProcessing: isProcessing.value,
+    isProgressiveMode: isProgressiveMode.value
+  })
+})
+
 // 监听转码状态变化（刷新后恢复时清除错误状态）
 watch(() => props.isUpgrading, (isUpgrading) => {
   if (isUpgrading) {
@@ -508,7 +520,8 @@ watch(() => props.progressiveUrl, async (newUrl, oldUrl) => {
   }
 })
 
-// 事件处理
+// ========== 事件处理 ==========
+
 function onMetadataLoaded() {
   const video = videoRef.value
   projectStore.meta.duration = video.duration
