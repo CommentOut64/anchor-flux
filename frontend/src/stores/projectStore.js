@@ -24,15 +24,8 @@ export const useProjectStore = defineStore("project", () => {
     hasProxyVideo: false, // 是否有 Proxy 视频
     lastSaved: Date.now(), // 最后保存时间
     isDirty: false, // 是否有未保存修改
-    // 渐进式加载相关
-    needsTranscode: false, // 是否需要转码
-    transcodeReason: "", // 转码原因
+    // 渐进式加载相关（状态由 useProxyVideo composable 管理）
     currentResolution: null, // 当前视频分辨率 ('360p', '720p', 'source')
-    videoStatus: {
-      preview360p: false, // 是否有 360p 预览
-      proxy720p: false, // 是否有 720p Proxy
-      sourceCompatible: false, // 源视频是否兼容浏览器
-    },
   });
 
   // ========== 2. 字幕数据（Single Source of Truth） ==========
@@ -597,15 +590,8 @@ export const useProjectStore = defineStore("project", () => {
       hasProxyVideo: false,
       lastSaved: Date.now(),
       isDirty: false,
-      // 渐进式加载相关
-      needsTranscode: false,
-      transcodeReason: "",
+      // 渐进式加载相关（状态由 useProxyVideo composable 管理）
       currentResolution: null,
-      videoStatus: {
-        preview360p: false,
-        proxy720p: false,
-        sourceCompatible: false,
-      },
     };
     player.value = {
       currentTime: 0,
