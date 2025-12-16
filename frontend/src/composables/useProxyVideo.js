@@ -58,6 +58,9 @@ export function useProxyVideo(jobIdInput) {
     source: null
   })
 
+  // 待替换的720p URL（用于延迟替换）
+  const pending720pUrl = ref(null)
+
   // SSE 订阅状态
   const isSubscribed = ref(false)
   let unsubscribeSSE = null
@@ -198,19 +201,34 @@ export function useProxyVideo(jobIdInput) {
       // 此处不立即切换到 TRANSCODING_720，等待后端推送
     },
 
-    // 720p Proxy 进度
+    // 720p Proxy 进度（后台静默转码，不更新状态）
     onProxyProgress: (data) => {
-      console.log('[useProxyVideo] 720p 进度:', data.progress)
-      state.value = ProxyState.TRANSCODING_720
-      progress.value = data.progress || 0
+      console.log('[useProxyVideo] 720p 后台转码进度:', data.progress)
+      // 如果当前已有可播放视频（360p 或 source），保持当前状态，不显示转码提示
+      // 只在内部记录进度，用于调试
+      if (state.value === ProxyState.IDLE || state.value === ProxyState.ANALYZING) {
+        // 如果当前没有可播放视频，才显示转码状态
+        state.value = ProxyState.TRANSCODING_720
+        progress.value = data.progress || 0
+      }
+      // 否则静默转码，不更新 UI 状态
     },
 
-    // 720p Proxy 完成
+    // 720p Proxy 完成（立即无缝替换）
     onProxyComplete: (data) => {
-      console.log('[useProxyVideo] 720p 完成:', data)
+      console.log('[useProxyVideo] 720p 完成，准备替换:', data)
+      const new720pUrl = data.video_url || `/api/media/${jobId.value}/video`
+
+      console.log('[useProxyVideo] 立即更新720p URL，触发无缝切换')
+      urls.value.proxy720p = new720pUrl
       state.value = ProxyState.READY_720P
-      urls.value.proxy720p = data.video_url || `/api/media/${jobId.value}/video`
-      progress.value = 100
+      progress.value = 0
+
+      console.log('[useProxyVideo] 720p URL已更新:', {
+        proxy720p: urls.value.proxy720p,
+        preview360p: urls.value.preview360p,
+        state: state.value
+      })
     },
 
     // Proxy 错误
@@ -320,6 +338,35 @@ export function useProxyVideo(jobIdInput) {
     await initialize()
   }
 
+  /**
+   * 执行720p替换（由 VideoStage 在合适的时机调用）
+   */
+  function apply720pUpgrade() {
+    if (!pending720pUrl.value) {
+      console.log('[useProxyVideo] 没有待替换的720p URL')
+      return false
+    }
+
+    console.log('[useProxyVideo] 执行720p替换:', {
+      pending: pending720pUrl.value,
+      currentState: state.value,
+      current720p: urls.value.proxy720p,
+      current360p: urls.value.preview360p
+    })
+
+    urls.value.proxy720p = pending720pUrl.value
+    state.value = ProxyState.READY_720P
+    pending720pUrl.value = null  // 清除待替换状态
+    progress.value = 0
+
+    console.log('[useProxyVideo] 720p替换完成，新的URLs:', {
+      proxy720p: urls.value.proxy720p,
+      preview360p: urls.value.preview360p
+    })
+
+    return true
+  }
+
   // ========== 生命周期 ==========
 
   onMounted(() => {
@@ -347,6 +394,16 @@ export function useProxyVideo(jobIdInput) {
     }
   })
 
+  // 调试：监听 currentUrl 变化
+  watch(currentUrl, (newUrl, oldUrl) => {
+    console.log('[useProxyVideo] currentUrl 变化:', {
+      oldUrl,
+      newUrl,
+      state: state.value,
+      urls: { ...urls.value }
+    })
+  })
+
   // ========== 返回值 ==========
   return {
     // 状态
@@ -370,6 +427,10 @@ export function useProxyVideo(jobIdInput) {
     refresh,
     subscribeSSE,
     unsubscribe,
+    apply720pUpgrade,  // 执行720p替换
+
+    // 待替换状态
+    pending720pUrl,
 
     // SSE 处理器（供外部直接调用）
     handlers: sseHandlers,
