@@ -49,14 +49,17 @@
             :job-id="jobId"
             :show-subtitle="true"
             :enable-keyboard="false"
-            :progressive-url="videoStatus.currentUrl.value"
-            :current-resolution="videoStatus.currentResolution.value"
-            :is-upgrading="videoStatus.isUpgrading.value"
-            :upgrade-progress="videoStatus.upgradeProgress.value"
+            :progressive-url="proxyVideo.currentUrl.value"
+            :current-resolution="proxyVideo.currentResolution.value"
+            :is-upgrading="proxyVideo.isUpgrading.value"
+            :upgrade-progress="proxyVideo.progress.value"
+            :proxy-state="proxyVideo.state.value"
+            :proxy-error="proxyVideo.error.value"
             @loaded="handleVideoLoaded"
             @error="handleVideoError"
             @check-status="handleCheckVideoStatus"
             @resolution-change="handleResolutionChange"
+            @retry="proxyVideo.retry"
           />
         </div>
 
@@ -205,7 +208,7 @@ import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { mediaApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
-import { useVideoStatus } from '@/composables/useVideoStatus'
+import { useProxyVideo } from '@/composables/useProxyVideo'
 
 // 组件导入
 import EditorHeader from '@/components/editor/EditorHeader.vue'
@@ -224,8 +227,8 @@ const router = useRouter()
 const projectStore = useProjectStore()
 const taskStore = useUnifiedTaskStore()
 
-// 渐进式视频加载状态
-const videoStatus = useVideoStatus(props.jobId)
+// Proxy 视频加载状态（新重构版本）
+const proxyVideo = useProxyVideo(props.jobId)
 
 // Refs
 const videoStageRef = ref(null)
@@ -251,7 +254,15 @@ let sseUnsubscribe = null
 let progressPollTimer = null
 
 // Provide 编辑器上下文
-provide('editorContext', { jobId: props.jobId, saving })
+// ========== Provide 上下文 ==========
+
+// 提供编辑器上下文给子组件
+provide('editorContext', {
+  jobId: props.jobId,
+  saving,
+  // 视频就绪状态（用于播放控制拦截）
+  isVideoReady: computed(() => proxyVideo.isReady.value)
+})
 
 // ========== 计算属性 ==========
 
@@ -349,9 +360,8 @@ async function loadProject() {
         console.log('[EditorView] 任务已暂停，订阅SSE以接收恢复信号')
         subscribeSSE()
       } else if (jobStatus.status === 'finished') {
-        // 任务已完成但视频可能仍在后台转码，此时需要重新拉取转码状态并订阅proxy事件
-        console.log('[EditorView] 本地恢复后任务已完成，检查视频转码状态')
-        await checkAndSubscribeProxySSE()
+        // 任务已完成，useProxyVideo会自动处理视频转码状态
+        console.log('[EditorView] 本地恢复后任务已完成，useProxyVideo将自动检查视频转码状态')
       }
       return
     }
@@ -359,8 +369,7 @@ async function loadProject() {
     // 3. 根据任务状态从后端加载字幕数据
     if (jobStatus.status === 'finished') {
       await loadCompletedSRT()
-      // 检查视频状态，必要时订阅 SSE 等待 proxy 完成
-      await checkAndSubscribeProxySSE()
+      // useProxyVideo会自动检查视频状态
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
       isTranscribing.value = true
       await loadTranscribingSegments()
@@ -461,67 +470,6 @@ function formatSRTTime(seconds) {
 
 // ========== SSE 实时更新 ==========
 
-/**
- * 检查视频状态，必要时订阅 SSE 等待 proxy 完成
- * 用于 finished 状态的任务，解决 H265 转码完成后 URL 不更新的问题
- */
-async function checkAndSubscribeProxySSE() {
-  try {
-    // 1. 获取当前视频状态
-    const progressiveStatus = await mediaApi.getProgressiveStatus(props.jobId)
-
-    // 2. 检查是否需要等待转码
-    const needsProxy = progressiveStatus.needs_transcode &&
-                       !progressiveStatus.proxy_720p?.exists
-
-    // 3. 检查是否正在转码中
-    const isProxyProcessing = progressiveStatus.proxy_720p?.status?.progress > 0 &&
-                              progressiveStatus.proxy_720p?.status?.progress < 100
-
-    if (needsProxy || isProxyProcessing) {
-      console.log('[EditorView] 视频需要转码或正在转码，订阅 SSE 等待 proxy 完成')
-      subscribeProxySSE()
-    } else {
-      console.log('[EditorView] 视频已就绪，无需订阅 proxy SSE')
-    }
-  } catch (error) {
-    console.warn('[EditorView] 检查视频状态失败:', error)
-  }
-}
-
-/**
- * 仅订阅 proxy 相关事件的精简 SSE
- * 用于 finished 任务等待视频转码完成
- */
-function subscribeProxySSE() {
-  // 如果已经订阅，先取消
-  if (sseUnsubscribe) {
-    console.log('[EditorView] 已存在SSE订阅，先取消')
-    sseUnsubscribe()
-    sseUnsubscribe = null
-  }
-
-  console.log('[EditorView] 订阅 Proxy SSE:', props.jobId)
-
-  sseUnsubscribe = sseChannelManager.subscribeJob(props.jobId, {
-    onProxyProgress(data) {
-      console.log('[EditorView] Proxy 转码进度:', data.progress)
-      videoStatus.handleProxyProgress(data)
-    },
-
-    onProxyComplete(data) {
-      console.log('[EditorView] Proxy 转码完成:', data)
-      videoStatus.handleProxyComplete(data)
-      // 转码完成后关闭 SSE
-      cleanupSSE()
-    },
-
-    onConnected() {
-      console.log('[EditorView] Proxy SSE 连接成功')
-    }
-  })
-}
-
 function subscribeSSE() {
   // 如果已经订阅，先取消避免重复订阅
   if (sseUnsubscribe) {
@@ -618,30 +566,6 @@ function subscribeSSE() {
       refreshTaskProgress()
     },
 
-    // 新增：360p 预览进度
-    onPreview360pProgress(data) {
-      console.log('[EditorView] 收到 360p 预览进度事件:', data.progress)
-      videoStatus.handlePreview360pProgress(data)
-    },
-
-    // 新增：360p 预览完成
-    onPreview360pComplete(data) {
-      console.log('[EditorView] 收到 360p 预览完成事件:', data)
-      videoStatus.handlePreview360pComplete(data)
-    },
-
-    // 新增：720p Proxy 进度
-    onProxyProgress(data) {
-      console.log('[EditorView] 收到SSE Proxy进度事件:', data.progress)
-      videoStatus.handleProxyProgress(data)
-    },
-
-    // 新增：720p Proxy 完成
-    onProxyComplete(data) {
-      console.log('[EditorView] 收到SSE Proxy完成事件，完整数据:', data)
-      videoStatus.handleProxyComplete(data)
-    },
-
     // 新增：SenseVoice 流式字幕事件
     onSubtitleUpdate(data) {
       console.log('[EditorView] 收到字幕更新:', data)
@@ -679,6 +603,40 @@ function subscribeSSE() {
     // 新增：熔断事件
     onCircuitBreaker(data) {
       console.log('[EditorView] 熔断触发:', data)
+    },
+
+    // === Proxy 视频转码事件（转发到 useProxyVideo）===
+    onAnalyzeComplete(data) {
+      console.log('[EditorView] 转发 analyze_complete 到 useProxyVideo')
+      proxyVideo.handlers.onAnalyzeComplete(data)
+    },
+    onRemuxProgress(data) {
+      console.log('[EditorView] 转发 remux_progress 到 useProxyVideo')
+      proxyVideo.handlers.onRemuxProgress(data)
+    },
+    onRemuxComplete(data) {
+      console.log('[EditorView] 转发 remux_complete 到 useProxyVideo')
+      proxyVideo.handlers.onRemuxComplete(data)
+    },
+    onPreview360pProgress(data) {
+      console.log('[EditorView] 转发 preview_360p_progress 到 useProxyVideo')
+      proxyVideo.handlers.onPreview360pProgress(data)
+    },
+    onPreview360pComplete(data) {
+      console.log('[EditorView] 转发 preview_360p_complete 到 useProxyVideo')
+      proxyVideo.handlers.onPreview360pComplete(data)
+    },
+    onProxyProgress(data) {
+      console.log('[EditorView] 转发 proxy_progress 到 useProxyVideo')
+      proxyVideo.handlers.onProxyProgress(data)
+    },
+    onProxyComplete(data) {
+      console.log('[EditorView] 转发 proxy_complete 到 useProxyVideo')
+      proxyVideo.handlers.onProxyComplete(data)
+    },
+    onProxyError(data) {
+      console.log('[EditorView] 转发 proxy_error 到 useProxyVideo')
+      proxyVideo.handlers.onProxyError(data)
     }
   })
 }
@@ -1015,23 +973,17 @@ function handleVideoError(error) {
 }
 
 async function handleCheckVideoStatus() {
-  console.log('[EditorView] 视频加载失败，检查转码状态...')
+  console.log('[EditorView] 视频加载失败，刷新 Proxy 视频状态...')
   try {
-    // 刷新视频状态，检查是否正在转码
-    await videoStatus.fetchProgressiveStatus()
-    console.log('[EditorView] 视频状态已更新:', {
-      isUpgrading: videoStatus.isUpgrading.value,
-      currentStage: videoStatus.currentStage.value,
-      needsTranscode: videoStatus.needsTranscode.value
+    // 刷新 proxyVideo 状态（会从后端重新获取状态并自动订阅SSE）
+    await proxyVideo.refresh()
+    console.log('[EditorView] Proxy 视频状态已刷新:', {
+      state: proxyVideo.state.value,
+      isReady: proxyVideo.isReady.value,
+      isTranscoding: proxyVideo.isTranscoding.value
     })
-
-    // 如果检测到正在转码，确保订阅 SSE 事件
-    if (videoStatus.needsTranscode.value || videoStatus.isUpgrading.value) {
-      console.log('[EditorView] 检测到视频正在转码，确保订阅 SSE 事件')
-      await checkAndSubscribeProxySSE()
-    }
   } catch (error) {
-    console.error('[EditorView] 检查视频状态失败:', error)
+    console.error('[EditorView] 刷新 Proxy 视频状态失败:', error)
   }
 }
 

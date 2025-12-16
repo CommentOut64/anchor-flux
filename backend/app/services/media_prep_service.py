@@ -10,15 +10,34 @@ import logging
 import subprocess
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any, Literal
+from typing import Optional, Dict, Any, Literal, Callable
 from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
 
 from app.core.config import config
 
 logger = logging.getLogger(__name__)
 
 # 任务类型
-TaskType = Literal["preview_360p", "proxy_720p", "waveform", "thumbnail"]
+TaskType = Literal["preview_360p", "proxy_720p", "remux", "waveform", "thumbnail"]
+
+
+class TranscodeDecision(Enum):
+    """
+    转码决策类型
+
+    决策优先级:
+    1. DIRECT_PLAY - 容器和编解码器都兼容，可直接播放
+    2. REMUX_ONLY - 容器不兼容但编解码器兼容，仅需重封装（零转码）
+    3. TRANSCODE_AUDIO - 仅音频编解码器不兼容
+    4. TRANSCODE_VIDEO - 仅视频编解码器不兼容
+    5. TRANSCODE_FULL - 完整转码
+    """
+    DIRECT_PLAY = "direct_play"          # 直接播放，无需任何处理
+    REMUX_ONLY = "remux_only"            # 仅重封装（-c:v copy -c:a copy）
+    TRANSCODE_AUDIO = "transcode_audio"  # 仅转码音频
+    TRANSCODE_VIDEO = "transcode_video"  # 仅转码视频
+    TRANSCODE_FULL = "transcode_full"    # 完整转码
 
 
 class MediaPrepService:
@@ -180,6 +199,190 @@ class MediaPrepService:
             return status.get("status") in ["queued", "processing"]
         return False
 
+    def analyze_transcode_decision(self, video_info: dict) -> TranscodeDecision:
+        """
+        智能分析转码决策
+
+        决策优先级：
+        1. 容器和编解码器都兼容 -> DIRECT_PLAY
+        2. 容器不兼容但编解码器兼容 -> REMUX_ONLY（零转码，极速）
+        3. 仅音频编解码器不兼容 -> TRANSCODE_AUDIO
+        4. 视频编解码器不兼容 -> TRANSCODE_FULL
+
+        Args:
+            video_info: 媒体分析结果，包含 video.codec, audio.codec, container 等
+
+        Returns:
+            TranscodeDecision: 转码决策类型
+        """
+        compatibility = config.BROWSER_COMPATIBILITY
+
+        # 获取编解码器信息
+        video_codec = video_info.get('video', {}).get('codec', '').lower()
+        audio_info = video_info.get('audio')
+        audio_codec = audio_info.get('codec', '').lower() if audio_info else ''
+        container = video_info.get('container', '').lower()
+
+        # 确保容器格式以点号开头
+        if container and not container.startswith('.'):
+            container = f'.{container}'
+
+        # 检查各项兼容性
+        container_ok = container in compatibility['compatible_containers']
+        video_ok = video_codec in compatibility['compatible_video_codecs']
+        # 无音频流或音频编解码器兼容均视为音频OK
+        audio_ok = not audio_codec or audio_codec in compatibility['compatible_audio_codecs']
+
+        # 检查是否是必须转码的编解码器
+        video_must_transcode = video_codec in compatibility['need_transcode_codecs']
+
+        logger.debug(
+            f"[MediaPrep] 转码决策分析: container={container}({container_ok}), "
+            f"video={video_codec}({video_ok}), audio={audio_codec}({audio_ok}), "
+            f"must_transcode={video_must_transcode}"
+        )
+
+        # 决策逻辑
+        if video_must_transcode:
+            # HEVC/VP9/AV1 等必须完整转码
+            return TranscodeDecision.TRANSCODE_FULL
+
+        if container_ok and video_ok and audio_ok:
+            # 完全兼容，可直接播放
+            return TranscodeDecision.DIRECT_PLAY
+
+        if video_ok and audio_ok:
+            # 编解码器兼容，仅需重封装容器（极速）
+            return TranscodeDecision.REMUX_ONLY
+
+        if video_ok and not audio_ok:
+            # 仅音频不兼容
+            return TranscodeDecision.TRANSCODE_AUDIO
+
+        # 视频不兼容，需完整转码
+        return TranscodeDecision.TRANSCODE_FULL
+
+    def enqueue_remux(self, job_id: str, video_path: Path, output_path: Path,
+                      priority: int = 3) -> bool:
+        """
+        将容器重封装任务加入队列（最高优先级，极速完成）
+
+        容器重封装使用 -c:v copy -c:a copy，直接复制流，速度极快
+
+        Args:
+            job_id: 任务ID
+            video_path: 源视频路径
+            output_path: 输出路径 (remux.mp4)
+            priority: 优先级 (0最高，默认3，比360p更高)
+
+        Returns:
+            bool: 是否成功加入队列
+        """
+        with self.lock:
+            if job_id in self.task_status:
+                status = self.task_status[job_id].get("remux", {})
+                if status.get("status") in ["queued", "processing"]:
+                    logger.info(f"[MediaPrep] 重封装任务已存在，跳过: {job_id}")
+                    return False
+
+            if job_id not in self.task_status:
+                self.task_status[job_id] = {}
+
+            self.task_status[job_id]["remux"] = {
+                "status": "queued",
+                "progress": 0,
+                "video_path": str(video_path),
+                "output_path": str(output_path)
+            }
+
+        task = (priority, time.time(), {
+            "type": "remux",
+            "job_id": job_id,
+            "video_path": video_path,
+            "output_path": output_path
+        })
+        self.task_queue.put(task)
+
+        logger.info(f"[MediaPrep] 重封装任务已入队: {job_id} (priority={priority})")
+        return True
+
+    def get_remux_status(self, job_id: str) -> Optional[Dict]:
+        """获取重封装任务状态"""
+        with self.lock:
+            if job_id in self.task_status:
+                return self.task_status[job_id].get("remux")
+        return None
+
+    def get_full_task_status(self, job_id: str) -> Optional[Dict]:
+        """
+        获取任务的完整状态（用于前端刷新后恢复）
+
+        Returns:
+            {
+                "state": "transcoding_720",  # 当前状态
+                "progress": 45.5,            # 当前进度
+                "decision": "transcode_full", # 转码决策
+                "preview_360p": {...},
+                "proxy_720p": {...},
+                "remux": {...},
+                "error": None
+            }
+        """
+        with self.lock:
+            if job_id not in self.task_status:
+                return None
+
+            status = self.task_status[job_id]
+            preview = status.get("preview_360p", {})
+            proxy = status.get("proxy_720p", {})
+            remux = status.get("remux", {})
+
+            # 确定当前状态
+            state = "idle"
+            progress = 0
+            error = None
+
+            if remux.get("status") == "processing":
+                state = "remuxing"
+                progress = remux.get("progress", 0)
+            elif remux.get("status") == "completed":
+                state = "ready_720p"
+                progress = 100
+            elif remux.get("status") == "failed":
+                state = "error"
+                error = remux.get("error")
+            elif preview.get("status") == "processing":
+                state = "transcoding_360"
+                progress = preview.get("progress", 0)
+            elif preview.get("status") == "completed":
+                if proxy.get("status") == "processing":
+                    state = "transcoding_720"
+                    progress = proxy.get("progress", 0)
+                elif proxy.get("status") == "completed":
+                    state = "ready_720p"
+                    progress = 100
+                elif proxy.get("status") == "failed":
+                    state = "error"
+                    error = proxy.get("error")
+                else:
+                    state = "ready_360p"
+                    progress = 100
+            elif preview.get("status") == "failed":
+                state = "error"
+                error = preview.get("error")
+            elif preview.get("status") == "queued":
+                state = "analyzing"
+                progress = 0
+
+            return {
+                "state": state,
+                "progress": progress,
+                "preview_360p": preview,
+                "proxy_720p": proxy,
+                "remux": remux,
+                "error": error
+            }
+
     def _consumer_loop(self):
         """任务消费循环"""
         logger.info("[MediaPrep] 消费线程已启动")
@@ -202,6 +405,8 @@ class MediaPrepService:
                     self._execute_preview_task(task)
                 elif task_type == "proxy_720p":
                     self._execute_proxy_task(task)
+                elif task_type == "remux":
+                    self._execute_remux_task(task)
 
                 self.task_queue.task_done()
 
@@ -213,7 +418,7 @@ class MediaPrepService:
     def _execute_preview_task(self, task: dict):
         """
         执行 360p 预览视频转码任务（在独立线程中）
-        使用更快的编码预设，优先快速生成
+        使用配置中的编码参数，优先快速生成
         """
         job_id = task["job_id"]
         video_path = Path(task["video_path"])
@@ -227,22 +432,44 @@ class MediaPrepService:
             # 获取视频时长
             duration = self._get_video_duration(video_path)
 
-            # 构建 FFmpeg 命令 - 360p 快速预览
+            # 从配置读取参数
+            preview_config = config.PROXY_CONFIG.get('preview_360p', {})
+            scale = preview_config.get('scale', 360)
+            preset = preview_config.get('preset', 'ultrafast')
+            crf = preview_config.get('crf', 28)
+            gop = preview_config.get('gop', 30)
+            keyint_min = preview_config.get('keyint_min', gop // 2)
+            tune = preview_config.get('tune', 'fastdecode')
+            include_audio = preview_config.get('audio', False)
+
+            # 构建 FFmpeg 命令 - 360p 快速预览（参数从配置读取）
             ffmpeg_cmd = config.get_ffmpeg_command()
             cmd = [
                 ffmpeg_cmd,
                 '-i', str(video_path),
-                '-vf', 'scale=-2:360',      # 360p 分辨率
+                '-vf', f'scale=-2:{scale}',       # 分辨率
                 '-c:v', 'libx264',
-                '-preset', 'ultrafast',     # 最快编码（牺牲质量）
-                '-crf', '28',               # 中等质量
-                '-g', '30',                 # 关键帧间隔
-                '-an',                      # 去掉音频（减小体积 + 加速）
+                '-preset', preset,                 # 编码预设
+                '-tune', tune,                     # 解码优化
+                '-crf', str(crf),                  # 质量
+                '-g', str(gop),                    # 关键帧间隔
+                '-keyint_min', str(keyint_min),    # 最小关键帧间隔
+                '-sc_threshold', '0',              # 禁用场景检测，保证 GOP 稳定
+            ]
+
+            # 音频处理
+            if include_audio:
+                cmd.extend(['-c:a', 'aac', '-b:a', '64k'])
+            else:
+                cmd.append('-an')  # 无音频
+
+            # 输出优化
+            cmd.extend([
                 '-movflags', '+faststart',  # 优化拖动
                 '-progress', 'pipe:1',
                 '-y',
                 str(output_path)
-            ]
+            ])
 
             logger.info(f"[MediaPrep] 开始转码 360p 预览: {video_path.name} -> preview_360p.mp4")
 
@@ -251,7 +478,7 @@ class MediaPrepService:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
 
@@ -292,12 +519,12 @@ class MediaPrepService:
                 self._push_preview_progress(job_id, 100, completed=True)
             else:
                 # 失败
-                stderr = process.stderr.read().decode() if process.stderr else ""
+                error_msg = f"FFmpeg 返回码: {process.returncode}"
                 with self.lock:
                     self.task_status[job_id]["preview_360p"]["status"] = "failed"
-                    self.task_status[job_id]["preview_360p"]["error"] = stderr[:500]
+                    self.task_status[job_id]["preview_360p"]["error"] = error_msg
 
-                logger.error(f"[MediaPrep] 360p预览转码失败: {stderr[:200]}")
+                logger.error(f"[MediaPrep] 360p预览转码失败: {error_msg}")
 
         except Exception as e:
             with self.lock:
@@ -326,19 +553,33 @@ class MediaPrepService:
             # 检查转录队列是否繁忙（有新任务进入）
             queue_busy = self._is_transcription_queue_busy()
 
-            # 构建 FFmpeg 命令
+            # 从配置读取参数
+            proxy_config = config.PROXY_CONFIG.get('proxy_720p', {})
+            scale = proxy_config.get('scale', 720)
+            preset = proxy_config.get('preset', 'fast')
+            crf = proxy_config.get('crf', 23)
+            gop = proxy_config.get('gop', 30)
+            keyint_min = proxy_config.get('keyint_min', gop // 2)
+            audio_bitrate = proxy_config.get('audio_bitrate', '128k')
+            audio_sample_rate = proxy_config.get('audio_sample_rate', 44100)
+
+            # 构建 FFmpeg 命令 - 720p 高清（参数从配置读取）
             ffmpeg_cmd = config.get_ffmpeg_command()
             cmd = [
                 ffmpeg_cmd,
                 '-i', str(video_path),
-                '-vf', 'scale=-2:720',
+                '-threads', '0',                   # 自动线程
+                '-vf', f'scale=-2:{scale}',        # 分辨率
                 '-c:v', 'libx264',
-                '-preset', 'fast',
-                '-crf', '23',
-                '-g', '30',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-movflags', '+faststart',
+                '-preset', preset,                  # 编码预设
+                '-crf', str(crf),                   # 质量
+                '-g', str(gop),                     # 关键帧间隔
+                '-keyint_min', str(keyint_min),     # 最小关键帧间隔
+                '-sc_threshold', '0',               # 禁用场景检测，保证 GOP 稳定
+                '-c:a', 'aac',                      # 音频编码
+                '-b:a', audio_bitrate,              # 音频码率
+                '-ar', str(audio_sample_rate),      # 音频采样率
+                '-movflags', '+faststart',          # 优化网络播放
                 '-progress', 'pipe:1',
                 '-y',
                 str(output_path)
@@ -354,7 +595,7 @@ class MediaPrepService:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
 
@@ -399,12 +640,12 @@ class MediaPrepService:
                 self._push_proxy_progress(job_id, 100, completed=True)
             else:
                 # 失败
-                stderr = process.stderr.read().decode() if process.stderr else ""
+                error_msg = f"FFmpeg 返回码: {process.returncode}"
                 with self.lock:
                     self.task_status[job_id]["proxy_720p"]["status"] = "failed"
-                    self.task_status[job_id]["proxy_720p"]["error"] = stderr[:500]
+                    self.task_status[job_id]["proxy_720p"]["error"] = error_msg
 
-                logger.error(f"[MediaPrep] 720p 转码失败: {stderr[:200]}")
+                logger.error(f"[MediaPrep] 720p 转码失败: {error_msg}")
 
         except Exception as e:
             with self.lock:
@@ -488,50 +729,198 @@ class MediaPrepService:
 
     def _push_preview_progress(self, job_id: str, progress: float, completed: bool = False):
         """推送 360p 预览进度到 SSE"""
-        try:
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
+        channel_id = f"job:{job_id}"
+        event_type = "preview_360p_complete" if completed else "preview_360p_progress"
 
-            channel_id = f"job:{job_id}"
-            event_type = "preview_360p_complete" if completed else "preview_360p_progress"
+        data = {
+            "job_id": job_id,
+            "progress": progress,
+            "completed": completed,
+            "resolution": "360p"
+        }
 
-            data = {
-                "job_id": job_id,
-                "progress": progress,
-                "completed": completed,
-                "resolution": "360p"
-            }
+        if completed:
+            data["video_url"] = f"/api/media/{job_id}/video/preview"
 
-            if completed:
-                data["video_url"] = f"/api/media/{job_id}/video/preview"
-
-            sse_manager.broadcast_sync(channel_id, event_type, data)
-        except Exception as e:
-            # SSE 推送失败不影响转码
-            pass
+        self._broadcast_progress(job_id, event_type, data)
 
     def _push_proxy_progress(self, job_id: str, progress: float, completed: bool = False):
         """推送 Proxy 进度到 SSE"""
+        channel_id = f"job:{job_id}"
+        event_type = "proxy_complete" if completed else "proxy_progress"
+
+        data = {
+            "job_id": job_id,
+            "progress": progress,
+            "completed": completed
+        }
+
+        if completed:
+            data["video_url"] = f"/api/media/{job_id}/video"
+
+        self._broadcast_progress(job_id, event_type, data)
+
+    def _push_remux_progress(self, job_id: str, progress: float, completed: bool = False):
+        """推送重封装进度到 SSE"""
+        channel_id = f"job:{job_id}"
+        event_type = "remux_complete" if completed else "remux_progress"
+
+        data = {
+            "job_id": job_id,
+            "progress": progress,
+            "completed": completed,
+            "type": "remux"
+        }
+
+        if completed:
+            data["video_url"] = f"/api/media/{job_id}/video"
+
+        self._broadcast_progress(job_id, event_type, data)
+
+    def _broadcast_progress(
+        self,
+        job_id: str,
+        event_type: str,
+        data: dict,
+        retry_count: int = None
+    ) -> bool:
+        """
+        带重试机制的进度推送
+
+        Args:
+            job_id: 任务ID
+            event_type: 事件类型
+            data: 事件数据
+            retry_count: 重试次数（默认从配置读取）
+
+        Returns:
+            是否推送成功
+        """
+        sse_config = config.PROXY_CONFIG.get('sse', {})
+        retry_count = retry_count or sse_config.get('retry_count', 3)
+        retry_delay = sse_config.get('retry_delay', 0.1)
+
+        for attempt in range(retry_count):
+            try:
+                from app.services.sse_service import get_sse_manager
+                sse_manager = get_sse_manager()
+                channel_id = f"job:{job_id}"
+
+                sse_manager.broadcast_sync(channel_id, event_type, data)
+                return True
+
+            except Exception as e:
+                if attempt < retry_count - 1:
+                    logger.warning(
+                        f"[MediaPrep] SSE推送失败 (尝试 {attempt + 1}/{retry_count}): "
+                        f"job={job_id}, event={event_type}, error={e}"
+                    )
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(
+                        f"[MediaPrep] SSE推送最终失败: job={job_id}, event={event_type}, error={e}"
+                    )
+
+        return False
+
+    def _execute_remux_task(self, task: dict):
+        """
+        执行容器重封装任务（零转码，极速完成）
+
+        使用 -c:v copy -c:a copy 直接复制流，速度极快
+        通常几秒内完成，比完整转码快 10-100 倍
+        """
+        job_id = task["job_id"]
+        video_path = Path(task["video_path"])
+        output_path = Path(task["output_path"])
+
+        # 更新状态
+        with self.lock:
+            self.task_status[job_id]["remux"]["status"] = "processing"
+
         try:
-            from app.services.sse_service import get_sse_manager
-            sse_manager = get_sse_manager()
+            # 获取视频时长（用于进度计算）
+            duration = self._get_video_duration(video_path)
 
-            channel_id = f"job:{job_id}"
-            event_type = "proxy_complete" if completed else "proxy_progress"
+            # 构建 FFmpeg 重封装命令（零转码）
+            ffmpeg_cmd = config.get_ffmpeg_command()
+            cmd = [
+                ffmpeg_cmd,
+                '-i', str(video_path),
+                '-c:v', 'copy',             # 视频流直接复制
+                '-c:a', 'copy',             # 音频流直接复制
+                '-movflags', '+faststart',  # 优化网络播放
+                '-progress', 'pipe:1',
+                '-y',
+                str(output_path)
+            ]
 
-            data = {
-                "job_id": job_id,
-                "progress": progress,
-                "completed": completed
-            }
+            logger.info(f"[MediaPrep] 开始容器重封装: {video_path.name} -> {output_path.name}")
 
-            if completed:
-                data["video_url"] = f"/api/media/{job_id}/video"
+            # 执行 FFmpeg
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
+                creationflags=creationflags
+            )
 
-            sse_manager.broadcast_sync(channel_id, event_type, data)
+            # 解析进度
+            for line in process.stdout:
+                line_str = line.decode().strip()
+                if line_str.startswith('out_time_ms='):
+                    try:
+                        out_time_ms = int(line_str.split('=')[1])
+                        if duration > 0:
+                            progress = min(100, (out_time_ms / 1000000) / duration * 100)
+                            progress = round(progress, 1)
+
+                            with self.lock:
+                                self.task_status[job_id]["remux"]["progress"] = progress
+
+                            # 推送进度
+                            self._push_remux_progress(job_id, progress)
+                    except:
+                        pass
+
+            process.wait()
+
+            if process.returncode == 0 and output_path.exists():
+                # 成功
+                with self.lock:
+                    self.task_status[job_id]["remux"]["status"] = "completed"
+                    self.task_status[job_id]["remux"]["progress"] = 100
+
+                file_size = output_path.stat().st_size / (1024 * 1024)  # MB
+                logger.info(f"[MediaPrep] 容器重封装完成: {output_path} ({file_size:.1f}MB)")
+                self._push_remux_progress(job_id, 100, completed=True)
+            else:
+                # 失败
+                error_msg = f"FFmpeg 返回码: {process.returncode}"
+                with self.lock:
+                    self.task_status[job_id]["remux"]["status"] = "failed"
+                    self.task_status[job_id]["remux"]["error"] = error_msg
+
+                logger.error(f"[MediaPrep] 容器重封装失败: {error_msg}")
+                # 推送错误事件
+                self._broadcast_progress(job_id, "proxy_error", {
+                    "job_id": job_id,
+                    "message": f"重封装失败: {error_msg}",
+                    "type": "remux"
+                })
+
         except Exception as e:
-            # SSE 推送失败不影响转码
-            pass
+            with self.lock:
+                self.task_status[job_id]["remux"]["status"] = "failed"
+                self.task_status[job_id]["remux"]["error"] = str(e)
+
+            logger.error(f"[MediaPrep] 容器重封装异常: {e}", exc_info=True)
+            self._broadcast_progress(job_id, "proxy_error", {
+                "job_id": job_id,
+                "message": str(e),
+                "type": "remux"
+            })
 
     def shutdown(self):
         """关闭服务"""

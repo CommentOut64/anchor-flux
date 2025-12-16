@@ -239,6 +239,26 @@ class SSEChannelManager extends EventEmitter {
       },
 
       // === 视频转码相关事件 ===
+      // 分析完成事件（新增：智能转码决策）
+      analyze_complete: (data) => {
+        console.log(`[SSE Job ${jobId}] 分析完成:`, data.decision)
+        handlers.onAnalyzeComplete?.(data)
+      },
+      // 容器重封装进度（新增：零转码优化）
+      remux_progress: (data) => {
+        console.log(`[SSE Job ${jobId}] 重封装进度:`, data.progress)
+        handlers.onRemuxProgress?.(data)
+      },
+      // 容器重封装完成（新增）
+      remux_complete: (data) => {
+        console.log(`[SSE Job ${jobId}] 重封装完成`)
+        handlers.onRemuxComplete?.(data)
+      },
+      // Proxy 错误事件（新增：统一错误处理）
+      proxy_error: (data) => {
+        console.error(`[SSE Job ${jobId}] Proxy 错误:`, data.message)
+        handlers.onProxyError?.(data)
+      },
       // 360p 预览进度
       preview_360p_progress: (data) => {
         console.log(`[SSE Job ${jobId}] 360p 预览进度:`, data.progress)

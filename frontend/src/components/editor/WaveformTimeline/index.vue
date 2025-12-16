@@ -92,7 +92,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted, nextTick } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from "vue";
 import { useProjectStore } from "@/stores/projectStore";
 import { usePlaybackManager } from "@/services/PlaybackManager";
 
@@ -131,6 +131,10 @@ const projectStore = useProjectStore();
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager();
+
+// 注入编辑器上下文（获取视频就绪状态）
+const editorContext = inject('editorContext', { isVideoReady: computed(() => true) })
+const isVideoReady = computed(() => editorContext.isVideoReady?.value ?? true)
 
 // Refs
 const containerRef = ref(null);
@@ -727,6 +731,12 @@ function isMouseNearCursor(clientX, threshold = 10) {
 function handleUpperZoneMouseDown(e) {
   if (!wavesurfer || !isReady.value) return;
   if (e.button !== 0) return; // 只处理左键
+
+  // 【关键】视频未就绪时拦截所有波形操作
+  if (!isVideoReady.value) {
+    console.warn('[WaveformTimeline] 视频未就绪，波形操作被拦截')
+    return
+  }
 
   // 【关键】始终阻止事件传播，防止触发下层的 Region 操作
   e.preventDefault();

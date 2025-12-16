@@ -718,48 +718,105 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
 @router.get("/{job_id}/proxy-status")
 async def check_proxy_status(job_id: str):
     """
-    检查Proxy视频生成状态（支持进度查询）
+    获取 Proxy 视频完整状态（用于前端刷新后恢复）
 
     Returns:
-        JSON: { exists, size, generating, progress, status }
+        JSON: {
+            "state": "transcoding_720",  # 当前状态
+            "progress": 45.5,            # 当前进度百分比
+            "decision": "transcode_full", # 转码决策
+            "urls": {
+                "360p": "/api/media/.../video/preview",
+                "720p": "/api/media/.../video",
+                "source": "/api/media/.../video/source"
+            },
+            "error": null,
+            "started_at": null,
+            "estimated_remaining": null
+        }
     """
     job_dir = config.JOBS_DIR / job_id
-    proxy_video = job_dir / "proxy.mp4"
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="任务不存在")
 
-    if proxy_video.exists():
-        return JSONResponse({
-            "exists": True,
-            "size": proxy_video.stat().st_size,
-            "generating": False,
-            "progress": 100,
-            "status": "completed"
-        })
-
-    # 检查 MediaPrepService 中的生成状态
-    from app.services.media_prep_service import get_media_prep_service
+    # 从 MediaPrepService 获取任务状态
+    from app.services.media_prep_service import get_media_prep_service, TranscodeDecision
     media_prep = get_media_prep_service()
-    proxy_status = media_prep.get_proxy_status(job_id)
+    task_status = media_prep.get_full_task_status(job_id)
 
-    if proxy_status and proxy_status.get("status") in ["queued", "processing"]:
+    # 检查文件存在性，构建 URLs
+    preview_360p = job_dir / "preview_360p.mp4"
+    proxy_720p = job_dir / "proxy.mp4"
+    remux_video = job_dir / "remux.mp4"
+    source_video = _find_video_file(job_dir)
+
+    urls = {
+        "360p": f"/api/media/{job_id}/video/preview" if preview_360p.exists() else None,
+        "720p": f"/api/media/{job_id}/video" if (proxy_720p.exists() or remux_video.exists()) else None,
+        "source": f"/api/media/{job_id}/video/source" if source_video else None
+    }
+
+    # 如果没有任务状态，根据文件存在性推断状态
+    if not task_status:
+        if proxy_720p.exists() or remux_video.exists():
+            state = "ready_720p"
+            progress = 100
+        elif preview_360p.exists():
+            state = "ready_360p"
+            progress = 100
+        elif source_video:
+            # 分析是否需要转码
+            from app.utils.media_analyzer import media_analyzer
+            try:
+                video_info = media_analyzer.analyze_sync(source_video)
+                video_info['container'] = source_video.suffix.lower()
+                decision = media_prep.analyze_transcode_decision(video_info)
+
+                if decision == TranscodeDecision.DIRECT_PLAY:
+                    state = "direct_play"
+                    progress = 100
+                else:
+                    # 需要转码但任务还没启动，自动启动转码
+                    state = "analyzing"
+                    progress = 0
+
+                    # 根据决策类型启动相应任务
+                    if decision == TranscodeDecision.REMUX_ONLY:
+                        # 仅重封装
+                        remux_output = job_dir / "remux.mp4"
+                        media_prep.enqueue_remux(job_id, source_video, remux_output, priority=3)
+                        print(f"[media] 自动启动重封装任务: {job_id}")
+                    else:
+                        # 需要完整转码，启动360p预览
+                        media_prep.enqueue_preview(job_id, source_video, preview_360p, priority=5)
+                        print(f"[media] 自动启动360p预览转码: {job_id}")
+            except Exception as e:
+                print(f"[media] 分析视频失败: {e}")
+                state = "idle"
+                progress = 0
+        else:
+            state = "idle"
+            progress = 0
+
         return JSONResponse({
-            "exists": False,
-            "size": 0,
-            "generating": True,
-            "progress": proxy_status.get("progress", 0),
-            "status": proxy_status["status"]
+            "state": state,
+            "progress": progress,
+            "decision": None,
+            "urls": urls,
+            "error": None,
+            "started_at": None,
+            "estimated_remaining": None
         })
 
-    # 检查源视频是否需要转码
-    video_file = _find_video_file(job_dir)
-    needs_proxy = video_file and video_file.suffix.lower() in NEED_TRANSCODE_FORMATS
-
+    # 返回完整状态
     return JSONResponse({
-        "exists": False,
-        "size": 0,
-        "generating": False,
-        "progress": 0,
-        "status": "not_started",
-        "needs_proxy": needs_proxy
+        "state": task_status.get("state", "idle"),
+        "progress": task_status.get("progress", 0),
+        "decision": task_status.get("decision"),
+        "urls": urls,
+        "error": task_status.get("error"),
+        "started_at": task_status.get("started_at"),
+        "estimated_remaining": task_status.get("estimated_remaining")
     })
 
 

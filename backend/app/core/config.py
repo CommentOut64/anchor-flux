@@ -136,6 +136,58 @@ class ProjectConfig:
         self.PREVIEW_PRESET = "ultrafast"        # 预览视频编码预设
         self.PROXY_PRESET = "fast"               # 高质量视频编码预设
 
+        # ========== Proxy 视频配置（重构新增）==========
+        # 统一管理所有 Proxy 转码相关参数
+        self.PROXY_CONFIG = {
+            # 360p 预览参数（极速模式）
+            "preview_360p": {
+                "scale": 360,
+                "preset": "ultrafast",
+                "crf": 28,
+                "gop": 30,              # 关键帧间隔
+                "keyint_min": 15,       # 最小关键帧间隔
+                "audio": False,         # 无音频（加速生成）
+                "tune": "fastdecode",   # 优化解码速度
+            },
+            # 720p 高清参数（平衡质量和速度）
+            "proxy_720p": {
+                "scale": 720,
+                "preset": "fast",
+                "crf": 23,
+                "gop": 30,
+                "keyint_min": 15,
+                "audio_bitrate": "128k",
+                "audio_sample_rate": 44100,
+            },
+            # 容器重封装配置（零转码）
+            "remux": {
+                "enabled": True,                          # 是否启用重封装优化
+                "compatible_codecs": {"h264", "aac", "mp3"},  # 可直接复制的编解码器
+                "target_container": "mp4",                # 目标容器格式
+            },
+            # SSE 推送配置
+            "sse": {
+                "progress_interval": 0.5,   # 进度推送间隔（秒）
+                "retry_count": 3,           # 推送失败重试次数
+                "retry_delay": 0.1,         # 重试延迟（秒）
+            }
+        }
+
+        # ========== 浏览器兼容性配置 ==========
+        # 用于智能转码决策
+        self.BROWSER_COMPATIBILITY = {
+            # 浏览器原生支持的容器格式
+            "compatible_containers": {".mp4", ".webm"},
+            # 浏览器原生支持的视频编解码器
+            "compatible_video_codecs": {"h264", "vp8"},
+            # 浏览器原生支持的音频编解码器
+            "compatible_audio_codecs": {"aac", "mp3", "opus", "vorbis"},
+            # 需要强制转码的视频编解码器
+            "need_transcode_codecs": {"hevc", "h265", "vp9", "av1", "mpeg2video"},
+            # 需要转码的容器格式
+            "need_transcode_formats": {".mkv", ".avi", ".mov", ".wmv", ".flv", ".m4v"},
+        }
+
         # ========== 流水线配置（V3.1.0 新增）==========
         # 双流对齐流水线模式
         # - True: 三级异步流水线（错位并行，性能提升 30-50%）
