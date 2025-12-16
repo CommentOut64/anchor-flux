@@ -633,7 +633,7 @@ class JobQueueService:
                     needs_transcode = True
 
             if needs_transcode:
-                proxy_path = job_dir / "proxy.mp4"
+                proxy_path = job_dir / "proxy_720p.mp4"
                 if not proxy_path.exists():
                     # 提前入队（低优先级20，不抢转录任务的资源）
                     media_prep = get_media_prep_service()
