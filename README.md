@@ -2,10 +2,13 @@
 
 > 双模态时空解耦的高精度字幕生成引擎 - 快慢双流，锚点对齐
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
-[![Vue.js](https://img.shields.io/badge/Vue.js-3.0+-green.svg)](https://vuejs.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.68+-red.svg)](https://fastapi.tiangolo.com)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Version](https://img.shields.io/badge/version-v3.0.0-brightgreen.svg)
+![Vue](https://img.shields.io/badge/Vue-3.5+-4FC08D?logo=vue.js&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?logo=fastapi&logoColor=white)
+
+<img src="https://cdn.jsdelivr.net/gh/CommentOut64/anchor-flux@main/assets/pic1.png" />
 
 AnchorFlux 采用创新的双锚架构：**SenseVoice 锚定时间边界，Whisper 锚定语义内容**，两个模型各司其职，通过锚点对齐算法融合输出高精度字幕。支持快慢双流体验——草稿秒级上屏，定稿延迟覆盖。
 
@@ -16,7 +19,7 @@ AnchorFlux 采用创新的双锚架构：**SenseVoice 锚定时间边界，Whisp
 - **双模态对齐**：SenseVoice + Whisper 协同工作
 - **快慢双流**：草稿 0.3s 上屏，定稿 3s 后自动覆盖，用户无需等待
 - **时空解耦**：文本/语义与时间/边界分离处理，各取所长
-- **整轨人声分离**：Demucs 全局处理，保留完整上下文，提升识别质量
+- **智能人声分离**：Demucs 按需处理，提升识别质量
 - **字级时间戳**：CTC 精准边界检测，字级别时间对齐
 
 ### 用户界面
@@ -24,7 +27,7 @@ AnchorFlux 采用创新的双锚架构：**SenseVoice 锚定时间边界，Whisp
 - **现代化 Web UI**：基于 Vue.js 3 的响应式界面
 - **实时双流预览**：草稿灰色斜体，定稿黑色正体，状态一目了然
 - **拖拽上传**：支持多种视频格式的拖拽上传
-- **SSE 实时推送**：服务端事件流，断线自动重连
+- **SSE 实时推送**：服务端事件流，断线自动重连，实时更新转录进度
 
 ### 技术特性
 
@@ -152,47 +155,11 @@ backend_port = 8000      # 后端端口
 frontend_port = 5174     # 前端端口
 ```
 
-## 故障排除
-
-### 常见问题
-
-#### "connect ECONNREFUSED 127.0.0.1:8000"
-
-**解决方案**:
-
-1. 使用 `一键启动.bat` 自动清理进程
-2. 手动检查端口占用：`netstat -ano | findstr :8000`
-3. 重启应用
-
-#### "npm 命令找不到"
-**解决方案**:
-
-1. 安装 Node.js (https://nodejs.org)
-2. 重启命令行窗口
-3. 验证安装：`npm --version`
-
-#### GPU 显存不足
-
-**解决方案**:
-
-1. 切换到"极速"预设，仅使用 SenseVoice
-2. 关闭 Demucs 人声分离
-3. 减小 Whisper 模型尺寸
-
-### 调试模式
-
-遇到问题时使用调试版本：
-```bash
-python launcher_debug.py
-```
-
 ## 版本历史
 
 - **v3.0.0** (开发中) - 双模态时空解耦架构，快慢双流体验
 - **v2.0.0** (2025-08-18) - 全面架构升级，前后端分离
 - **v1.1.0** (2025-06-18) - 初始版本，命令行界面
-
-详细更新日志请查看 [CHANGELOG.md](CHANGELOG.md)
 
 ## 贡献指南
 
