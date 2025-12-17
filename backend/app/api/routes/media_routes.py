@@ -558,7 +558,7 @@ async def get_video(job_id: str, request: Request):
         media_prep = get_media_prep_service()
 
         # 360p 预览视频路径
-        preview_360p = proxy_video.parent / "preview_360p.mp4"
+        preview_360p = job_dir / "preview_360p.mp4"
 
         # 检查 360p 预览状态
         preview_status = media_prep.get_preview_status(job_id)
@@ -572,8 +572,8 @@ async def get_video(job_id: str, request: Request):
         proxy_completed = proxy_status and proxy_status.get("status") == "completed"
         print(f"[media] 720p Proxy状态: {proxy_status}, 进行中={proxy_in_progress}, 已完成={proxy_completed}")
 
-        # 720p Proxy 视频路径
-        proxy_720p = proxy_video.parent / "proxy_720p.mp4"
+        # 720p Proxy 视频路径（使用函数开始时定义的变量）
+        # proxy_720p 已在 line 509 定义
 
         # 优先级1: 如果 720p 已完成，返回 720p 视频
         if proxy_completed and proxy_720p.exists():
@@ -772,7 +772,7 @@ async def check_proxy_status(job_id: str):
     urls = {
         "360p": f"/api/media/{job_id}/video/preview" if preview_360p.exists() else None,
         "720p": f"/api/media/{job_id}/video" if (proxy_720p.exists() or remux_video.exists()) else None,
-        "source": f"/api/media/{job_id}/video/source" if source_video else None
+        "source": f"/api/media/{job_id}/video" if source_video else None
     }
 
     # 如果没有任务状态，根据文件存在性推断状态
