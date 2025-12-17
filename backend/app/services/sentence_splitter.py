@@ -513,15 +513,49 @@ class SentenceSplitter:
         """判断字符是否为标点符号"""
         if not char:
             return False
-        # 包含中英文常见标点
-        punctuation = set(',.!?;:\'\"()[]{}，。！？；：""''（）【】《》、')
+        # 分开定义避免字符编码问题
+        punctuation = {
+            # 半角标点
+            ',', '.', '!', '?', ';', ':', "'", '"',
+            '(', ')', '[', ']', '{', '}',
+            # 全角标点
+            '\uff0c',  # 全角逗号 ，
+            '\u3002',  # 全角句号 。
+            '\uff01',  # 全角感叹号 ！
+            '\uff1f',  # 全角问号 ？
+            '\uff1b',  # 全角分号 ；
+            '\uff1a',  # 全角冒号 ：
+            '\u201c',  # 全角左双引号 "
+            '\u201d',  # 全角右双引号 "
+            '\u2018',  # 全角左单引号 '
+            '\u2019',  # 全角右单引号 '
+            '\uff08',  # 全角左括号 （
+            '\uff09',  # 全角右括号 ）
+            '\u3010',  # 全角左方括号 【
+            '\u3011',  # 全角右方括号 】
+            '\u300a',  # 全角左书名号 《
+            '\u300b',  # 全角右书名号 》
+            '\u3001',  # 全角顿号 、
+        }
         return char in punctuation
 
     def _is_opening_quote(self, char: str) -> bool:
         """判断字符是否为开引号"""
         if not char:
             return False
-        opening_quotes = set('"\'"'（([{《【')
+        # 分开定义避免字符编码问题
+        opening_quotes = {
+            '"',    # 半角双引号
+            "'",    # 半角单引号
+            '\u201c',  # 全角左双引号 "
+            '\u2018',  # 全角左单引号 '
+            '\uff08',  # 全角左括号 （
+            '(',    # 半角左括号
+            '[',    # 半角左方括号
+            '{',    # 半角左花括号
+            '\u300a',  # 全角书名号 《
+            '\u3010',  # 全角方括号 【
+        }
         return char in opening_quotes
 
     def _should_add_space(self, current_word: str, next_word: str) -> bool:

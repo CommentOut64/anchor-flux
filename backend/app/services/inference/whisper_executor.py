@@ -41,7 +41,9 @@ class WhisperExecutor:
         start_time: float,
         end_time: float,
         language: Optional[str] = None,
-        initial_prompt: Optional[str] = None
+        initial_prompt: Optional[str] = None,
+        repetition_penalty: float = 1.2,
+        no_repeat_ngram_size: int = 3
     ) -> Dict[str, Any]:
         """
         执行 Whisper 推理
@@ -52,6 +54,8 @@ class WhisperExecutor:
             end_time: Chunk 结束时间（秒）- 仅用于日志，不用于切片
             language: 语言代码（zh/en/auto）
             initial_prompt: 初始提示词（用于引导识别）
+            repetition_penalty: 重复惩罚系数，>1 抑制重复（默认 1.2，推荐 1.1-1.3）
+            no_repeat_ngram_size: 禁止重复的 N-gram 大小（默认 3，0=禁用）
 
         Returns:
             Dict: 推理结果
@@ -97,7 +101,9 @@ class WhisperExecutor:
             word_timestamps=False,  # 使用伪对齐，不需要词级时间戳
             beam_size=beam_size,  # 自适应 beam_size
             vad_filter=False,  # 已经是 VAD 切片，不需要再次 VAD
-            condition_on_previous_text=False  # 禁用前文条件化，保留 prompt 用于词汇引导
+            condition_on_previous_text=False,  # 禁用前文条件化，保留 prompt 用于词汇引导
+            repetition_penalty=repetition_penalty,  # 重复惩罚
+            no_repeat_ngram_size=no_repeat_ngram_size  # N-gram 重复抑制
         )
         
         # 估算置信度

@@ -4,8 +4,6 @@
   新架构本身就是按 chunk 并行处理，把 Demucs 结果写回 ProcessingContext.current_audio 就可以被 SlowWorker 直接消费，逻辑适配成本不高。
   即使将来要扩展多模型策略，也可以在频谱诊断阶段统一决策（如不同 chunk 用不同 model_quality），不会影响双流流水线。
   落地步骤大概是：在 job_queue_service/async_dual_pipeline 初始化 chunk 时调用频谱诊断，给 ProcessingContext 填入 need_separation 标记；FastWorker before SenseVoice 把需要分离的 chunk 异步喂给 demucs_service.separate_chunk（或在 VAD 结束后一次性跑完）并及时 unload_model()。这样既保留新架构的 streaming 优势，又恢复旧架构的按需分离策略，是收益最大的一条路。
-2. **块内重复检测**：在 TextNormalizer.clean_whisper_output() 或 AlignmentWorker 进入 SRT 阶段前加一层 N‑gram/压缩比检测；例如计算句子里 3‑5 词短语的出现次数或检测 len(set(chunks))/len(chunks)，异常时截断或回退 (backend/app/services/text_normalizer.py (lines 36-118))。这能精准打击用户指出的“在同一条字幕里循环”的问题。
-3. 扩展 WhisperService.transcribe() 的参数，把 repetition_penalty、no_repeat_ngram_size 暴露给配置，然后在 WhisperExecutor 或缓冲池模式中提供>1 的 penalty；这是最直接的方式，成本也只是在调用处加几个关键字参数（backend/app/services/whisper_service.py (lines 452-474)）。
 5. 引入微型标点模型 (Punctuator)，在 CPU 上跑一个极小的 BERT-based 标点恢复模型（ONNX 格式，几十 MB）
   流程：SenseVoice 文本 -> Punctuator (CPU 10ms) -> 带标点文本 -> 推送。
 模型：CT-Transformer (FunASR/Sherpa 版本)
