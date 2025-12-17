@@ -14,7 +14,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 import psutil
 import torch
-from faster_whisper import WhisperModel
+# 延迟导入 faster_whisper，避免启动时加载 ctranslate2 导致首次启动卡死
+# from faster_whisper import WhisperModel  # 已移至 get_model() 内部延迟导入
 
 # 使用完整路径导入
 from app.models.job_models import JobSettings
@@ -329,6 +330,9 @@ class ModelPreloadManager:
 
             # 导入配置以获取缓存路径
             from app.core.config import config
+
+            # 延迟导入 faster_whisper，避免启动时加载 ctranslate2 导致首次启动卡死
+            from faster_whisper import WhisperModel
 
             # 使用 faster_whisper 的 WhisperModel 加载模型
             model = WhisperModel(

@@ -7,13 +7,18 @@ Faster-Whisper 转录服务
 - 自动检测并下载缺失的 Whisper 模型（默认 medium）
 - 自动使用 HuggingFace 镜像源（hf-mirror.com）
 """
-from faster_whisper import WhisperModel
-from typing import Optional, Dict, Any, Union, Tuple
+# 延迟导入 faster_whisper，避免启动时加载 ctranslate2 导致首次启动卡死
+# from faster_whisper import WhisperModel  # 已移至 load_model() 内部延迟导入
+from typing import Optional, Dict, Any, Union, Tuple, TYPE_CHECKING
 import numpy as np
 import logging
 import gc
 import os
 from pathlib import Path
+
+# 用于类型检查的条件导入（不会在运行时触发导入）
+if TYPE_CHECKING:
+    from faster_whisper import WhisperModel
 
 from app.core import config
 
@@ -181,6 +186,9 @@ class WhisperService:
                     model_repo_id = model_path
 
             # 加载模型
+            # 延迟导入 faster_whisper，避免启动时加载 ctranslate2 导致首次启动卡死
+            from faster_whisper import WhisperModel
+
             self.model = WhisperModel(
                 model_repo_id,
                 device=device,
@@ -400,7 +408,10 @@ class WhisperService:
         vad_filter: bool = True,
         vad_parameters: dict = None,
         temperature: float = 0.0,
-        condition_on_previous_text: bool = True
+        condition_on_previous_text: bool = True,
+        suppress_tokens: list = None,  # 幻觉抑制 Token ID 列表
+        repetition_penalty: float = 1.0,  # 重复惩罚系数（>1 抑制重复）
+        no_repeat_ngram_size: int = 0  # 禁止重复的 N-gram 大小（0=禁用）
     ) -> Dict[str, Any]:
         """
         转录音频
@@ -415,6 +426,9 @@ class WhisperService:
             vad_parameters: VAD 参数
             temperature: 采样温度
             condition_on_previous_text: 是否基于前文条件生成
+            suppress_tokens: 幻觉抑制 Token ID 列表（None 则自动从配置获取）
+            repetition_penalty: 重复惩罚系数，>1.0 抑制重复（推荐 1.1-1.3），默认 1.0 无惩罚
+            no_repeat_ngram_size: 禁止重复的 N-gram 大小，>0 时禁止相同 N-gram 连续出现（推荐 3），默认 0 禁用
 
         Returns:
             dict: {
@@ -431,6 +445,13 @@ class WhisperService:
         if language is None or language == 'auto' or language == '':
             language = None
 
+        # 获取幻觉抑制 Token ID（如果未指定）
+        if suppress_tokens is None:
+            from app.config.model_config import get_whisper_suppress_tokens
+            suppress_tokens = get_whisper_suppress_tokens(self._model_name)
+            if suppress_tokens:
+                logger.debug(f"启用幻觉抑制: {len(suppress_tokens)} 个 Token ID")
+
         # 执行转录
         segments_generator, info = self.model.transcribe(
             audio,
@@ -441,7 +462,10 @@ class WhisperService:
             vad_filter=vad_filter,
             vad_parameters=vad_parameters,
             temperature=temperature,
-            condition_on_previous_text=condition_on_previous_text
+            condition_on_previous_text=condition_on_previous_text,
+            suppress_tokens=suppress_tokens if suppress_tokens else None,  # 幻觉抑制
+            repetition_penalty=repetition_penalty,  # 重复惩罚
+            no_repeat_ngram_size=no_repeat_ngram_size  # N-gram 重复抑制
         )
 
         # 转换生成器为列表
@@ -481,7 +505,9 @@ class WhisperService:
         start_time: float,
         end_time: float,
         language: str = None,
-        initial_prompt: str = None
+        initial_prompt: str = None,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0
     ) -> Dict[str, Any]:
         """
         转录指定时间段的音频（用于补刀场景）
@@ -492,6 +518,8 @@ class WhisperService:
             end_time: 结束时间（秒）
             language: 语言代码
             initial_prompt: 上下文提示
+            repetition_penalty: 重复惩罚系数（推荐 1.1-1.3）
+            no_repeat_ngram_size: N-gram 重复抑制大小（推荐 3）
 
         Returns:
             dict: 转录结果
@@ -517,7 +545,9 @@ class WhisperService:
             initial_prompt=initial_prompt,
             word_timestamps=False,  # 补刀场景使用伪对齐，不需要词级时间戳
             beam_size=5,
-            vad_filter=False  # 已经是切片，不需要 VAD
+            vad_filter=False,  # 已经是切片，不需要 VAD
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size
         )
 
     def warmup(self):

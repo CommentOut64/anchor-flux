@@ -13,6 +13,7 @@
       :can-redo="canRedo"
       :active-tasks="activeTasks"
       :last-saved="lastSaved"
+      :dual-stream-progress="dualStreamProgress"
       @undo="undo"
       @redo="redo"
       @pause="pauseTranscription"
@@ -48,13 +49,17 @@
             :job-id="jobId"
             :show-subtitle="true"
             :enable-keyboard="false"
-            :progressive-url="videoStatus.currentUrl.value"
-            :current-resolution="videoStatus.currentResolution.value"
-            :is-upgrading="videoStatus.isUpgrading.value"
-            :upgrade-progress="videoStatus.upgradeProgress.value"
+            :progressive-url="proxyVideo.currentUrl.value"
+            :current-resolution="proxyVideo.currentResolution.value"
+            :is-upgrading="proxyVideo.isUpgrading.value"
+            :upgrade-progress="proxyVideo.progress.value"
+            :proxy-state="proxyVideo.state.value"
+            :proxy-error="proxyVideo.error.value"
             @loaded="handleVideoLoaded"
             @error="handleVideoError"
+            @check-status="handleCheckVideoStatus"
             @resolution-change="handleResolutionChange"
+            @retry="proxyVideo.retry"
           />
         </div>
 
@@ -203,7 +208,7 @@ import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
 import { mediaApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
-import { useVideoStatus } from '@/composables/useVideoStatus'
+import { useProxyVideo } from '@/composables/useProxyVideo'
 
 // 组件导入
 import EditorHeader from '@/components/editor/EditorHeader.vue'
@@ -222,8 +227,8 @@ const router = useRouter()
 const projectStore = useProjectStore()
 const taskStore = useUnifiedTaskStore()
 
-// 渐进式视频加载状态
-const videoStatus = useVideoStatus(props.jobId)
+// Proxy 视频加载状态（新重构版本）
+const proxyVideo = useProxyVideo(props.jobId)
 
 // Refs
 const videoStageRef = ref(null)
@@ -249,7 +254,38 @@ let sseUnsubscribe = null
 let progressPollTimer = null
 
 // Provide 编辑器上下文
-provide('editorContext', { jobId: props.jobId, saving })
+// ========== Provide 上下文 ==========
+
+// 提供编辑器上下文给子组件
+provide('editorContext', {
+  jobId: props.jobId,
+  saving,
+  // 视频就绪状态（用于播放控制拦截）
+  isVideoReady: computed(() => proxyVideo.isReady.value)
+})
+
+// 调试：监听 proxyVideo 状态变化
+watch(() => proxyVideo.currentUrl.value, (newUrl, oldUrl) => {
+  console.log('[EditorView] proxyVideo.currentUrl 变化:', {
+    oldUrl,
+    newUrl,
+    state: proxyVideo.state.value,
+    isReady: proxyVideo.isReady.value,
+    urls: {
+      preview360p: proxyVideo.urls.value.preview360p,
+      proxy720p: proxyVideo.urls.value.proxy720p,
+      source: proxyVideo.urls.value.source
+    }
+  })
+})
+
+watch(() => proxyVideo.state.value, (newState, oldState) => {
+  console.log('[EditorView] proxyVideo.state 变化:', {
+    oldState,
+    newState,
+    currentUrl: proxyVideo.currentUrl.value
+  })
+})
 
 // ========== 计算属性 ==========
 
@@ -294,6 +330,9 @@ const activeTasks = computed(() =>
   taskStore.tasks.filter(t => ['processing', 'queued'].includes(t.status)).length
 )
 
+// Phase 5: 双流进度（从 projectStore 获取）
+const dualStreamProgress = computed(() => projectStore.dualStreamProgress)
+
 // Grid 布局样式
 const gridStyle = computed(() => ({
   gridTemplateColumns: `1fr 4px ${sidebarWidth.value}px`
@@ -305,6 +344,9 @@ const gridStyle = computed(() => ({
 async function loadProject() {
   isLoading.value = true
   loadError.value = null
+
+  // 先重置项目状态，确保不同任务数据隔离
+  projectStore.resetProject()
 
   try {
     // 1. 获取任务状态
@@ -340,6 +382,9 @@ async function loadProject() {
         // 暂停状态也需要订阅SSE，以便接收恢复信号
         console.log('[EditorView] 任务已暂停，订阅SSE以接收恢复信号')
         subscribeSSE()
+      } else if (jobStatus.status === 'finished') {
+        // 任务已完成，useProxyVideo会自动处理视频转码状态
+        console.log('[EditorView] 本地恢复后任务已完成，useProxyVideo将自动检查视频转码状态')
       }
       return
     }
@@ -347,6 +392,7 @@ async function loadProject() {
     // 3. 根据任务状态从后端加载字幕数据
     if (jobStatus.status === 'finished') {
       await loadCompletedSRT()
+      // useProxyVideo会自动检查视频状态
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
       isTranscribing.value = true
       await loadTranscribingSegments()
@@ -543,23 +589,23 @@ function subscribeSSE() {
       refreshTaskProgress()
     },
 
-    // 新增：视频生成进度
-    onProxyProgress(data) {
-      console.log('[EditorView] 收到SSE Proxy进度事件:', data.progress)
-      videoStatus.handleProxyProgress(data)
-    },
-
-    // 新增：视频生成完成
-    onProxyComplete(data) {
-      console.log('[EditorView] 收到SSE Proxy完成事件，完整数据:', data)
-      videoStatus.handleProxyComplete(data)
-    },
-
     // 新增：SenseVoice 流式字幕事件
     onSubtitleUpdate(data) {
       console.log('[EditorView] 收到字幕更新:', data)
       // 处理流式字幕更新（SenseVoice/Whisper补刀/LLM校对翻译等）
       handleStreamingSubtitle(data)
+    },
+
+    // Phase 5: 草稿字幕事件（快流/SenseVoice）
+    onDraft(data) {
+      console.log('[EditorView] 收到草稿字幕:', data)
+      handleDraftSubtitle(data)
+    },
+
+    // Phase 5: 替换 Chunk 事件（慢流/Whisper）
+    onReplaceChunk(data) {
+      console.log('[EditorView] 收到替换 Chunk:', data)
+      handleReplaceChunk(data)
     },
 
     // 新增：BGM 检测事件
@@ -580,6 +626,40 @@ function subscribeSSE() {
     // 新增：熔断事件
     onCircuitBreaker(data) {
       console.log('[EditorView] 熔断触发:', data)
+    },
+
+    // === Proxy 视频转码事件（转发到 useProxyVideo）===
+    onAnalyzeComplete(data) {
+      console.log('[EditorView] 转发 analyze_complete 到 useProxyVideo')
+      proxyVideo.handlers.onAnalyzeComplete(data)
+    },
+    onRemuxProgress(data) {
+      console.log('[EditorView] 转发 remux_progress 到 useProxyVideo')
+      proxyVideo.handlers.onRemuxProgress(data)
+    },
+    onRemuxComplete(data) {
+      console.log('[EditorView] 转发 remux_complete 到 useProxyVideo')
+      proxyVideo.handlers.onRemuxComplete(data)
+    },
+    onPreview360pProgress(data) {
+      console.log('[EditorView] 转发 preview_360p_progress 到 useProxyVideo')
+      proxyVideo.handlers.onPreview360pProgress(data)
+    },
+    onPreview360pComplete(data) {
+      console.log('[EditorView] 转发 preview_360p_complete 到 useProxyVideo')
+      proxyVideo.handlers.onPreview360pComplete(data)
+    },
+    onProxyProgress(data) {
+      console.log('[EditorView] 转发 proxy_progress 到 useProxyVideo')
+      proxyVideo.handlers.onProxyProgress(data)
+    },
+    onProxyComplete(data) {
+      console.log('[EditorView] 转发 proxy_complete 到 useProxyVideo')
+      proxyVideo.handlers.onProxyComplete(data)
+    },
+    onProxyError(data) {
+      console.log('[EditorView] 转发 proxy_error 到 useProxyVideo')
+      proxyVideo.handlers.onProxyError(data)
     }
   })
 }
@@ -598,11 +678,13 @@ function handleStreamingSubtitle(data) {
   if (!data) return
 
   // 解析字幕数据格式
-  const sentenceIndex = data.sentence_index ?? data.index
-  const text = data.text ?? data.content
-  const start = data.start_time ?? data.start
-  const end = data.end_time ?? data.end
-  const warningType = data.warning_type ?? 'none'
+  // 兼容两种格式: 直接字段(sv_sentence) 和 嵌套sentence对象(whisper_patch/llm_proof等)
+  const sentence = data.sentence || {}
+  const sentenceIndex = data.sentence_index ?? data.index ?? sentence.index
+  const text = sentence.text ?? data.text ?? data.content
+  const start = sentence.start ?? data.start_time ?? data.start
+  const end = sentence.end ?? data.end_time ?? data.end
+  const warningType = sentence.warning_type ?? data.warning_type ?? 'none'
   const source = data.source ?? data.event_type ?? 'unknown'
 
   if (sentenceIndex === undefined || !text) {
@@ -634,6 +716,63 @@ function handleStreamingSubtitle(data) {
   }
 
   console.log(`[EditorView] 字幕 #${sentenceIndex} 已更新，来源: ${source}`)
+}
+
+// Phase 5: 处理草稿字幕（快流/SenseVoice）
+function handleDraftSubtitle(data) {
+  if (!data) return
+
+  // 后端数据格式: { index, chunk_index, sentence: { text, start, end, confidence, words, ... } }
+  const chunkIndex = data.chunk_index
+  const sentenceIndex = data.index
+  const sentence = data.sentence
+
+  if (!sentence) {
+    console.warn('[EditorView] 草稿数据缺少 sentence 字段:', data)
+    return
+  }
+
+  // 构建 sentenceData，匹配 projectStore.appendOrUpdateDraft 的参数格式
+  const sentenceData = {
+    index: sentenceIndex,
+    text: sentence.text || '',
+    start: sentence.start ?? 0,
+    end: sentence.end ?? 0,
+    confidence: sentence.confidence ?? 0.8,
+    words: sentence.words || [],
+    warning_type: sentence.warning_type || 'none'
+  }
+
+  // 调用 projectStore 的草稿处理方法，传递两个参数
+  projectStore.appendOrUpdateDraft(chunkIndex, sentenceData)
+
+  console.log(`[EditorView] 处理草稿字幕，chunk_index: ${chunkIndex}, sentence_index: ${sentenceIndex}`)
+}
+
+// Phase 5: 处理替换 Chunk（慢流/Whisper）
+function handleReplaceChunk(data) {
+  if (!data) return
+
+  // 后端数据格式: { chunk_index, old_indices, new_indices, sentences: [...] }
+  const chunkIndex = data.chunk_index
+  const sentences = Array.isArray(data.sentences) ? data.sentences : []
+
+  // 转换为 projectStore 需要的格式
+  const formattedSentences = sentences.map((sentence, idx) => ({
+    index: data.new_indices?.[idx] ?? idx,
+    text: sentence.text || '',
+    start: sentence.start ?? 0,
+    end: sentence.end ?? 0,
+    confidence: sentence.confidence ?? 1.0,
+    words: sentence.words || [],
+    warning_type: sentence.warning_type || 'none',
+    source: sentence.source || 'whisper'
+  }))
+
+  // 调用 projectStore 的替换方法
+  projectStore.replaceChunk(chunkIndex, formattedSentences)
+
+  console.log(`[EditorView] 替换 Chunk ${chunkIndex}，共 ${formattedSentences.length} 条定稿字幕`)
 }
 
 // 刷新任务进度（用于SSE重连后的状态同步）
@@ -854,6 +993,21 @@ function handleVideoLoaded(duration) {
 
 function handleVideoError(error) {
   console.error('视频加载错误:', error)
+}
+
+async function handleCheckVideoStatus() {
+  console.log('[EditorView] 视频加载失败，刷新 Proxy 视频状态...')
+  try {
+    // 刷新 proxyVideo 状态（会从后端重新获取状态并自动订阅SSE）
+    await proxyVideo.refresh()
+    console.log('[EditorView] Proxy 视频状态已刷新:', {
+      state: proxyVideo.state.value,
+      isReady: proxyVideo.isReady.value,
+      isTranscoding: proxyVideo.isTranscoding.value
+    })
+  } catch (error) {
+    console.error('[EditorView] 刷新 Proxy 视频状态失败:', error)
+  }
 }
 
 function handleResolutionChange(resolution) {

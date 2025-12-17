@@ -39,7 +39,7 @@ class DemucsConfig:
     # 模型选择 - 默认使用htdemucs（快速，只需1个文件）
     model_name: str = "htdemucs"
     device: str = "cuda"                   # 设备 (cuda/cpu)
-    shifts: int = 2                        # 增强次数（1=快速，2=平衡，5=最高质量）
+    shifts: int = 1                        # 增强次数（1=快速，2=平衡，5=最高质量）- 速度优先
     overlap: float = 0.5                   # 分段重叠率
     segment_length: int = 10               # 每段处理长度（秒）
 
@@ -1072,7 +1072,7 @@ class DemucsService:
         if vocals.ndim > 1:
             vocals = vocals.mean(axis=0)
 
-        self.logger.info(f"Chunk 分离完成 (model={self.config.model_name})")
+        self.logger.debug(f"Chunk 分离完成 (model={self.config.model_name})")
         return vocals
 
 

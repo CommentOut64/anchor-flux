@@ -359,6 +359,21 @@ class SenseVoiceONNXService:
                 sess_options = ort.SessionOptions()
                 sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
+                # CPU 线程限制（防止卡顿）
+                # 原理：ONNX Runtime 默认会占满所有 CPU 核心，导致 Whisper 的 CUDA 调度线程无核可用
+                # 解决：保留 2 个核心给操作系统和 Whisper 调度
+                import multiprocessing
+                total_cores = multiprocessing.cpu_count()
+                intra_op_threads = max(1, total_cores - 2)  # 保留 2 个核心
+
+                sess_options.intra_op_num_threads = intra_op_threads  # 算子内部并行度（最关键）
+                sess_options.inter_op_num_threads = 1  # 算子间并行度（通常设为 1）
+
+                self.logger.info(
+                    f"CPU 线程配置: 总核心={total_cores}, "
+                    f"SenseVoice 使用={intra_op_threads}, 预留={total_cores - intra_op_threads}"
+                )
+
                 # 选择执行提供者
                 providers = self._get_execution_providers()
                 self.logger.info(f"执行提供者: {providers}")
@@ -540,10 +555,16 @@ class SenseVoiceONNXService:
             # 修复 "laval" 被拆分为 " la" + "val" 的问题
             word_timestamps = self._merge_tokens_to_words(word_timestamps)
 
-            # 4. 提取标签信息
+            # 4. 提取标签信息并使用语言自适应标点归一化
             from ..services.text_normalizer import get_text_normalizer
             normalizer = get_text_normalizer()
-            process_result = normalizer.process(text, extract_info=True)
+
+            # 先提取语言标签
+            tags = normalizer.extract_tags(text)
+            detected_language = tags.get("language") if tags else language
+
+            # 使用检测到的语言进行文本清洗和标点归一化
+            process_result = normalizer.process(text, extract_info=True, language=detected_language)
 
             # 5. 构建结果
             result = {
@@ -551,7 +572,7 @@ class SenseVoiceONNXService:
                 "text_clean": process_result["text_clean"],
                 "words": word_timestamps,
                 "confidence": confidence,
-                "language": process_result["tags"]["language"] if process_result["tags"] else None,
+                "language": detected_language,
                 "emotion": process_result["tags"]["emotion"] if process_result["tags"] else None,
                 "event": process_result["tags"]["event"] if process_result["tags"] else None
             }
@@ -789,6 +810,8 @@ class SenseVoiceONNXService:
             if is_new_word:
                 # 归档上一个词
                 if current_word is not None:
+                    # 清理 SentencePiece 符号 ▁ 和前导空格
+                    current_word["word"] = current_word["word"].lstrip("▁ ")
                     merged_words.append(current_word)
 
                 # 开始新词
@@ -812,8 +835,9 @@ class SenseVoiceONNXService:
                 if token.get("is_pseudo"):
                     current_word["is_pseudo"] = True
 
-        # 归档最后一个词
+        # 归档最后一个词（同样清理前缀）
         if current_word is not None:
+            current_word["word"] = current_word["word"].lstrip("▁ ")
             merged_words.append(current_word)
 
         return merged_words

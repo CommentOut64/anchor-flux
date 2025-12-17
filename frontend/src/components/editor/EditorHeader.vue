@@ -32,7 +32,13 @@
       >
         <template #reference>
           <div class="progress-capsule" :class="{ paused: isPaused }">
-            <div class="progress-track">
+            <!-- Phase 5: 双流进度条 -->
+            <div v-if="showDualStreamProgress" class="dual-progress-track">
+              <div class="progress-layer fast" :style="{ width: dualStreamProgress.fastStream + '%' }"></div>
+              <div class="progress-layer slow" :style="{ width: dualStreamProgress.slowStream + '%' }"></div>
+            </div>
+            <!-- 单流进度条 -->
+            <div v-else class="progress-track">
               <div class="progress-fill" :style="{ width: currentTaskProgress + '%' }"></div>
             </div>
             <!-- 显示阶段标签和进度 -->
@@ -46,7 +52,12 @@
               >
                 {{ phaseLabel }}
               </span>
-              <span class="progress-percent">{{ formatProgress(currentTaskProgress) }}%</span>
+              <!-- Phase 5: 双流进度显示 -->
+              <span v-if="showDualStreamProgress" class="progress-percent dual">
+                <span class="fast-label">S</span>{{ dualStreamProgress.fastStream }}%
+                <span class="slow-label">W</span>{{ dualStreamProgress.slowStream }}%
+              </span>
+              <span v-else class="progress-percent">{{ formatProgress(currentTaskProgress) }}%</span>
             </span>
           </div>
         </template>
@@ -182,7 +193,12 @@ const props = defineProps({
   canUndo: { type: Boolean, default: false },
   canRedo: { type: Boolean, default: false },
   activeTasks: { type: Number, default: 0 },                 // 正在进行的任务数
-  lastSaved: { type: [Number, null], default: null }         // 上次保存时间戳
+  lastSaved: { type: [Number, null], default: null },        // 上次保存时间戳
+  // Phase 5: 双流进度
+  dualStreamProgress: {
+    type: Object,
+    default: () => ({ fastStream: 0, slowStream: 0, totalChunks: 0 })
+  }
 })
 
 defineEmits(['undo', 'redo', 'export', 'pause', 'resume', 'cancel'])
@@ -193,6 +209,11 @@ const isPaused = computed(() => props.currentTaskStatus === 'paused')
 // 是否显示当前任务进度（转录中、排队中、或已暂停）
 const showCurrentTaskProgress = computed(() =>
   ['processing', 'queued', 'paused'].includes(props.currentTaskStatus)
+)
+
+// Phase 5: 是否显示双流进度（双模态对齐模式）
+const showDualStreamProgress = computed(() =>
+  showCurrentTaskProgress.value && props.dualStreamProgress.totalChunks > 0
 )
 
 // 队列进度百分比
@@ -395,6 +416,33 @@ $header-h: 56px;
     }
   }
 
+  // Phase 5: 双流进度条
+  .dual-progress-track {
+    width: 120px;
+    height: 8px;
+    background: var(--border-muted);
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+
+    .progress-layer {
+      position: absolute;
+      left: 0;
+      height: 4px;
+      transition: width 0.3s ease;
+
+      &.fast {
+        top: 0;
+        background: #58a6ff;  // SenseVoice - 蓝色
+      }
+
+      &.slow {
+        bottom: 0;
+        background: #3fb950;  // Whisper - 绿色
+      }
+    }
+  }
+
   .capsule-text {
     display: flex;
     align-items: center;
@@ -413,6 +461,27 @@ $header-h: 56px;
     .progress-percent {
       color: var(--text-secondary);
       font-family: var(--font-mono);
+
+      // Phase 5: 双流进度文字
+      &.dual {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 11px;
+
+        .fast-label {
+          color: #58a6ff;
+          font-weight: 600;
+          margin-right: 1px;
+        }
+
+        .slow-label {
+          color: #3fb950;
+          font-weight: 600;
+          margin-left: 6px;
+          margin-right: 1px;
+        }
+      }
     }
   }
 }

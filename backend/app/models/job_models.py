@@ -1,8 +1,10 @@
 """
-任务相关的数据模型定义
+任务相关的数据模型定义 - v3.5 重构版
+
+与 preset_models.py 中的 1+3 预设模式保持一致
 """
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, TYPE_CHECKING
+from typing import List, Dict, Optional, TYPE_CHECKING, Any
 import torch
 
 # 使用TYPE_CHECKING避免循环导入
@@ -10,85 +12,370 @@ if TYPE_CHECKING:
     from app.services.cpu_affinity_service import CPUAffinityConfig
 
 
+# ========== 分组一: 预处理与音频设置 ==========
+
+@dataclass
+class PreprocessingConfig:
+    """
+    预处理与音频配置 (Demucs 人声分离)
+    对应文档分组一
+    """
+    # 人声分离策略: off/auto/force_on
+    demucs_strategy: str = "auto"
+
+    # 分离模型: htdemucs/htdemucs_ft/mdx_q/mdx_extra
+    demucs_model: str = "htdemucs"
+
+    # 分离预测次数: 1-5
+    demucs_shifts: int = 1
+
+    # 分诊灵敏度: 0.0-1.0 (默认从 spectrum_thresholds.py: 0.35)
+    spectrum_threshold: float = 0.35
+
+    # VAD 静音过滤开关
+    vad_filter: bool = True
+
+
+# ========== 分组二: 转录核心设置 ==========
+
+@dataclass
+class TranscriptionConfig:
+    """
+    转录核心配置 (ASR 引擎)
+    对应文档分组二
+    """
+    # 转录流水线模式: sensevoice_only/sv_whisper_patch/sv_whisper_dual
+    transcription_profile: str = "sensevoice_only"
+
+    # 主引擎运行设备: auto/cpu
+    sensevoice_device: str = "auto"
+
+    # 辅助/补刀模型: tiny/small/medium/large-v3
+    whisper_model: str = "medium"
+
+    # 补刀触发阈值: 0.0-1.0
+    patching_threshold: float = 0.60
+
+
+# ========== 分组三: 增强与润色设置 ==========
+
+@dataclass
+class RefinementConfig:
+    """
+    增强与润色配置 (LLM)
+    对应文档分组三
+    """
+    # LLM 任务目标: off/proofread/translate
+    llm_task: str = "off"
+
+    # 介入范围: sparse/global
+    llm_scope: str = "sparse"
+
+    # 稀疏校对阈值: 0.0-1.0
+    sparse_threshold: float = 0.70
+
+    # 目标语言
+    target_language: str = "zh"
+
+    # 模型提供商: openai_compatible/local_ollama
+    llm_provider: str = "openai_compatible"
+
+    # 模型名称
+    llm_model_name: str = "gpt-4o-mini"
+
+    # API Key (运行时注入，不持久化)
+    api_key: Optional[str] = None
+
+    # 自定义 API 地址
+    base_url: Optional[str] = None
+
+
+# ========== 分组四: 计算与系统设置 ==========
+
+@dataclass
+class ComputeConfig:
+    """
+    计算与系统配置
+    对应文档分组四
+    """
+    # 并发调度策略: auto/parallel/serial
+    concurrency_strategy: str = "auto"
+
+    # GPU 选择
+    gpu_id: int = 0
+
+    # 输出格式列表
+    output_formats: List[str] = field(default_factory=lambda: ["srt"])
+
+    # 临时文件策略: delete_on_complete/keep
+    temp_file_policy: str = "delete_on_complete"
+
+
+# ========== 兼容性: 保留旧的设置类 (带别名) ==========
+# 这些类保留用于向后兼容，新代码应使用上面的新结构
+
 @dataclass
 class DemucsSettings:
-    """Demucs人声分离配置（用户可配置）"""
-    # === 基础开关 ===
-    enabled: bool = True                        # 是否启用Demucs
-    mode: str = "auto"                          # 模式: auto/always/never/on_demand
+    """
+    Demucs人声分离配置 (兼容旧版)
+    新代码请使用 PreprocessingConfig
+    """
+    # 基础配置 - 映射到新字段
+    enabled: bool = True                        # 对应 demucs_strategy != "off"
+    mode: str = "auto"                          # 对应 demucs_strategy
 
-    # === 分级模型配置 ===
-    weak_model: str = "htdemucs"                # 弱BGM使用的模型（速度优先）
-    strong_model: str = "htdemucs"              # 强BGM使用的模型（质量优先）
-    fallback_model: str = "htdemucs"            # 兜底模型（熔断升级后使用）
-    auto_escalation: bool = True                # 是否允许自动升级模型
-    max_escalations: int = 1                    # 最大升级次数
+    # 分级模型配置 - 简化为单一 model 字段
+    weak_model: str = "htdemucs"
+    strong_model: str = "htdemucs"
+    fallback_model: str = "htdemucs"
+    auto_escalation: bool = True
+    max_escalations: int = 1
 
-    # === BGM检测阈值 ===
-    bgm_light_threshold: float = 0.02           # 轻微BGM阈值
-    bgm_heavy_threshold: float = 0.15           # 强BGM阈值
+    # BGM检测阈值 - 映射到 spectrum_threshold
+    bgm_light_threshold: float = 0.02
+    bgm_heavy_threshold: float = 0.15
 
-    # === 质量评估阈值 ===
-    retry_threshold_logprob: float = -0.8       # 重试阈值（avg_logprob）
-    retry_threshold_no_speech: float = 0.6      # 重试阈值（no_speech_prob）
+    # 质量评估阈值
+    retry_threshold_logprob: float = -0.8
+    retry_threshold_no_speech: float = 0.6
 
-    # === 熔断配置 ===
-    circuit_breaker_enabled: bool = True        # 是否启用熔断机制
-    consecutive_threshold: int = 3              # 连续重试触发熔断的阈值
-    ratio_threshold: float = 0.2                # 总重试比例触发熔断的阈值（20%）
+    # 熔断配置
+    circuit_breaker_enabled: bool = True
+    consecutive_threshold: int = 3
+    ratio_threshold: float = 0.2
 
-    # === 熔断处理策略 ===
-    on_break: str = "continue"                  # 熔断后处理策略: continue/fallback/fail/pause
-    mark_problem_segments: bool = True          # 是否在结果中标记问题段落
-    problem_segment_suffix: str = "[?]"         # 问题段落的标记后缀
+    # 熔断处理策略
+    on_break: str = "continue"
+    mark_problem_segments: bool = True
+    problem_segment_suffix: str = "[?]"
 
-    # === 质量预设（简化配置入口） ===
-    quality_preset: str = "balanced"            # 质量预设: fast/balanced/quality
+    # 质量预设
+    quality_preset: str = "balanced"
 
 
 @dataclass
 class SenseVoiceSettings:
-    """SenseVoice 转录引擎配置"""
-    # === 预设方案 ===
-    preset_id: str = "default"                  # 预设ID: default/preset1-5/custom
+    """
+    SenseVoice 转录引擎配置 (兼容旧版)
+    新代码请使用 TranscriptionConfig + RefinementConfig
+    """
+    # 预设方案
+    preset_id: str = "default"
 
-    # === 增强模式 ===
+    # 增强模式 - 映射到 transcription_profile
     enhancement: str = "off"                    # off/smart_patch/deep_listen
-    # - off: 仅 SenseVoice
-    # - smart_patch: 低置信度自动 Whisper 补刀
-    # - deep_listen: Whisper 全文转录
 
-    # === 校对模式 ===
+    # 校对模式 - 映射到 llm_task + llm_scope
     proofread: str = "off"                      # off/sparse/full
-    # - off: 不校对
-    # - sparse: 仅校对低置信度和疑问片段
-    # - full: 滑动窗口全量校对润色
 
-    # === 翻译模式 ===
+    # 翻译模式 - 映射到 llm_task
     translate: str = "off"                      # off/full/partial
-    target_language: str = "en"                 # 翻译目标语言
+    target_language: str = "en"
 
-    # === 阈值配置 ===
-    confidence_threshold: float = 0.6           # 低置信度阈值
-    whisper_patch_threshold: float = 0.5        # 触发 Whisper 补刀的阈值
+    # 阈值配置 - 映射到 patching_threshold
+    confidence_threshold: float = 0.6
+    whisper_patch_threshold: float = 0.5
 
+
+# ========== 任务设置 ==========
 
 @dataclass
 class JobSettings:
-    """转录任务设置"""
-    # === 转录引擎选择 ===
-    engine: str = "sensevoice"                  # 转录引擎: whisper/sensevoice（默认 SenseVoice）
+    """
+    转录任务设置 - v3.5 重构版
 
+    支持两种配置方式:
+    1. 新版 (推荐): 使用 task_config 字段
+    2. 旧版 (兼容): 使用 demucs/sensevoice 字段
+    """
+    # === 转录引擎选择 (兼容旧版) ===
+    engine: str = "sensevoice"                  # whisper/sensevoice
+
+    # === 旧版设置 (兼容) ===
     model: str = "medium"
     compute_type: str = "float16"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size: int = 16
     word_timestamps: bool = False
-    cpu_affinity: Optional["CPUAffinityConfig"] = None  # 使用字符串形式的类型注解
-    demucs: DemucsSettings = field(default_factory=DemucsSettings)  # Demucs配置
-
-    # === SenseVoice 配置 ===
+    cpu_affinity: Optional["CPUAffinityConfig"] = None
+    demucs: DemucsSettings = field(default_factory=DemucsSettings)
     sensevoice: SenseVoiceSettings = field(default_factory=SenseVoiceSettings)
+
+    # === 新版 1+3 预设配置 ===
+    # 选择的宏预设 ID (fast/balanced/quality/custom)
+    preset_id: str = "balanced"
+
+    # 四个设置分组
+    preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
+    transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
+    refinement: RefinementConfig = field(default_factory=RefinementConfig)
+    compute: ComputeConfig = field(default_factory=ComputeConfig)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典"""
+        return {
+            # 新版配置
+            "preset_id": self.preset_id,
+            "preprocessing": {
+                "demucs_strategy": self.preprocessing.demucs_strategy,
+                "demucs_model": self.preprocessing.demucs_model,
+                "demucs_shifts": self.preprocessing.demucs_shifts,
+                "spectrum_threshold": self.preprocessing.spectrum_threshold,
+                "vad_filter": self.preprocessing.vad_filter,
+            },
+            "transcription": {
+                "transcription_profile": self.transcription.transcription_profile,
+                "sensevoice_device": self.transcription.sensevoice_device,
+                "whisper_model": self.transcription.whisper_model,
+                "patching_threshold": self.transcription.patching_threshold,
+            },
+            "refinement": {
+                "llm_task": self.refinement.llm_task,
+                "llm_scope": self.refinement.llm_scope,
+                "sparse_threshold": self.refinement.sparse_threshold,
+                "target_language": self.refinement.target_language,
+                "llm_provider": self.refinement.llm_provider,
+                "llm_model_name": self.refinement.llm_model_name,
+            },
+            "compute": {
+                "concurrency_strategy": self.compute.concurrency_strategy,
+                "gpu_id": self.compute.gpu_id,
+                "output_formats": self.compute.output_formats,
+                "temp_file_policy": self.compute.temp_file_policy,
+            },
+            # 旧版配置 (兼容)
+            "engine": self.engine,
+            "model": self.model,
+            "compute_type": self.compute_type,
+            "device": self.device,
+            "batch_size": self.batch_size,
+            "word_timestamps": self.word_timestamps,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "JobSettings":
+        """从字典创建设置"""
+        # 解析新版配置
+        preprocessing_data = data.get("preprocessing", {})
+        transcription_data = data.get("transcription", {})
+        refinement_data = data.get("refinement", {})
+        compute_data = data.get("compute", {})
+
+        # 解析旧版配置
+        demucs_data = data.get("demucs", {})
+        sensevoice_data = data.get("sensevoice", {})
+
+        return cls(
+            # 新版配置
+            preset_id=data.get("preset_id", "balanced"),
+            preprocessing=PreprocessingConfig(
+                demucs_strategy=preprocessing_data.get("demucs_strategy", "auto"),
+                demucs_model=preprocessing_data.get("demucs_model", "htdemucs"),
+                demucs_shifts=preprocessing_data.get("demucs_shifts", 1),
+                spectrum_threshold=preprocessing_data.get("spectrum_threshold", 0.35),
+                vad_filter=preprocessing_data.get("vad_filter", True),
+            ),
+            transcription=TranscriptionConfig(
+                transcription_profile=transcription_data.get("transcription_profile", "sensevoice_only"),
+                sensevoice_device=transcription_data.get("sensevoice_device", "auto"),
+                whisper_model=transcription_data.get("whisper_model", "medium"),
+                patching_threshold=transcription_data.get("patching_threshold", 0.60),
+            ),
+            refinement=RefinementConfig(
+                llm_task=refinement_data.get("llm_task", "off"),
+                llm_scope=refinement_data.get("llm_scope", "sparse"),
+                sparse_threshold=refinement_data.get("sparse_threshold", 0.70),
+                target_language=refinement_data.get("target_language", "zh"),
+                llm_provider=refinement_data.get("llm_provider", "openai_compatible"),
+                llm_model_name=refinement_data.get("llm_model_name", "gpt-4o-mini"),
+            ),
+            compute=ComputeConfig(
+                concurrency_strategy=compute_data.get("concurrency_strategy", "auto"),
+                gpu_id=compute_data.get("gpu_id", 0),
+                output_formats=compute_data.get("output_formats", ["srt"]),
+                temp_file_policy=compute_data.get("temp_file_policy", "delete_on_complete"),
+            ),
+            # 旧版配置
+            engine=data.get("engine", "sensevoice"),
+            model=data.get("model", "medium"),
+            compute_type=data.get("compute_type", "float16"),
+            device=data.get("device", "cuda"),
+            batch_size=data.get("batch_size", 16),
+            word_timestamps=data.get("word_timestamps", False),
+            demucs=DemucsSettings(
+                enabled=demucs_data.get("enabled", True),
+                mode=demucs_data.get("mode", "auto"),
+                weak_model=demucs_data.get("weak_model", "htdemucs"),
+                strong_model=demucs_data.get("strong_model", "htdemucs"),
+                fallback_model=demucs_data.get("fallback_model", "htdemucs"),
+                auto_escalation=demucs_data.get("auto_escalation", True),
+                max_escalations=demucs_data.get("max_escalations", 1),
+                bgm_light_threshold=demucs_data.get("bgm_light_threshold", 0.02),
+                bgm_heavy_threshold=demucs_data.get("bgm_heavy_threshold", 0.15),
+                retry_threshold_logprob=demucs_data.get("retry_threshold_logprob", -0.8),
+                retry_threshold_no_speech=demucs_data.get("retry_threshold_no_speech", 0.6),
+                circuit_breaker_enabled=demucs_data.get("circuit_breaker_enabled", True),
+                consecutive_threshold=demucs_data.get("consecutive_threshold", 3),
+                ratio_threshold=demucs_data.get("ratio_threshold", 0.2),
+                on_break=demucs_data.get("on_break", "continue"),
+                mark_problem_segments=demucs_data.get("mark_problem_segments", True),
+                problem_segment_suffix=demucs_data.get("problem_segment_suffix", "[?]"),
+                quality_preset=demucs_data.get("quality_preset", "balanced"),
+            ),
+            sensevoice=SenseVoiceSettings(
+                preset_id=sensevoice_data.get("preset_id", "default"),
+                enhancement=sensevoice_data.get("enhancement", "off"),
+                proofread=sensevoice_data.get("proofread", "off"),
+                translate=sensevoice_data.get("translate", "off"),
+                target_language=sensevoice_data.get("target_language", "en"),
+                confidence_threshold=sensevoice_data.get("confidence_threshold", 0.6),
+                whisper_patch_threshold=sensevoice_data.get("whisper_patch_threshold", 0.5),
+            ),
+        )
+
+    @classmethod
+    def from_preset(cls, preset_id: str) -> "JobSettings":
+        """从预设创建设置"""
+        from app.models.preset_models import MACRO_PRESETS, PRESET_BALANCED
+
+        preset = MACRO_PRESETS.get(preset_id)
+        if not preset:
+            preset = PRESET_BALANCED
+            preset_id = "balanced"
+
+        return cls(
+            preset_id=preset_id,
+            preprocessing=PreprocessingConfig(
+                demucs_strategy=preset.preprocessing.demucs_strategy,
+                demucs_model=preset.preprocessing.demucs_model,
+                demucs_shifts=preset.preprocessing.demucs_shifts,
+                spectrum_threshold=preset.preprocessing.spectrum_threshold,
+                vad_filter=preset.preprocessing.vad_filter,
+            ),
+            transcription=TranscriptionConfig(
+                transcription_profile=preset.transcription.transcription_profile,
+                sensevoice_device=preset.transcription.sensevoice_device,
+                whisper_model=preset.transcription.whisper_model,
+                patching_threshold=preset.transcription.patching_threshold,
+            ),
+            refinement=RefinementConfig(
+                llm_task=preset.refinement.llm_task,
+                llm_scope=preset.refinement.llm_scope,
+                sparse_threshold=preset.refinement.sparse_threshold,
+                target_language=preset.refinement.target_language,
+                llm_provider=preset.refinement.llm_provider,
+                llm_model_name=preset.refinement.llm_model_name,
+            ),
+            compute=ComputeConfig(
+                concurrency_strategy=preset.compute.concurrency_strategy,
+                gpu_id=preset.compute.gpu_id,
+                output_formats=preset.compute.output_formats,
+                temp_file_policy=preset.compute.temp_file_policy,
+            ),
+            # 根据预设设置旧版字段的默认值
+            engine="sensevoice",
+            model=preset.transcription.whisper_model,
+        )
 
 
 @dataclass
@@ -126,6 +413,7 @@ class JobState:
     canceled: bool = False
     paused: bool = False  # 暂停标志
     title: str = ""  # 用户自定义的任务名称，为空时使用 filename
+    createdAt: Optional[int] = None  # 创建时间戳
 
     # 媒体状态（用于编辑器，转录完成后更新）
     media_status: Optional[MediaStatus] = None
@@ -160,49 +448,7 @@ class JobState:
             "srt_path": self.srt_path,
             "canceled": self.canceled,
             "paused": self.paused,
-            "settings": {
-                "engine": self.settings.engine,
-                "model": self.settings.model,
-                "compute_type": self.settings.compute_type,
-                "device": self.settings.device,
-                "batch_size": self.settings.batch_size,
-                "word_timestamps": self.settings.word_timestamps,
-                "demucs": {
-                    "enabled": self.settings.demucs.enabled,
-                    "mode": self.settings.demucs.mode,
-                    # 分级模型配置
-                    "weak_model": self.settings.demucs.weak_model,
-                    "strong_model": self.settings.demucs.strong_model,
-                    "fallback_model": self.settings.demucs.fallback_model,
-                    "auto_escalation": self.settings.demucs.auto_escalation,
-                    "max_escalations": self.settings.demucs.max_escalations,
-                    # BGM检测阈值
-                    "bgm_light_threshold": self.settings.demucs.bgm_light_threshold,
-                    "bgm_heavy_threshold": self.settings.demucs.bgm_heavy_threshold,
-                    # 质量评估阈值
-                    "retry_threshold_logprob": self.settings.demucs.retry_threshold_logprob,
-                    "retry_threshold_no_speech": self.settings.demucs.retry_threshold_no_speech,
-                    # 熔断配置
-                    "circuit_breaker_enabled": self.settings.demucs.circuit_breaker_enabled,
-                    "consecutive_threshold": self.settings.demucs.consecutive_threshold,
-                    "ratio_threshold": self.settings.demucs.ratio_threshold,
-                    # 熔断处理策略
-                    "on_break": self.settings.demucs.on_break,
-                    "mark_problem_segments": self.settings.demucs.mark_problem_segments,
-                    "problem_segment_suffix": self.settings.demucs.problem_segment_suffix,
-                    # 质量预设
-                    "quality_preset": self.settings.demucs.quality_preset,
-                },
-                "sensevoice": {
-                    "preset_id": self.settings.sensevoice.preset_id,
-                    "enhancement": self.settings.sensevoice.enhancement,
-                    "proofread": self.settings.sensevoice.proofread,
-                    "translate": self.settings.sensevoice.translate,
-                    "target_language": self.settings.sensevoice.target_language,
-                    "confidence_threshold": self.settings.sensevoice.confidence_threshold,
-                    "whisper_patch_threshold": self.settings.sensevoice.whisper_patch_threshold,
-                }
-            },
+            "settings": self.settings.to_dict(),
             "updated_at": time.time()
         }
 
@@ -218,59 +464,7 @@ class JobState:
             JobState: 恢复的任务状态对象
         """
         settings_data = data.get("settings", {})
-
-        # 处理 Demucs 配置（向后兼容：如果没有则使用默认值）
-        demucs_data = settings_data.get("demucs", {})
-        demucs_settings = DemucsSettings(
-            # 基础配置
-            enabled=demucs_data.get("enabled", True),
-            mode=demucs_data.get("mode", "auto"),
-            # 分级模型配置
-            weak_model=demucs_data.get("weak_model", "htdemucs"),
-            strong_model=demucs_data.get("strong_model", "htdemucs"),
-            fallback_model=demucs_data.get("fallback_model", "htdemucs"),
-            auto_escalation=demucs_data.get("auto_escalation", True),
-            max_escalations=demucs_data.get("max_escalations", 1),
-            # BGM检测阈值
-            bgm_light_threshold=demucs_data.get("bgm_light_threshold", 0.02),
-            bgm_heavy_threshold=demucs_data.get("bgm_heavy_threshold", 0.15),
-            # 质量评估阈值
-            retry_threshold_logprob=demucs_data.get("retry_threshold_logprob", -0.8),
-            retry_threshold_no_speech=demucs_data.get("retry_threshold_no_speech", 0.6),
-            # 熔断配置
-            circuit_breaker_enabled=demucs_data.get("circuit_breaker_enabled", True),
-            consecutive_threshold=demucs_data.get("consecutive_threshold", 3),
-            ratio_threshold=demucs_data.get("ratio_threshold", 0.2),
-            # 熔断处理策略
-            on_break=demucs_data.get("on_break", "continue"),
-            mark_problem_segments=demucs_data.get("mark_problem_segments", True),
-            problem_segment_suffix=demucs_data.get("problem_segment_suffix", "[?]"),
-            # 质量预设
-            quality_preset=demucs_data.get("quality_preset", "balanced"),
-        )
-
-        # 处理 SenseVoice 配置（向后兼容）
-        sensevoice_data = settings_data.get("sensevoice", {})
-        sensevoice_settings = SenseVoiceSettings(
-            preset_id=sensevoice_data.get("preset_id", "default"),
-            enhancement=sensevoice_data.get("enhancement", "off"),
-            proofread=sensevoice_data.get("proofread", "off"),
-            translate=sensevoice_data.get("translate", "off"),
-            target_language=sensevoice_data.get("target_language", "en"),
-            confidence_threshold=sensevoice_data.get("confidence_threshold", 0.6),
-            whisper_patch_threshold=sensevoice_data.get("whisper_patch_threshold", 0.5),
-        )
-
-        settings = JobSettings(
-            engine=settings_data.get("engine", "whisper"),
-            model=settings_data.get("model", "medium"),
-            compute_type=settings_data.get("compute_type", "float16"),
-            device=settings_data.get("device", "cuda"),
-            batch_size=settings_data.get("batch_size", 16),
-            word_timestamps=settings_data.get("word_timestamps", False),
-            demucs=demucs_settings,
-            sensevoice=sensevoice_settings,
-        )
+        settings = JobSettings.from_dict(settings_data)
 
         return cls(
             job_id=data["job_id"],

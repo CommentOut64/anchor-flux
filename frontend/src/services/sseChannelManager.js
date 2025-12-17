@@ -87,7 +87,10 @@ class SSEChannelManager extends EventEmitter {
    *     onSignal: (signal, data) => void,
    *     onComplete: (data) => void,
    *     onFailed: (data) => void,
-   *     onProxyProgress: (progress) => void
+   *     onProxyProgress: (progress) => void,
+   *     // Phase 5: 双模态架构新增
+   *     onDraft: (data) => void,           // 草稿字幕（快流/SenseVoice）
+   *     onReplaceChunk: (data) => void     // 替换 Chunk（慢流/Whisper）
    *   }
    * @returns {Function} 取消订阅函数
    */
@@ -193,6 +196,22 @@ class SSEChannelManager extends EventEmitter {
       // === 字幕流式事件（新格式带命名空间前缀） ===
       'subtitle.segment': handleSegment,
       'subtitle.aligned': handleAligned,
+
+      // Phase 5: 双模态架构 - 草稿事件（快流/SenseVoice）
+      'subtitle.draft': (data) => {
+        console.log(`[SSE Job ${jobId}] 草稿字幕:`, data)
+        handlers.onDraft?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+
+      // Phase 5: 双模态架构 - 替换 Chunk 事件（慢流/Whisper）
+      'subtitle.replace_chunk': (data) => {
+        console.log(`[SSE Job ${jobId}] 替换 Chunk:`, data)
+        handlers.onReplaceChunk?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+
+      // 旧版事件 (兼容)
       'subtitle.sv_sentence': (data) => {
         console.log(`[SSE Job ${jobId}] SenseVoice 句子:`, data)
         handlers.onSvSentence?.(data)
@@ -219,11 +238,43 @@ class SSEChannelManager extends EventEmitter {
         handlers.onSubtitleUpdate?.(data)
       },
 
-      // === Proxy 相关事件 ===
+      // === 视频转码相关事件 ===
+      // 分析完成事件（新增：智能转码决策）
+      analyze_complete: (data) => {
+        console.log(`[SSE Job ${jobId}] 分析完成:`, data.decision)
+        handlers.onAnalyzeComplete?.(data)
+      },
+      // 容器重封装进度（新增：零转码优化）
+      remux_progress: (data) => {
+        console.log(`[SSE Job ${jobId}] 重封装进度:`, data.progress)
+        handlers.onRemuxProgress?.(data)
+      },
+      // 容器重封装完成（新增）
+      remux_complete: (data) => {
+        console.log(`[SSE Job ${jobId}] 重封装完成`)
+        handlers.onRemuxComplete?.(data)
+      },
+      // Proxy 错误事件（新增：统一错误处理）
+      proxy_error: (data) => {
+        console.error(`[SSE Job ${jobId}] Proxy 错误:`, data.message)
+        handlers.onProxyError?.(data)
+      },
+      // 360p 预览进度
+      preview_360p_progress: (data) => {
+        console.log(`[SSE Job ${jobId}] 360p 预览进度:`, data.progress)
+        handlers.onPreview360pProgress?.(data)
+      },
+      // 360p 预览完成
+      preview_360p_complete: (data) => {
+        console.log(`[SSE Job ${jobId}] 360p 预览完成:`, data)
+        handlers.onPreview360pComplete?.(data)
+      },
+      // 720p Proxy 进度
       proxy_progress: (data) => {
         console.log(`[SSE Job ${jobId}] Proxy 进度:`, data.progress)
         handlers.onProxyProgress?.(data)
       },
+      // 720p Proxy 完成
       proxy_complete: (data) => {
         console.log(`[SSE Job ${jobId}] Proxy 完成:`, data)
         handlers.onProxyComplete?.(data)

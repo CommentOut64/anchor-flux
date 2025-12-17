@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from collections import OrderedDict  # 新增导入
 from pydub import AudioSegment, silence
 from app.services.whisper_service import get_whisper_service, load_audio as whisper_load_audio
+from app.services.config_adapter import ConfigAdapter
 import torch
 import shutil
 import psutil
@@ -540,6 +541,20 @@ class TranscriptionService:
 
         # 持久化任务元信息（重启后可恢复）
         self.save_job_meta(job)
+
+        # 立即异步提取音频，确保前端能加载波形图（不阻塞响应）
+        audio_path = job_dir / 'audio.wav'
+        if not audio_path.exists():
+            self.logger.info(f"[{job_id}] 启动后台音频提取...")
+            import threading
+            threading.Thread(
+                target=self._extract_audio_async_wrapper,
+                args=(str(dest_path), str(audio_path), job_id),
+                daemon=True,
+                name=f"AudioExtract-{job_id[:8]}"
+            ).start()
+        else:
+            self.logger.debug(f"[{job_id}] 音频文件已存在，跳过提取")
 
         self.logger.info(f"任务已创建: {job_id} - {filename}")
         return job
@@ -1138,9 +1153,120 @@ class TranscriptionService:
 
             self.logger.info(f"已触发媒体预处理任务: {job_id}")
 
+            # 触发 720p 高清转码（队列空闲时执行）
+            self._trigger_720p_transcode_if_idle(job_id)
+
         except Exception as e:
             # 预处理失败不影响转录结果
             self.logger.warning(f"触发媒体预处理失败（非致命）: {e}")
+
+    def _trigger_720p_transcode_if_idle(self, job_id: str):
+        """
+        在转录完成后触发 720p 高清转码（仅在队列空闲时）
+
+        策略:
+        1. 检查视频是否需要转码（H.265 等）
+        2. 检查转录队列是否空闲
+        3. 如果空闲，立即启动 720p 转码
+        4. 如果队列有任务，延迟触发（使用低优先级）
+        """
+        try:
+            from pathlib import Path
+            from app.core.config import config
+            from app.services.media_prep_service import get_media_prep_service
+
+            self.logger.info(f"[720p] 开始检查是否需要触发720p转码: {job_id}")
+
+            job_dir = config.JOBS_DIR / job_id
+            if not job_dir.exists():
+                self.logger.info(f"[720p] 任务目录不存在，跳过: {job_id}")
+                return
+
+            # 查找视频文件
+            video_file = None
+            video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
+            for file in job_dir.iterdir():
+                if file.is_file() and file.suffix.lower() in video_exts:
+                    video_file = file
+                    break
+
+            if not video_file:
+                self.logger.info(f"[720p] 未找到视频文件，跳过: {job_id}")
+                return
+
+            self.logger.info(f"[720p] 找到视频文件: {video_file.name}")
+
+            # 使用正确的文件名：proxy_720p.mp4
+            proxy_720p = job_dir / "proxy_720p.mp4"
+
+            # 720p 已存在则跳过
+            if proxy_720p.exists():
+                self.logger.info(f"[720p] 已存在，跳过: {job_id}")
+                return
+
+            media_prep = get_media_prep_service()
+
+            # 检查 720p 是否已在队列中
+            proxy_status = media_prep.get_proxy_status(job_id)
+            if proxy_status and proxy_status.get("status") in ["queued", "processing", "completed"]:
+                self.logger.info(f"[720p] 任务已存在或完成（状态={proxy_status.get('status')}），跳过: {job_id}")
+                return
+
+            # 检查 360p 预览是否已完成（必须先有360p才能启动720p）
+            # 修复：优先检查文件是否存在，因为内存状态可能在服务重启后丢失
+            preview_360p = job_dir / "preview_360p.mp4"
+
+            # 文件存在即认为360p已完成（内存状态可能丢失）
+            if preview_360p.exists():
+                preview_completed = True
+                self.logger.debug(f"[720p] 360p文件存在，认为已完成: {job_id}")
+            else:
+                # 文件不存在，检查内存状态（可能正在转码中）
+                preview_status = media_prep.get_preview_status(job_id)
+                preview_completed = preview_status and preview_status.get("status") == "completed"
+
+            if not preview_completed:
+                self.logger.info(f"[720p] 360p预览未完成，跳过720p转码: {job_id}")
+                return
+
+            # 检查转录队列是否空闲
+            queue_idle = self._is_transcription_queue_idle()
+            self.logger.info(f"[720p] 队列空闲状态: {queue_idle}")
+
+            if queue_idle:
+                # 队列空闲，立即启动（正常优先级）
+                self.logger.info(f"[720p] 队列空闲，立即启动转码: {job_id}")
+                success = media_prep.enqueue_proxy(job_id, video_file, proxy_720p, priority=10)
+                self.logger.info(f"[720p] 入队结果: {success}")
+            else:
+                # 队列繁忙，使用低优先级（独立进程模式）
+                self.logger.info(f"[720p] 队列繁忙，低优先级排队: {job_id}")
+                success = media_prep.enqueue_proxy(job_id, video_file, proxy_720p, priority=1)
+                self.logger.info(f"[720p] 入队结果: {success}")
+
+        except Exception as e:
+            self.logger.warning(f"[720p] 触发转码失败（非致命）: {e}")
+
+    def _is_transcription_queue_idle(self) -> bool:
+        """检查转录任务队列是否空闲"""
+        try:
+            from app.services.job_queue_service import get_job_queue
+
+            job_queue = get_job_queue()
+            if not job_queue:
+                return True
+
+            # 检查是否有正在处理或等待的任务
+            active_jobs = [
+                j for j in job_queue.jobs.values()
+                if j.status in ['pending', 'processing', 'queued']
+            ]
+
+            return len(active_jobs) == 0
+
+        except Exception as e:
+            self.logger.debug(f"检查队列状态失败: {e}")
+            return True  # 默认认为空闲
 
     def _push_sse_segment(self, job: JobState, segment_result: dict, processed: int, total: int):
         """
@@ -1224,6 +1350,8 @@ class TranscriptionService:
             job: 任务状态对象（用于获取settings）
         """
         # 添加原始设置到checkpoint（用于校验参数兼容性）
+        # 使用 ConfigAdapter 统一新旧配置
+        demucs_strategy = ConfigAdapter.get_demucs_strategy(job.settings)
         data["original_settings"] = {
             "model": job.settings.model,
             "device": job.settings.device,
@@ -1231,16 +1359,16 @@ class TranscriptionService:
             "compute_type": job.settings.compute_type,
             "batch_size": job.settings.batch_size,
             "demucs": {
-                "enabled": job.settings.demucs.enabled,
-                "mode": job.settings.demucs.mode,
+                "enabled": ConfigAdapter.is_demucs_enabled(job.settings),
+                "mode": demucs_strategy,
             }
         }
 
         # 确保 demucs 字段存在（向后兼容）
         if "demucs" not in data:
             data["demucs"] = {
-                "enabled": job.settings.demucs.enabled,
-                "mode": job.settings.demucs.mode,
+                "enabled": ConfigAdapter.is_demucs_enabled(job.settings),
+                "mode": demucs_strategy,
                 "bgm_level": "none",
                 "bgm_ratios": [],
                 "global_separation_done": False,
@@ -2583,13 +2711,13 @@ class TranscriptionService:
             sse_manager = get_sse_manager()
             channel_id = f"job:{job.job_id}"
 
-            # 构造事件数据
+            # 构造事件数据 (使用 ConfigAdapter 兼容新旧配置)
             event_data = {
                 "from_model": from_model,
                 "to_model": to_model,
                 "reason": reason,
                 "escalation_count": breaker_state.escalation_count,
-                "max_escalations": job.settings.demucs.max_escalations,
+                "max_escalations": ConfigAdapter.get_max_escalations(job.settings),
                 "stats": breaker_state.get_stats()
             }
 
@@ -2896,6 +3024,21 @@ class TranscriptionService:
             self.logger.warning(f"Demucs重试失败: {e}")
 
         return result
+
+    def _extract_audio_async_wrapper(self, input_file: str, audio_out: str, job_id: str):
+        """
+        音频提取的异步包装器（在后台线程中调用）
+        用于在任务创建时立即提取音频，不阻塞响应
+        """
+        try:
+            self.logger.info(f"[{job_id}] 开始异步提取音频...")
+            success = self._extract_audio(input_file, audio_out)
+            if success:
+                self.logger.info(f"[{job_id}] 异步音频提取完成: {audio_out}")
+            else:
+                self.logger.error(f"[{job_id}] 异步音频提取失败")
+        except Exception as e:
+            self.logger.error(f"[{job_id}] 异步音频提取异常: {e}", exc_info=True)
 
     def _extract_audio(self, input_file: str, audio_out: str) -> bool:
         """
@@ -3845,7 +3988,7 @@ class TranscriptionService:
         from app.services.sensevoice_onnx_service import get_sensevoice_service
         from app.models.sensevoice_models import SenseVoiceResult, WordTimestamp
 
-        self.logger.info("调用 SenseVoice 转录服务")
+        self.logger.debug("调用 SenseVoice 转录服务")
 
         try:
             service = get_sensevoice_service()
@@ -3856,10 +3999,11 @@ class TranscriptionService:
                 service.load_model()
 
             # 调用转录（返回字典）
+            # 注: SenseVoice 的 language 参数实际上是自动检测，这里传入 "auto" 即可
             result_dict = service.transcribe_audio_array(
                 audio_array=audio_array,
                 sample_rate=sample_rate,
-                language=job.settings.sensevoice.preset_id if hasattr(job.settings, 'sensevoice') else "auto"
+                language="auto"
             )
 
             # 转换为 SenseVoiceResult 对象
@@ -3881,7 +4025,7 @@ class TranscriptionService:
                 raw_result=result_dict
             )
 
-            self.logger.info(f"SenseVoice 转录完成: {len(result.text_clean)} 字符, {len(words)} 个字")
+            self.logger.debug(f"SenseVoice 转录完成: {len(result.text_clean)} 字符, {len(words)} 个字")
             return result
 
         except Exception as e:
@@ -3910,7 +4054,7 @@ class TranscriptionService:
         from app.models.sensevoice_models import SentenceSegment, TextSource
         from app.services.sentence_splitter import SentenceSplitter, SplitConfig
 
-        self.logger.info(f"开始句子切分: {len(sv_result.words)} 个字")
+        self.logger.debug(f"开始句子切分: {len(sv_result.words)} 个字")
 
         if not sv_result.words:
             return []
@@ -3958,7 +4102,7 @@ class TranscriptionService:
                 word.start += chunk_start_time
                 word.end += chunk_start_time
 
-        self.logger.info(f"句子切分完成: {len(sentences)} 句")
+        self.logger.debug(f"句子切分完成: {len(sentences)} 句")
         return sentences
 
     def _split_text_by_punctuation(self, text: str) -> List[str]:
@@ -4076,6 +4220,10 @@ class TranscriptionService:
             lines.append("")
 
         # 写入文件
+        # 确保父目录存在
+        from pathlib import Path
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
 
@@ -4351,9 +4499,9 @@ class TranscriptionService:
 
             # 5. 处理决策
             if decision.action == FuseAction.ACCEPT:
-                # 接受结果，推送 SSE，返回
-                for sent in sentences:
-                    subtitle_manager.add_sentence(sent)
+                # 接受结果，推送草稿事件（Phase 5: 双模态架构）
+                # 使用 add_draft_sentences 批量推送，触发 subtitle.draft 事件
+                subtitle_manager.add_draft_sentences(chunk_state.chunk_index, sentences)
                 return sentences
 
             elif decision.action == FuseAction.UPGRADE_SEPARATION:
@@ -4374,8 +4522,7 @@ class TranscriptionService:
 
             else:
                 # 未知动作，接受当前结果
-                for sent in sentences:
-                    subtitle_manager.add_sentence(sent)
+                subtitle_manager.add_draft_sentences(chunk_state.chunk_index, sentences)
                 return sentences
 
     async def _whisper_text_patch_with_arbitration(
@@ -4415,13 +4562,24 @@ class TranscriptionService:
             self.logger.info("加载 Whisper 模型...")
             whisper_service.load_model()  # 自动下载 CTranslate2 格式模型
 
-        # 提取对应时间段的音频
+        # 提取对应时间段的音频（增加前向重叠，为 Whisper 提供上下文预热）
         sr = 16000
-        start_sample = int(sentence.start * sr)
+        WHISPER_OVERLAP_SEC = 0.5  # Whisper 上下文重叠时长（秒）
+
+        # 计算重叠后的起始位置（不小于0）
+        overlap_start = max(0.0, sentence.start - WHISPER_OVERLAP_SEC)
+        start_sample = int(overlap_start * sr)
         end_sample = int(sentence.end * sr)
         audio_segment = audio_array[start_sample:end_sample]
 
-        # 获取上下文提示
+        # 记录日志（调试用）
+        if overlap_start < sentence.start:
+            self.logger.debug(
+                f"Whisper 补刀添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
+                f"[{overlap_start:.2f}s, {sentence.end:.2f}s]"
+            )
+
+        # 获取上下文提示（现在使用清洗后的文本，避免下划线等原始 token）
         context = subtitle_manager.get_context_window(sentence_index)
 
         # Whisper 转录
@@ -4429,11 +4587,109 @@ class TranscriptionService:
             audio=audio_segment,
             initial_prompt=context,
             language=getattr(job.settings, 'language', 'auto'),
-            word_timestamps=False
+            word_timestamps=False,
+            condition_on_previous_text=False  # 禁用前文条件化，避免与 initial_prompt 形成双重提示词增益
         )
 
         whisper_text = result.get('text', '').strip()
         whisper_conf = self._estimate_whisper_confidence(result)
+        segments = result.get('segments', [])
+
+        # ========== 第三道防线: 双流校验与置信度门控 ==========
+        from app.services.text_normalizer import TextNormalizer
+
+        # A. avg_logprob 检查（模型在瞎猜）
+        avg_logprob = -0.5  # 默认值
+        avg_no_speech = 0.0  # 默认值
+        if segments:
+            avg_logprob = sum(s.get('avg_logprob', -0.5) for s in segments) / len(segments)
+            avg_no_speech = sum(s.get('no_speech_prob', 0.0) for s in segments) / len(segments)
+
+            # 熔断条件1: avg_logprob 过低（模型不确信）
+            if avg_logprob < -1.0:
+                self.logger.warning(
+                    f"Whisper 熔断(avg_logprob={avg_logprob:.2f} < -1.0) {sentence_index}: "
+                    f"'{whisper_text[:50]}...', 回退到 SenseVoice"
+                )
+                return sentence
+
+            # 熔断条件2: no_speech_prob 高但仍输出文本（静音段被强行翻译）
+            if avg_no_speech > 0.6 and whisper_text:
+                self.logger.warning(
+                    f"Whisper 熔断(no_speech={avg_no_speech:.2f} > 0.6) {sentence_index}: "
+                    f"'{whisper_text[:50]}...', 回退到 SenseVoice"
+                )
+                return sentence
+
+        # B. 幻觉正则检测（使用升级后的 TextNormalizer）
+        if TextNormalizer.is_whisper_hallucination(whisper_text):
+            self.logger.warning(
+                f"Whisper 熔断(幻觉检测) {sentence_index}: '{whisper_text[:50]}...', 回退到 SenseVoice"
+            )
+            return sentence
+
+        # C. 双流长度/内容对比（关键创新）
+        sensevoice_text = sentence.text_clean or sentence.text or ""
+
+        # 特殊情况: SenseVoice 为空，但 Whisper 有输出
+        if not sensevoice_text and whisper_text:
+            # 如果 Whisper 置信度极高，给予特权放行
+            if avg_logprob > -0.5:
+                self.logger.info(
+                    f"SenseVoice 为空，Whisper 高置信度(logprob={avg_logprob:.2f})特权放行 {sentence_index}: "
+                    f"'{whisper_text[:50]}...'"
+                )
+                # 继续正常流程
+            else:
+                # Whisper 置信度不够高，保守起见不采纳
+                self.logger.warning(
+                    f"SenseVoice 为空，Whisper 置信度不足(logprob={avg_logprob:.2f}) {sentence_index}: "
+                    f"'{whisper_text[:50]}...', 保持 SenseVoice 空结果"
+                )
+                return sentence
+
+        # 长度暴涨检测: Whisper 输出远超 SenseVoice
+        if sensevoice_text:
+            len_sv = len(sensevoice_text)
+            len_w = len(whisper_text)
+
+            # 公式: len(whisper) > 3 * len(sensevoice) + 10
+            if len_w > 3 * len_sv + 10:
+                # 特权放行: 如果 Whisper 置信度极高，可能是 SenseVoice 漏识别
+                if avg_logprob > -0.5:
+                    self.logger.info(
+                        f"Whisper 长度暴涨但置信度高(logprob={avg_logprob:.2f}) {sentence_index}, 特权放行"
+                    )
+                else:
+                    self.logger.warning(
+                        f"Whisper 熔断(长度暴涨 {len_w} > 3*{len_sv}+10) {sentence_index}: "
+                        f"'{whisper_text[:50]}...', 回退到 SenseVoice"
+                    )
+                    return sentence
+
+        # D. 原有检测逻辑（保留兼容）
+        if context and whisper_text:
+            # 检测是否包含大量下划线（幻觉标志）
+            underscore_ratio = whisper_text.count('_') / max(len(whisper_text), 1)
+            if underscore_ratio > 0.3:  # 超过 30% 是下划线
+                self.logger.warning(
+                    f"Whisper 补刀检测到下划线幻觉 {sentence_index}: "
+                    f"'{whisper_text[:50]}...' (下划线占比 {underscore_ratio:.1%}), 回退到 SenseVoice"
+                )
+                return sentence
+
+            # 检测是否重复了提示词内容（相似度过高）
+            context_words = set(context.split())
+            whisper_words = set(whisper_text.split())
+            if len(context_words) > 0:
+                overlap_ratio = len(context_words & whisper_words) / len(context_words)
+                # 如果 Whisper 输出与 context 重叠度超过 80%，且长度相近，可能是照抄
+                if overlap_ratio > 0.8 and abs(len(whisper_text) - len(context)) < len(context) * 0.3:
+                    self.logger.warning(
+                        f"Whisper 补刀检测到提示词重复 {sentence_index}: "
+                        f"与 context 重叠度 {overlap_ratio:.1%}, 回退到 SenseVoice"
+                    )
+                    return sentence
 
         # === 判决时刻 ===
         if is_trash_suspect:
@@ -4513,13 +4769,24 @@ class TranscriptionService:
             self.logger.info("加载 Whisper 模型...")
             whisper_service.load_model()  # 自动下载 CTranslate2 格式模型
 
-        # 提取对应时间段的音频（使用 SenseVoice 的时间窗口）
+        # 提取对应时间段的音频（增加前向重叠，为 Whisper 提供上下文预热）
         sr = 16000
-        start_sample = int(sentence.start * sr)
+        WHISPER_OVERLAP_SEC = 0.5  # Whisper 上下文重叠时长（秒）
+
+        # 计算重叠后的起始位置（不小于0）
+        overlap_start = max(0.0, sentence.start - WHISPER_OVERLAP_SEC)
+        start_sample = int(overlap_start * sr)
         end_sample = int(sentence.end * sr)
         audio_segment = audio_array[start_sample:end_sample]
 
-        # 获取上下文提示
+        # 记录日志（调试用）
+        if overlap_start < sentence.start:
+            self.logger.debug(
+                f"Whisper 补刀添加 {sentence.start - overlap_start:.2f}s 前向重叠: "
+                f"[{overlap_start:.2f}s, {sentence.end:.2f}s]"
+            )
+
+        # 获取上下文提示（现在使用清洗后的文本，避免下划线等原始 token）
         context = subtitle_manager.get_context_window(sentence_index)
 
         # Whisper 转录（仅取文本，弃用时间戳）
@@ -4527,10 +4794,88 @@ class TranscriptionService:
             audio=audio_segment,
             initial_prompt=context,
             language=getattr(job.settings, 'language', 'auto'),
-            word_timestamps=False  # 不需要字级时间戳，使用伪对齐
+            word_timestamps=False,  # 不需要字级时间戳，使用伪对齐
+            condition_on_previous_text=False  # 禁用前文条件化，避免与 initial_prompt 形成双重提示词增益
         )
 
         whisper_text = result.get('text', '').strip()
+        segments = result.get('segments', [])
+
+        # ========== 第三道防线: 双流校验与置信度门控 ==========
+        from app.services.text_normalizer import TextNormalizer
+
+        # A. avg_logprob 检查（模型在瞎猜）
+        avg_logprob = -0.5  # 默认值
+        avg_no_speech = 0.0  # 默认值
+        if segments:
+            avg_logprob = sum(s.get('avg_logprob', -0.5) for s in segments) / len(segments)
+            avg_no_speech = sum(s.get('no_speech_prob', 0.0) for s in segments) / len(segments)
+
+            # 熔断条件1: avg_logprob 过低（模型不确信）
+            if avg_logprob < -1.0:
+                self.logger.warning(
+                    f"Whisper 熔断(avg_logprob={avg_logprob:.2f} < -1.0) {sentence_index}: "
+                    f"'{whisper_text[:50]}...', 回退到 SenseVoice"
+                )
+                return sentence
+
+            # 熔断条件2: no_speech_prob 高但仍输出文本（静音段被强行翻译）
+            if avg_no_speech > 0.6 and whisper_text:
+                self.logger.warning(
+                    f"Whisper 熔断(no_speech={avg_no_speech:.2f} > 0.6) {sentence_index}: "
+                    f"'{whisper_text[:50]}...', 回退到 SenseVoice"
+                )
+                return sentence
+
+        # B. 幻觉正则检测（使用升级后的 TextNormalizer）
+        if TextNormalizer.is_whisper_hallucination(whisper_text):
+            self.logger.warning(
+                f"Whisper 熔断(幻觉检测) {sentence_index}: '{whisper_text[:50]}...', 回退到 SenseVoice"
+            )
+            return sentence
+
+        # C. 双流长度对比
+        sensevoice_text = sentence.text_clean or sentence.text or ""
+        if sensevoice_text:
+            len_sv = len(sensevoice_text)
+            len_w = len(whisper_text)
+
+            # 长度暴涨检测
+            if len_w > 3 * len_sv + 10:
+                if avg_logprob > -0.5:
+                    self.logger.info(
+                        f"Whisper 长度暴涨但置信度高(logprob={avg_logprob:.2f}) {sentence_index}, 特权放行"
+                    )
+                else:
+                    self.logger.warning(
+                        f"Whisper 熔断(长度暴涨 {len_w} > 3*{len_sv}+10) {sentence_index}: "
+                        f"'{whisper_text[:50]}...', 回退到 SenseVoice"
+                    )
+                    return sentence
+
+        # D. 原有检测逻辑（保留兼容）
+        if context and whisper_text:
+            # 检测是否包含大量下划线（幻觉标志）
+            underscore_ratio = whisper_text.count('_') / max(len(whisper_text), 1)
+            if underscore_ratio > 0.3:  # 超过 30% 是下划线
+                self.logger.warning(
+                    f"Whisper 补刀检测到下划线幻觉 {sentence_index}: "
+                    f"'{whisper_text[:50]}...' (下划线占比 {underscore_ratio:.1%}), 回退到 SenseVoice"
+                )
+                return sentence
+
+            # 检测是否重复了提示词内容（相似度过高）
+            context_words = set(context.split())
+            whisper_words = set(whisper_text.split())
+            if len(context_words) > 0:
+                overlap_ratio = len(context_words & whisper_words) / len(context_words)
+                # 如果 Whisper 输出与 context 重叠度超过 80%，且长度相近，可能是照抄
+                if overlap_ratio > 0.8 and abs(len(whisper_text) - len(context)) < len(context) * 0.3:
+                    self.logger.warning(
+                        f"Whisper 补刀检测到提示词重复 {sentence_index}: "
+                        f"与 context 重叠度 {overlap_ratio:.1%}, 回退到 SenseVoice"
+                    )
+                    return sentence
 
         if not whisper_text:
             self.logger.warning(f"Whisper 补刀返回空文本，保留原结果")
@@ -4567,6 +4912,180 @@ class TranscriptionService:
 
         return round(confidence, 3)
 
+    async def _whisper_buffer_pool_process(
+        self,
+        patch_queue: List[Dict],
+        audio_array: np.ndarray,
+        job: 'JobState',
+        subtitle_manager: 'StreamingSubtitleManager',
+        progress_tracker
+    ):
+        """
+        使用 Whisper 缓冲池批量处理句子（DEEP_LISTEN 模式）
+
+        优势:
+        - 累积多个短 Chunk，拼接后一次性推理
+        - 利用 Whisper 长上下文能力，从根源消除短音频幻觉
+        - 长文本回填对齐到原始时间戳
+
+        Args:
+            patch_queue: 需要补刀的句子队列
+            audio_array: 完整音频数组
+            job: 任务状态
+            subtitle_manager: 流式字幕管理器
+            progress_tracker: 进度追踪器
+        """
+        from app.services.whisper_service import get_whisper_service
+        from app.services.whisper_buffer_pool import WhisperBufferService, WhisperBufferConfig
+        from app.services.text_normalizer import TextNormalizer
+        from app.models.sensevoice_models import TextSource
+        from app.services.progress_tracker import ProcessPhase
+
+        whisper_service = get_whisper_service()
+
+        # 确保 Whisper 模型已加载
+        if not whisper_service.is_loaded:
+            self.logger.info("加载 Whisper 模型...")
+            whisper_service.load_model()
+
+        # 初始化缓冲池服务
+        buffer_config = WhisperBufferConfig(
+            min_duration_sec=5.0,       # 累积 5 秒后触发
+            max_chunk_count=3,          # 或累积 3 个 Chunk 后触发
+            silence_trigger_sec=1.0,    # 长静音也触发
+            max_duration_sec=30.0,      # 最大 30 秒
+        )
+        buffer_service = WhisperBufferService(buffer_config)
+
+        sr = 16000
+        processed_count = 0
+        total_count = len(patch_queue)
+
+        self.logger.info(f"Whisper 缓冲池模式: 处理 {total_count} 个句子")
+
+        # 按顺序处理句子，累积到缓冲池
+        for idx, item in enumerate(patch_queue):
+            sent_idx = item["index"]
+            sentence = item["sentence"]
+
+            # 提取音频片段
+            start_sample = int(sentence.start * sr)
+            end_sample = int(sentence.end * sr)
+            audio_segment = audio_array[start_sample:end_sample]
+
+            # 获取 SenseVoice 文本
+            sv_text = getattr(sentence, 'text_clean', None) or sentence.text or ""
+            sv_conf = sentence.confidence
+
+            # 添加到缓冲池
+            buffer_service.add_chunk(
+                index=sent_idx,
+                start=sentence.start,
+                end=sentence.end,
+                audio=audio_segment,
+                sensevoice_text=sv_text,
+                sensevoice_confidence=sv_conf
+            )
+
+            # 检测是否与下一个句子有长静音间隔
+            has_long_silence = False
+            if idx < len(patch_queue) - 1:
+                next_sentence = patch_queue[idx + 1]["sentence"]
+                gap = next_sentence.start - sentence.end
+                if gap > buffer_config.silence_trigger_sec:
+                    has_long_silence = True
+
+            is_last = (idx == len(patch_queue) - 1)
+
+            # 检查是否触发缓冲池处理
+            if buffer_service.should_trigger(has_long_silence=has_long_silence, is_eof=is_last):
+                # 获取上下文提示
+                context = subtitle_manager.get_context_window(sent_idx)
+
+                # 处理缓冲池
+                aligned_results = buffer_service.process_buffer(
+                    whisper_service=whisper_service,
+                    language=getattr(job.settings, 'language', 'auto'),
+                    initial_prompt=context
+                )
+
+                # 应用对齐结果
+                for result in aligned_results:
+                    chunk_idx = result["chunk_index"]
+                    whisper_text = result.get("whisper_text", "").strip()
+                    whisper_conf = result.get("whisper_confidence", 0.5)
+                    sv_text_orig = result.get("sensevoice_text", "")
+
+                    # 跳过空结果
+                    if not whisper_text:
+                        self.logger.debug(f"缓冲池对齐: Chunk {chunk_idx} Whisper 输出为空，保留 SenseVoice")
+                        processed_count += 1
+                        continue
+
+                    # 幻觉检测
+                    if TextNormalizer.is_whisper_hallucination(whisper_text):
+                        self.logger.warning(
+                            f"缓冲池对齐: Chunk {chunk_idx} Whisper 幻觉 '{whisper_text[:30]}...', 保留 SenseVoice"
+                        )
+                        processed_count += 1
+                        continue
+
+                    # 双流长度对比
+                    if sv_text_orig:
+                        len_sv = len(sv_text_orig)
+                        len_w = len(whisper_text)
+                        if len_w > 3 * len_sv + 10 and whisper_conf < 0.7:
+                            self.logger.warning(
+                                f"缓冲池对齐: Chunk {chunk_idx} 长度暴涨 ({len_w} > 3*{len_sv}+10), 保留 SenseVoice"
+                            )
+                            processed_count += 1
+                            continue
+
+                    # 更新句子
+                    if chunk_idx in subtitle_manager.sentences:
+                        subtitle_manager.update_sentence(
+                            index=chunk_idx,
+                            new_text=whisper_text,
+                            source=TextSource.WHISPER_PATCH,
+                            confidence=whisper_conf
+                        )
+                        self.logger.debug(
+                            f"缓冲池对齐: Chunk {chunk_idx} 更新为 '{whisper_text[:50]}...'"
+                        )
+
+                    processed_count += 1
+
+                # 更新进度
+                progress_tracker.update_phase(ProcessPhase.WHISPER_PATCH, increment=len(aligned_results))
+
+        # 处理缓冲池中的剩余内容
+        if not buffer_service.is_empty:
+            context = subtitle_manager.get_context_window(patch_queue[-1]["index"]) if patch_queue else ""
+            remaining_results = buffer_service.flush_remaining(
+                whisper_service=whisper_service,
+                language=getattr(job.settings, 'language', 'auto'),
+                initial_prompt=context
+            )
+
+            for result in remaining_results:
+                chunk_idx = result["chunk_index"]
+                whisper_text = result.get("whisper_text", "").strip()
+                whisper_conf = result.get("whisper_confidence", 0.5)
+
+                if whisper_text and not TextNormalizer.is_whisper_hallucination(whisper_text):
+                    if chunk_idx in subtitle_manager.sentences:
+                        subtitle_manager.update_sentence(
+                            index=chunk_idx,
+                            new_text=whisper_text,
+                            source=TextSource.WHISPER_PATCH,
+                            confidence=whisper_conf
+                        )
+                processed_count += 1
+
+            progress_tracker.update_phase(ProcessPhase.WHISPER_PATCH, increment=len(remaining_results))
+
+        self.logger.info(f"Whisper 缓冲池处理完成: {processed_count}/{total_count} 个句子")
+
     async def _post_process_enhancement(
         self,
         sentences: List['SentenceSegment'],
@@ -4602,7 +5121,7 @@ class TranscriptionService:
         progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
 
         # 调试日志：确认方法被调用
-        self.logger.info(f"[DEBUG] 开始后处理增强: {len(sentences)} 句, enhancement={solution_config.enhancement.value}")
+        self.logger.debug(f"开始后处理增强: {len(sentences)} 句, enhancement={solution_config.enhancement.value}")
 
         # 1. 收集需要 Whisper 补刀的句子（含强制补刀、常规补刀、垃圾核查）
         patch_queue = []
@@ -4613,6 +5132,18 @@ class TranscriptionService:
             should_patch = False
             is_critical = False
             is_trash_suspect = False  # 是否是"垃圾嫌疑"需要 Whisper 仲裁
+
+            # === DEEP_LISTEN 快速路径 ===
+            # DEEP_LISTEN 模式下所有句子都要补刀，直接入队，跳过后续冗余判断
+            if solution_config.enhancement == EnhancementMode.DEEP_LISTEN:
+                patch_queue.append({
+                    "index": i,
+                    "sentence": sentence,
+                    "is_critical": False,
+                    "is_trash_suspect": False
+                })
+                self.logger.debug(f"[DEEP_LISTEN] 句子{i} 直接加入双流队列")
+                continue
 
             # 计算片段时长和清洗后文本长度
             duration = sentence.end - sentence.start
@@ -4642,67 +5173,59 @@ class TranscriptionService:
             # 【新增】字级强制补刀（独立检查，不受 enhancement 配置影响）
             # 条件1: 单字符实词且置信度 < 0.9
             # 条件2: 任意实词置信度极低 (< 0.35)，几乎肯定是识别错误
-            if not should_patch:
-                # 调试：检查 sentence.words 是否存在
-                words_count = len(sentence.words) if sentence.words else 0
-                self.logger.info(f"[DEBUG] 句子{i} words数量: {words_count}, text: '{clean_text[:30]}'")
+            if not should_patch and sentence.words:
+                SINGLE_CHAR_CONF_THRESHOLD = 0.9  # 单字符词的高置信度要求
+                CRITICAL_WORD_CONF_THRESHOLD = 0.35  # 极低置信度阈值（低于此值几乎肯定是错误）
+                LOW_CONF_WORD_COUNT_THRESHOLD = 3  # 多个低置信度词的数量阈值
+                LOW_WORD_CONF_THRESHOLD = 0.5  # 低置信度词的阈值
 
-                if sentence.words:
-                    SINGLE_CHAR_CONF_THRESHOLD = 0.9  # 单字符词的高置信度要求
-                    CRITICAL_WORD_CONF_THRESHOLD = 0.35  # 极低置信度阈值（低于此值几乎肯定是错误）
-                    LOW_CONF_WORD_COUNT_THRESHOLD = 3  # 多个低置信度词的数量阈值
-                    LOW_WORD_CONF_THRESHOLD = 0.5  # 低置信度词的阈值
-                    
-                    low_conf_word_count = 0  # 统计低置信度词数量
-                    
-                    for w in sentence.words:
-                        # 去除空白和 SentencePiece 边界标记 ▁ (U+2581)
-                        word_text = w.word.strip().lstrip('▁').lower()
-                        word_conf = w.confidence
+                low_conf_word_count = 0  # 统计低置信度词数量
 
-                        # 调试日志：输出所有词（不仅仅是单字符）
-                        self.logger.info(
-                            f"[DEBUG] 句子{i} 词: '{w.word}' (cleaned: '{word_text}') len={len(word_text)} conf={word_conf:.3f}"
-                        )
+                for w in sentence.words:
+                    # 去除空白和 SentencePiece 边界标记 (U+2581)
+                    word_text = w.word.strip().lstrip('\u2581').lower()
+                    word_conf = w.confidence
 
-                        # 跳过空字符、标点
-                        if not word_text or (len(word_text) == 1 and not word_text.isalnum()):
-                            continue
+                    # 跳过空字符、标点
+                    if not word_text or (len(word_text) == 1 and not word_text.isalnum()):
+                        continue
 
-                        # 条件1: 单字符实词 + 置信度 < 0.9
-                        if len(word_text) == 1 and word_text.isalnum() and word_conf < SINGLE_CHAR_CONF_THRESHOLD:
-                            should_patch = True
-                            is_critical = True
-                            self.logger.warning(
-                                f"触发字级单字符强制补刀: Sentence {i} 含单字符词 '{word_text}' "
-                                f"(conf={word_conf:.2f})"
-                            )
-                            break
-
-                        # 条件2: 任意实词置信度极低 (< 0.35)，几乎肯定是识别错误
-                        if len(word_text) >= 2 and word_conf < CRITICAL_WORD_CONF_THRESHOLD:
-                            should_patch = True
-                            is_critical = True
-                            self.logger.warning(
-                                f"触发字级极低置信度强制补刀: Sentence {i} 含极低置信度词 '{word_text}' "
-                                f"(conf={word_conf:.2f})"
-                            )
-                            break
-                        
-                        # 统计低置信度词数量
-                        if len(word_text) >= 2 and word_conf < LOW_WORD_CONF_THRESHOLD:
-                            low_conf_word_count += 1
-                    
-                    # 条件3: 多个低置信度词（>= 3个），整句可能有问题
-                    if not should_patch and low_conf_word_count >= LOW_CONF_WORD_COUNT_THRESHOLD:
+                    # 条件1: 单字符实词 + 置信度 < 0.9
+                    if len(word_text) == 1 and word_text.isalnum() and word_conf < SINGLE_CHAR_CONF_THRESHOLD:
                         should_patch = True
                         is_critical = True
                         self.logger.warning(
-                            f"触发字级多低置信度词强制补刀: Sentence {i} 含 {low_conf_word_count} 个低置信度词"
+                            f"触发字级单字符强制补刀: Sentence {i} 含单字符词 '{word_text}' "
+                            f"(conf={word_conf:.2f})"
                         )
+                        break
 
-            # 常规补刀条件（遵循用户设置）
-            if not should_patch and solution_config.enhancement != EnhancementMode.OFF:
+                    # 条件2: 任意实词置信度极低 (< 0.35)，几乎肯定是识别错误
+                    if len(word_text) >= 2 and word_conf < CRITICAL_WORD_CONF_THRESHOLD:
+                        should_patch = True
+                        is_critical = True
+                        self.logger.warning(
+                            f"触发字级极低置信度强制补刀: Sentence {i} 含极低置信度词 '{word_text}' "
+                            f"(conf={word_conf:.2f})"
+                        )
+                        break
+
+                    # 统计低置信度词数量
+                    if len(word_text) >= 2 and word_conf < LOW_WORD_CONF_THRESHOLD:
+                        low_conf_word_count += 1
+
+                # 条件3: 多个低置信度词（>= 3个），整句可能有问题
+                if not should_patch and low_conf_word_count >= LOW_CONF_WORD_COUNT_THRESHOLD:
+                    should_patch = True
+                    is_critical = True
+                    self.logger.warning(
+                        f"触发字级多低置信度词强制补刀: Sentence {i} 含 {low_conf_word_count} 个低置信度词"
+                    )
+
+            # 常规补刀条件（遵循用户设置，仅 SMART_PATCH 模式）
+            # 注: DEEP_LISTEN 模式已在循环开头通过快速路径处理
+            if not should_patch and solution_config.enhancement == EnhancementMode.SMART_PATCH:
+                # SMART_PATCH 模式: 仅低置信度句子触发补刀
                 # 【阶段五】构建字级时间戳列表
                 words_data = [{"word": w.word, "confidence": w.confidence} for w in sentence.words]
 
@@ -4724,27 +5247,38 @@ class TranscriptionService:
                 })
 
         # 调试日志：输出补刀队列统计
-        self.logger.info(f"[DEBUG] 补刀队列构建完成: {len(patch_queue)} 个句子需要补刀")
+        self.logger.debug(f"补刀队列构建完成: {len(patch_queue)} 个句子需要补刀")
 
         # 2. Whisper 补刀阶段（含仲裁判决）
         if patch_queue:
             progress_tracker.start_phase(ProcessPhase.WHISPER_PATCH, len(patch_queue), "Whisper 补刀中...")
 
-            for idx, item in enumerate(patch_queue):
-                sent_idx = item["index"]
-                sentence = item["sentence"]
-                is_trash_suspect = item["is_trash_suspect"]
-
-                # 执行 Whisper 补刀并获取仲裁结果
-                await self._whisper_text_patch_with_arbitration(
-                    sentence=sentence,
-                    sentence_index=sent_idx,
+            # === DEEP_LISTEN 模式: 使用 Whisper 缓冲池批量处理 ===
+            if solution_config.enhancement == EnhancementMode.DEEP_LISTEN:
+                await self._whisper_buffer_pool_process(
+                    patch_queue=patch_queue,
                     audio_array=audio_array,
                     job=job,
                     subtitle_manager=subtitle_manager,
-                    is_trash_suspect=is_trash_suspect
+                    progress_tracker=progress_tracker
                 )
-                progress_tracker.update_phase(ProcessPhase.WHISPER_PATCH, increment=1)
+            else:
+                # === SMART_PATCH 模式: 逐句处理 ===
+                for idx, item in enumerate(patch_queue):
+                    sent_idx = item["index"]
+                    sentence = item["sentence"]
+                    is_trash_suspect = item["is_trash_suspect"]
+
+                    # 执行 Whisper 补刀并获取仲裁结果
+                    await self._whisper_text_patch_with_arbitration(
+                        sentence=sentence,
+                        sentence_index=sent_idx,
+                        audio_array=audio_array,
+                        job=job,
+                        subtitle_manager=subtitle_manager,
+                        is_trash_suspect=is_trash_suspect
+                    )
+                    progress_tracker.update_phase(ProcessPhase.WHISPER_PATCH, increment=1)
 
             progress_tracker.complete_phase(ProcessPhase.WHISPER_PATCH)
 
@@ -4792,13 +5326,23 @@ class TranscriptionService:
                 {"signal": signal_code, "message": message}
             )
 
-        # 获取方案配置
-        preset_id = getattr(job.settings.sensevoice, 'preset_id', 'default')
-        solution_config = SolutionConfig.from_preset(preset_id)
+        # 获取方案配置 - v3.5: 优先使用新版配置，兼容旧版
+        # 检查是否有 v3.5 新版配置
+        if hasattr(job.settings, 'transcription') and hasattr(job.settings.transcription, 'transcription_profile'):
+            # v3.5 新版配置: 从 job.settings 创建 SolutionConfig
+            solution_config = SolutionConfig.from_job_settings(job.settings)
+            self.logger.info(f"使用 v3.5 配置: profile={job.settings.transcription.transcription_profile}, "
+                           f"enhancement={solution_config.enhancement.value}, "
+                           f"proofread={solution_config.proofread.value}")
+        else:
+            # 旧版配置: 从 sensevoice.preset_id 创建
+            preset_id = getattr(job.settings.sensevoice, 'preset_id', 'default')
+            solution_config = SolutionConfig.from_preset(preset_id)
+            self.logger.info(f"使用旧版预设: {preset_id}")
 
         # 初始化管理器
         subtitle_manager = get_streaming_subtitle_manager(job.job_id)
-        progress_tracker = get_progress_tracker(job.job_id, preset_id)
+        progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
 
         try:
             # 1. 音频提取

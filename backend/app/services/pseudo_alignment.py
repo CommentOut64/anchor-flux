@@ -46,24 +46,35 @@ class PseudoAlignment:
             logger.warning(f"伪对齐：无效时间窗口 {original_start}-{original_end}")
             return []
 
-        # 过滤空白字符，保留实际字符
-        chars = [c for c in new_text if not c.isspace()]
-        char_count = len(chars)
+        # 智能切分：英文按单词，中文按字符
+        # 检测是否包含英文单词（包含连续的ASCII字母）
+        has_english = any(c.isascii() and c.isalpha() for c in new_text)
 
-        if char_count == 0:
+        if has_english:
+            # 英文文本：按单词切分（保留空格信息）
+            import re
+            # 匹配单词（字母+数字）和标点符号
+            tokens = re.findall(r'\w+|[^\w\s]', new_text)
+            token_count = len(tokens)
+        else:
+            # 中文文本：按字符切分（过滤空白）
+            tokens = [c for c in new_text if not c.isspace()]
+            token_count = len(tokens)
+
+        if token_count == 0:
             logger.warning("伪对齐：文本为空，跳过")
             return []
 
-        # 计算每个字符的时长
-        step = duration / char_count
+        # 计算每个token的时长
+        step = duration / token_count
         result = []
 
-        for i, char in enumerate(chars):
+        for i, token in enumerate(tokens):
             w_start = original_start + (i * step)
             w_end = w_start + step
 
             result.append(WordTimestamp(
-                word=char,
+                word=token,
                 start=round(w_start, 3),
                 end=round(w_end, 3),
                 confidence=default_confidence,
@@ -71,7 +82,7 @@ class PseudoAlignment:
             ))
 
         logger.debug(
-            f"伪对齐完成: {char_count} 字符, "
+            f"伪对齐完成: {token_count} 个token, "
             f"时间窗口 {original_start:.2f}-{original_end:.2f}s"
         )
 

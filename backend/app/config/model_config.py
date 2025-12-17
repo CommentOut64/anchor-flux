@@ -78,3 +78,69 @@ def recommend_models_by_memory(total_memory_gb: float) -> List[str]:
         return ["base", "small", "medium"]
     else:
         return ["medium", "large"]
+
+
+# ========== Whisper 幻觉抑制配置 ==========
+# 通过 scripts/extract_hallucination_tokens.py 生成
+# 注意: 不同模型的 Token ID 可能不同，需分别配置
+#
+# 安全封杀原则:
+# - 封杀下划线相关 Token (幻觉主要来源)
+# - 封杀 YouTube 风格幻觉词的首 Token
+# - 不封杀常见标点和单字母 (如 '.', '[', 'C')
+
+WHISPER_SUPPRESS_TOKENS = {
+    # Whisper Medium 模型
+    # 运行 `python scripts/extract_hallucination_tokens.py --model medium` 获取
+    "medium": [
+        # 下划线类 (最常见的幻觉来源)
+        62,      # '_' 单个下划线
+        10852,   # '__' 双下划线
+        23757,   # '____' 四下划线
+
+        # 省略号类
+        485,     # '...' 省略号
+        353,     # '..' 双点
+
+        # YouTube 风格幻觉 (带空格版本更安全)
+        27738,   # ' Questions' 带空格的 Questions
+        8511,    # ' Subtitles' 带空格的 Subtitles (首 token)
+        25653,   # ' Copyright' 带空格的 Copyright (首 token)
+        27917,   # 'Thanks for watching' 首 token
+        16216,   # 'Please subscribe' 首 token
+        2012,    # ' Amara' 带空格的 Amara (首 token)
+
+        # 音乐符号
+        3961,    # 音符符号
+
+        # 注意: 以下 Token 被排除，因为可能误杀正常文本
+        # 13,    # '.' 单点 - 太常见，不能封杀
+        # 34,    # 'C' (Copyright首字母) - 单字母，不能封杀
+        # 58,    # '[' 方括号 - 太常见，不能封杀
+        # 8547,  # 'Questions' 无空格版本 - 可能误杀正常问句
+        # 39582, # 'Subtitles' 无空格版本 - 首 token 是 'Sub'，可能误杀
+    ],
+
+    # Whisper Large-v3 模型 (未来扩展)
+    # 运行 `python scripts/extract_hallucination_tokens.py --model large-v3` 获取
+    "large-v3": [
+        # TODO: 运行脚本后填入实际 Token ID
+    ],
+}
+
+
+def get_whisper_suppress_tokens(model_name: str) -> List[int]:
+    """
+    获取指定模型的幻觉抑制 Token ID 列表
+
+    Args:
+        model_name: 模型名称 (如 "medium", "large-v3")
+
+    Returns:
+        list: Token ID 列表，用于 suppress_tokens 参数
+    """
+    model_name_lower = model_name.lower()
+    for key, tokens in WHISPER_SUPPRESS_TOKENS.items():
+        if key in model_name_lower:
+            return tokens
+    return []

@@ -116,7 +116,7 @@ class SemanticGrouper:
         # 设置组内位置
         self._set_group_positions(sentences)
 
-        logger.info(f"语义分组完成: {len(sentences)} 句 -> {len(set(s.group_id for s in sentences))} 组")
+        logger.debug(f"语义分组完成: {len(sentences)} 句 -> {len(set(s.group_id for s in sentences))} 组")
 
         return sentences
 

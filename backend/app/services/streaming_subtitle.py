@@ -40,6 +40,10 @@ class StreamingSubtitleManager:
         self.sentence_count = 0
         self.sse_manager = get_sse_manager()
 
+        # Phase 4: Chunk 级别的句子索引映射
+        # chunk_sentences[chunk_index] = [sentence_index_1, sentence_index_2, ...]
+        self.chunk_sentences: Dict[int, List[int]] = {}
+
     def add_sentence(self, sentence: SentenceSegment) -> int:
         """
         添加新句子（SenseVoice 阶段）
@@ -61,7 +65,8 @@ class StreamingSubtitleManager:
             "start": sentence.start,
             "end": sentence.end,
             "confidence": sentence.confidence,
-            "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source)
+            "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
+            "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
         }
 
         push_subtitle_event(
@@ -220,22 +225,160 @@ class StreamingSubtitleManager:
 
     def get_context_window(self, index: int, window_size: int = 3) -> str:
         """
-        获取上下文窗口（用于 LLM 校对）
+        获取上下文窗口（用于 LLM 校对和 Whisper 补刀）
 
         Args:
             index: 当前句子索引
             window_size: 上下文窗口大小
 
         Returns:
-            str: 上下文文本
+            str: 上下文文本（清洗后的文本，避免传递 SenseVoice 原始 token）
         """
         context_indices = range(max(0, index - window_size), index)
         context_texts = [
-            self.sentences[i].text
+            self.sentences[i].text_clean or self.sentences[i].text  # 优先使用清洗后的文本，避免传递下划线等原始 token
             for i in context_indices
             if i in self.sentences
         ]
         return " ".join(context_texts)
+
+    # ========== Phase 4: 双流对齐专用方法 ==========
+
+    def add_draft_sentences(
+        self,
+        chunk_index: int,
+        sentences: List[SentenceSegment]
+    ) -> List[int]:
+        """
+        添加草稿句子（快流推送）
+
+        Phase 4 双流对齐专用方法。
+        推送多个草稿句子，并记录 Chunk 级别的索引映射。
+
+        Args:
+            chunk_index: Chunk 索引
+            sentences: 句子列表
+
+        Returns:
+            List[int]: 句子索引列表
+        """
+        sentence_indices = []
+
+        for sentence in sentences:
+            index = self.sentence_count
+            self.sentences[index] = sentence
+            self.sentence_count += 1
+            sentence_indices.append(index)
+
+            # 推送 SSE 事件（草稿）
+            sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
+                "index": index,
+                "text": sentence.text_clean or sentence.text,
+                "start": sentence.start,
+                "end": sentence.end,
+                "confidence": sentence.confidence,
+                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
+                "is_draft": True,
+                "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
+            }
+
+            push_subtitle_event(
+                self.sse_manager,
+                self.job_id,
+                "draft",  # 新事件类型
+                {
+                    "index": index,
+                    "chunk_index": chunk_index,
+                    "sentence": sentence_dict
+                }
+            )
+
+        # 记录 Chunk 级别的索引映射
+        self.chunk_sentences[chunk_index] = sentence_indices
+
+        logger.debug(
+            f"添加草稿句子: Chunk {chunk_index}, "
+            f"{len(sentences)} 个句子, 索引 {sentence_indices}"
+        )
+
+        return sentence_indices
+
+    def replace_chunk(
+        self,
+        chunk_index: int,
+        sentences: List[SentenceSegment]
+    ) -> List[int]:
+        """
+        替换 Chunk 的所有句子（慢流推送）
+
+        Phase 4 双流对齐专用方法。
+        用定稿句子替换整个 Chunk 的草稿句子。
+
+        流程：
+        1. 删除旧的草稿句子
+        2. 添加新的定稿句子
+        3. 更新 Chunk 索引映射
+        4. 推送 replace_chunk 事件
+
+        Args:
+            chunk_index: Chunk 索引
+            sentences: 定稿句子列表
+
+        Returns:
+            List[int]: 新的句子索引列表
+        """
+        # 删除旧的草稿句子
+        old_indices = self.chunk_sentences.get(chunk_index, [])
+        for old_index in old_indices:
+            if old_index in self.sentences:
+                del self.sentences[old_index]
+
+        # 添加新的定稿句子
+        new_indices = []
+        for sentence in sentences:
+            index = self.sentence_count
+            self.sentences[index] = sentence
+            self.sentence_count += 1
+            new_indices.append(index)
+
+        # 更新 Chunk 索引映射
+        self.chunk_sentences[chunk_index] = new_indices
+
+        # 推送 SSE 事件（批量替换）
+        sentences_data = [
+            sentence.to_dict() if hasattr(sentence, 'to_dict') else {
+                "index": new_indices[i],
+                "text": sentence.text_clean or sentence.text,
+                "start": sentence.start,
+                "end": sentence.end,
+                "confidence": sentence.confidence,
+                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
+                "is_draft": False,
+                "is_finalized": True,
+                "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
+            }
+            for i, sentence in enumerate(sentences)
+        ]
+
+        push_subtitle_event(
+            self.sse_manager,
+            self.job_id,
+            "replace_chunk",  # 新事件类型
+            {
+                "chunk_index": chunk_index,
+                "old_indices": old_indices,
+                "new_indices": new_indices,
+                "sentences": sentences_data
+            }
+        )
+
+        logger.info(
+            f"替换 Chunk {chunk_index}: "
+            f"删除 {len(old_indices)} 个草稿, "
+            f"添加 {len(new_indices)} 个定稿"
+        )
+
+        return new_indices
 
 
 # ========== 单例工厂 ==========

@@ -3,6 +3,9 @@
 
 提供高度模块化的配置，允许在"速度、成本、质量"之间自由组合。
 前端预设对应后端具体配置。
+
+v3.5 更新: 支持从新版 transcription_profile 和 refinement 配置创建 SolutionConfig
+v3.5.1 更新: 使用 ConfigAdapter 统一新旧配置访问
 """
 from dataclasses import dataclass
 from enum import Enum
@@ -44,7 +47,7 @@ class SolutionConfig:
 
     @classmethod
     def from_preset(cls, preset_id: str) -> 'SolutionConfig':
-        """根据预设ID创建配置"""
+        """根据预设ID创建配置 (兼容旧版)"""
         presets = {
             'default': cls(
                 preset_id='default',
@@ -85,6 +88,65 @@ class SolutionConfig:
             ),
         }
         return presets.get(preset_id, cls())
+
+    @classmethod
+    def from_job_settings(cls, job_settings) -> 'SolutionConfig':
+        """
+        从 JobSettings 创建配置 (使用 ConfigAdapter 统一新旧配置)
+
+        v3.5.1 更新: 使用 ConfigAdapter 自动兼容新旧配置格式
+
+        映射关系:
+        - transcription_profile -> enhancement
+          - sensevoice_only -> OFF
+          - sv_whisper_patch -> SMART_PATCH
+          - sv_whisper_dual -> DEEP_LISTEN
+        - llm_task + llm_scope -> proofread/translate
+          - off -> proofread=OFF, translate=OFF
+          - proofread + sparse -> proofread=SPARSE
+          - proofread + global -> proofread=FULL
+          - translate -> translate=FULL (含校对)
+        """
+        from app.services.config_adapter import ConfigAdapter
+
+        # 使用 ConfigAdapter 统一获取配置 (自动兼容新旧格式)
+        transcription_profile = ConfigAdapter.get_transcription_profile(job_settings)
+        preset_id = ConfigAdapter.get_preset_id(job_settings)
+        llm_task = ConfigAdapter.get_llm_task(job_settings)
+        llm_scope = ConfigAdapter.get_llm_scope(job_settings)
+        target_language = ConfigAdapter.get_target_language(job_settings)
+        confidence_threshold = ConfigAdapter.get_patching_threshold(job_settings)
+
+        # 映射 transcription_profile -> enhancement
+        profile_to_enhancement = {
+            'sensevoice_only': EnhancementMode.OFF,
+            'sv_whisper_patch': EnhancementMode.SMART_PATCH,
+            'sv_whisper_dual': EnhancementMode.DEEP_LISTEN,
+        }
+        enhancement = profile_to_enhancement.get(transcription_profile, EnhancementMode.OFF)
+
+        # 映射 llm_task + llm_scope -> proofread/translate
+        proofread = ProofreadMode.OFF
+        translate = TranslateMode.OFF
+
+        if llm_task == 'translate':
+            # 翻译任务，同时包含校对
+            translate = TranslateMode.FULL
+            proofread = ProofreadMode.FULL
+        elif llm_task == 'proofread':
+            if llm_scope == 'global':
+                proofread = ProofreadMode.FULL
+            else:  # sparse
+                proofread = ProofreadMode.SPARSE
+
+        return cls(
+            preset_id=preset_id,
+            enhancement=enhancement,
+            proofread=proofread,
+            translate=translate,
+            target_language=target_language if translate != TranslateMode.OFF else None,
+            confidence_threshold=confidence_threshold
+        )
 
 
 # ========== 方案矩阵描述 ==========

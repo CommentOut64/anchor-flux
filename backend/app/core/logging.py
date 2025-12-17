@@ -1,11 +1,21 @@
 """
-统一的日志系统配置
-支持毫秒精度的时间戳和统一的日志格式
+统一的日志系统配置（v3.0 增强版）
+
+新增功能:
+- 日志轮转（按大小和时间）
+- 结构化日志输出（JSON 格式）
+- 日志上下文管理器
+- 性能日志记录
 """
 
 import logging
 import sys
+import json
+import time
 from pathlib import Path
+from typing import Optional, Dict, Any
+from contextlib import contextmanager
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from app.core.config import config
 
 
@@ -25,6 +35,37 @@ class MillisecondFormatter(logging.Formatter):
         return f"{timestamp} [{record.levelname}] [{logger_name}] {record.getMessage()}"
 
 
+class StructuredFormatter(logging.Formatter):
+    """结构化日志格式化器（JSON 格式）"""
+
+    def format(self, record):
+        import datetime
+
+        log_data = {
+            "timestamp": datetime.datetime.fromtimestamp(record.created).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "module": record.module,
+            "function": record.funcName,
+            "line": record.lineno,
+            "message": record.getMessage()
+        }
+
+        # 添加额外字段
+        if hasattr(record, 'job_id'):
+            log_data['job_id'] = record.job_id
+        if hasattr(record, 'duration'):
+            log_data['duration'] = record.duration
+        if hasattr(record, 'extra_data'):
+            log_data['extra'] = record.extra_data
+
+        # 添加异常信息
+        if record.exc_info:
+            log_data['exception'] = self.formatException(record.exc_info)
+
+        return json.dumps(log_data, ensure_ascii=False)
+
+
 class ThirdPartyFilter(logging.Filter):
     """过滤第三方库的多余日志"""
 
@@ -40,7 +81,10 @@ class ThirdPartyFilter(logging.Filter):
         "Warning: audio is shorter than 30s, language detection may be inaccurate",
         "Using `TRANSFORMERS_CACHE` is deprecated",
         "ReproducibilityWarning",
-        "FutureWarning"
+        "FutureWarning",
+        # Windows asyncio ProactorEventLoop 已知问题，无害
+        "_ProactorBasePipeTransport._call_connection_lost",
+        "Exception in callback _ProactorBasePipeTransport",
     ]
 
     def filter(self, record):
@@ -52,8 +96,21 @@ class ThirdPartyFilter(logging.Filter):
         return True
 
 
-def setup_logging():
-    """配置日志系统"""
+def setup_logging(
+    enable_rotation: bool = True,
+    enable_structured: bool = False,
+    max_bytes: int = 10 * 1024 * 1024,  # 10MB
+    backup_count: int = 5
+):
+    """
+    配置日志系统（v3.0 增强版）
+
+    Args:
+        enable_rotation: 是否启用日志轮转
+        enable_structured: 是否启用结构化日志（JSON 格式）
+        max_bytes: 单个日志文件最大大小（字节）
+        backup_count: 保留的备份文件数量
+    """
 
     # 创建根日志处理器
     root_logger = logging.getLogger()
@@ -64,28 +121,53 @@ def setup_logging():
     root_logger.handlers.clear()
 
     # 创建格式化器
-    formatter = MillisecondFormatter()
+    console_formatter = MillisecondFormatter()
 
-    # 控制台输出
+    # 控制台输出（始终使用可读格式）
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(log_level)  # 在处理器层面设置级别
-    console_handler.setFormatter(formatter)
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(console_formatter)
     console_handler.addFilter(ThirdPartyFilter())
     root_logger.addHandler(console_handler)
 
-    # 文件输出
-    file_handler = logging.FileHandler(config.LOG_FILE, encoding='utf-8')
-    file_handler.setLevel(log_level)  # 在处理器层面设置级别
-    file_handler.setFormatter(formatter)
+    # 文件输出（支持轮转）
+    if enable_rotation:
+        # 使用轮转文件处理器
+        file_handler = RotatingFileHandler(
+            config.LOG_FILE,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding='utf-8'
+        )
+    else:
+        # 使用普通文件处理器
+        file_handler = logging.FileHandler(config.LOG_FILE, encoding='utf-8')
+
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(console_formatter)
     file_handler.addFilter(ThirdPartyFilter())
     root_logger.addHandler(file_handler)
+
+    # 结构化日志输出（可选）
+    if enable_structured:
+        structured_log_file = config.LOG_DIR / "app_structured.log"
+        structured_handler = RotatingFileHandler(
+            structured_log_file,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding='utf-8'
+        )
+        structured_handler.setLevel(log_level)
+        structured_handler.setFormatter(StructuredFormatter())
+        structured_handler.addFilter(ThirdPartyFilter())
+        root_logger.addHandler(structured_handler)
 
     # 设置第三方库日志级别为WARNING
     third_party_loggers = [
         'urllib3', 'multipart', 'transformers',
         'faster_whisper', 'ctranslate2',  # Faster-Whisper 及其底层库
         'silero', 'torch', 'pytorch_lightning', 'pyannote',
-        'speechbrain', 'whisper'
+        'speechbrain', 'whisper', 'onnxruntime'
     ]
 
     for logger_name in third_party_loggers:
@@ -96,7 +178,107 @@ def setup_logging():
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
     logger = logging.getLogger(__name__)
-    logger.info(f"Logging system initialized - level: {config.LOG_LEVEL}")
-    logger.info(f"Log file: {config.LOG_FILE}")
+    logger.info(f"日志系统已初始化 - 级别: {config.LOG_LEVEL}")
+    logger.info(f"日志文件: {config.LOG_FILE}")
+    if enable_rotation:
+        logger.info(f"日志轮转已启用 - 最大: {max_bytes // (1024*1024)}MB, 备份: {backup_count}个")
+    if enable_structured:
+        logger.info(f"结构化日志已启用")
 
     return logger
+
+
+@contextmanager
+def log_context(
+    logger: logging.Logger,
+    operation: str,
+    level: int = logging.INFO,
+    **extra_fields
+):
+    """
+    日志上下文管理器，自动记录操作开始/结束和耗时
+
+    用法:
+        with log_context(logger, "模型加载", job_id="job_001"):
+            model = load_model()
+
+    Args:
+        logger: 日志记录器
+        operation: 操作名称
+        level: 日志级别
+        **extra_fields: 额外的上下文字段
+    """
+    start_time = time.time()
+
+    # 记录开始
+    extra_data = {"operation": operation, **extra_fields}
+    logger.log(level, f"{operation} 开始", extra={"extra_data": extra_data})
+
+    try:
+        yield
+        # 记录成功
+        duration = time.time() - start_time
+        extra_data["duration"] = round(duration, 3)
+        extra_data["status"] = "success"
+        logger.log(level, f"{operation} 完成 (耗时: {duration:.3f}s)",
+                  extra={"extra_data": extra_data, "duration": duration})
+    except Exception as e:
+        # 记录失败
+        duration = time.time() - start_time
+        extra_data["duration"] = round(duration, 3)
+        extra_data["status"] = "failed"
+        extra_data["error"] = str(e)
+        logger.error(f"{operation} 失败 (耗时: {duration:.3f}s): {e}",
+                    extra={"extra_data": extra_data, "duration": duration})
+        raise
+
+
+class PerformanceLogger:
+    """
+    性能日志记录器
+
+    用于记录关键操作的性能指标
+    """
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self._metrics: Dict[str, list] = {}
+
+    def record(self, metric_name: str, value: float, unit: str = "ms"):
+        """记录性能指标"""
+        if metric_name not in self._metrics:
+            self._metrics[metric_name] = []
+        self._metrics[metric_name].append(value)
+
+    def log_summary(self):
+        """输出性能摘要"""
+        if not self._metrics:
+            return
+
+        self.logger.info("=== 性能摘要 ===")
+        for metric_name, values in self._metrics.items():
+            if values:
+                avg = sum(values) / len(values)
+                min_val = min(values)
+                max_val = max(values)
+                self.logger.info(
+                    f"{metric_name}: 平均={avg:.2f}, 最小={min_val:.2f}, "
+                    f"最大={max_val:.2f}, 次数={len(values)}"
+                )
+
+    def clear(self):
+        """清除所有指标"""
+        self._metrics.clear()
+
+
+def get_logger(name: str) -> logging.Logger:
+    """
+    获取日志记录器
+
+    Args:
+        name: 日志记录器名称
+
+    Returns:
+        日志记录器实例
+    """
+    return logging.getLogger(name)
