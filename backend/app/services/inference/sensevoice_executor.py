@@ -45,13 +45,13 @@ class SenseVoiceExecutor:
     ) -> Dict[str, Any]:
         """
         执行 SenseVoice 推理
-        
+
         Args:
             audio_array: 音频数组
             sample_rate: 采样率
             language: 语言代码（zh/en/auto）
             use_itn: 是否使用 ITN（逆文本归一化）
-        
+
         Returns:
             Dict: 推理结果
                 - text: 识别文本
@@ -62,8 +62,14 @@ class SenseVoiceExecutor:
                 - emotion: 情感标签
                 - event: 事件标签
         """
+        # 自动加载模型（如果未加载）
+        if not self.is_loaded():
+            self.logger.info('SenseVoice 模型未加载，正在加载...')
+            self.service.load_model()
+            self.logger.info('SenseVoice 模型加载完成')
+
         self.logger.debug(f'执行 SenseVoice 推理: audio_len={len(audio_array)}, sr={sample_rate}')
-        
+
         # 调用底层服务
         result = self.service.transcribe_audio_array(
             audio_array=audio_array,
@@ -71,9 +77,9 @@ class SenseVoiceExecutor:
             language=language,
             use_itn=use_itn
         )
-        
+
         self.logger.debug(f'SenseVoice 推理完成: text={result.get("text", "")}')
-        
+
         return result
     
     def is_loaded(self) -> bool:

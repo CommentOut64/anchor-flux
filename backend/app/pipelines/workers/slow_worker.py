@@ -171,13 +171,13 @@ class SlowWorker:
             self.logger.debug("无完整音频数组，跳过 Audio Overlap")
 
         # 执行 Whisper 推理
+        # 注: condition_on_previous_text=False 已在 WhisperExecutor 内部设置
         result = await self.whisper_executor.execute(
             audio=audio_with_overlap,
             start_time=chunk.start,
             end_time=chunk.end,
             language=self.whisper_language,
-            initial_prompt=initial_prompt,
-            condition_on_previous_text=False  # 防止双重提示词增益
+            initial_prompt=initial_prompt
         )
 
         return result

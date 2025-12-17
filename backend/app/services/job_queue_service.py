@@ -17,6 +17,7 @@ import torch
 
 from app.models.job_models import JobState
 from app.services.sse_service import get_sse_manager
+from app.services.config_adapter import ConfigAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -367,18 +368,20 @@ class JobQueueService:
                 logger.info(f" 开始执行任务: {self.running_job_id}")
 
                 try:
-                    # 根据引擎和预设选择流水线
+                    # 根据引擎和配置选择流水线 (使用 ConfigAdapter 统一新旧配置)
                     engine = getattr(job.settings, 'engine', 'sensevoice')
-                    preset_id = getattr(job.settings.sensevoice, 'preset_id', 'default') if hasattr(job.settings, 'sensevoice') else 'default'
+                    use_dual_alignment = ConfigAdapter.needs_dual_alignment(job.settings)
+                    transcription_profile = ConfigAdapter.get_transcription_profile(job.settings)
+                    preset_id = ConfigAdapter.get_preset_id(job.settings)
 
-                    # Phase 5: 对于非 default 预设，使用双流对齐流水线
-                    # default: SenseVoice Only (旧流水线)
-                    # preset1+: SenseVoice + Whisper 双流对齐 (新流水线)
-                    use_dual_alignment = preset_id != 'default' and engine == 'sensevoice'
+                    # 调试日志: 输出配置来源和关键参数
+                    config_source = ConfigAdapter.get_config_source(job.settings)
+                    logger.debug(f"配置来源: {config_source}, profile={transcription_profile}, preset={preset_id}")
 
                     if use_dual_alignment:
                         # 双流对齐流水线 (V3.0+ 新架构)
-                        logger.info(f"使用双流对齐流水线 (preset={preset_id})")
+                        # 触发条件: transcription_profile 为 sv_whisper_patch 或 sv_whisper_dual
+                        logger.info(f"使用双流对齐流水线 (profile={transcription_profile}, preset={preset_id})")
                         _run_async_safely(self._run_dual_alignment_pipeline(job, preset_id))
                     elif engine == 'sensevoice':
                         # SenseVoice 流水线（旧架构，仅 default 预设）
@@ -506,10 +509,7 @@ class JobQueueService:
             # 阶段 1: 音频前处理
             progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "音频前处理...")
 
-            audio_config = AudioProcessingConfig()
             audio_pipeline = get_audio_processing_pipeline(
-                job_id=job.job_id,
-                config=audio_config,
                 logger=logger
             )
 
@@ -518,7 +518,7 @@ class JobQueueService:
             # 保存音频文件供波形图使用
             import soundfile as sf
             audio_path = Path(job.dir) / "audio.wav"
-            sf.write(str(audio_path), audio_result.audio_array, audio_result.sample_rate)
+            sf.write(str(audio_path), audio_result.full_audio, audio_result.sample_rate)
             logger.info(f"音频文件已保存: {audio_path}")
 
             progress_tracker.complete_phase(ProcessPhase.EXTRACT)
@@ -539,7 +539,7 @@ class JobQueueService:
                 # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
                 contexts = await async_pipeline.run(
                     audio_chunks=audio_result.chunks,
-                    full_audio_array=audio_result.audio_array,
+                    full_audio_array=audio_result.full_audio,
                     full_audio_sr=audio_result.sample_rate
                 )
 
@@ -633,15 +633,17 @@ class JobQueueService:
                     needs_transcode = True
 
             if needs_transcode:
-                proxy_path = job_dir / "proxy_720p.mp4"
-                if not proxy_path.exists():
-                    # 提前入队（低优先级20，不抢转录任务的资源）
+                # 先生成 360p 预览（高优先级，快速）
+                preview_360p = job_dir / "preview_360p.mp4"
+                if not preview_360p.exists():
                     media_prep = get_media_prep_service()
-                    enqueued = media_prep.enqueue_proxy(
-                        job.job_id, video_file, proxy_path, priority=20
+                    enqueued = media_prep.enqueue_preview(
+                        job.job_id, video_file, preview_360p, priority=5
                     )
                     if enqueued:
-                        logger.info(f"[Proxy预生成] 检测到不兼容格式，提前入队: {job.job_id}")
+                        logger.info(f"[Proxy预生成] 检测到不兼容格式，提前入队360p预览: {job.job_id}")
+
+                # 720p 将在 360p 完成后或转录完成后自动触发（由 media_prep_service 和 transcription_service 处理）
         except Exception as e:
             # 预触发失败不影响主流程
             logger.warning(f"[Proxy预生成] 预触发失败，忽略: {e}")

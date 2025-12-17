@@ -5,6 +5,7 @@
 前端预设对应后端具体配置。
 
 v3.5 更新: 支持从新版 transcription_profile 和 refinement 配置创建 SolutionConfig
+v3.5.1 更新: 使用 ConfigAdapter 统一新旧配置访问
 """
 from dataclasses import dataclass
 from enum import Enum
@@ -91,7 +92,9 @@ class SolutionConfig:
     @classmethod
     def from_job_settings(cls, job_settings) -> 'SolutionConfig':
         """
-        从 v3.5 JobSettings 创建配置
+        从 JobSettings 创建配置 (使用 ConfigAdapter 统一新旧配置)
+
+        v3.5.1 更新: 使用 ConfigAdapter 自动兼容新旧配置格式
 
         映射关系:
         - transcription_profile -> enhancement
@@ -104,10 +107,15 @@ class SolutionConfig:
           - proofread + global -> proofread=FULL
           - translate -> translate=FULL (含校对)
         """
-        # 获取 transcription_profile (默认 sensevoice_only)
-        transcription_profile = getattr(
-            job_settings.transcription, 'transcription_profile', 'sensevoice_only'
-        )
+        from app.services.config_adapter import ConfigAdapter
+
+        # 使用 ConfigAdapter 统一获取配置 (自动兼容新旧格式)
+        transcription_profile = ConfigAdapter.get_transcription_profile(job_settings)
+        preset_id = ConfigAdapter.get_preset_id(job_settings)
+        llm_task = ConfigAdapter.get_llm_task(job_settings)
+        llm_scope = ConfigAdapter.get_llm_scope(job_settings)
+        target_language = ConfigAdapter.get_target_language(job_settings)
+        confidence_threshold = ConfigAdapter.get_patching_threshold(job_settings)
 
         # 映射 transcription_profile -> enhancement
         profile_to_enhancement = {
@@ -116,11 +124,6 @@ class SolutionConfig:
             'sv_whisper_dual': EnhancementMode.DEEP_LISTEN,
         }
         enhancement = profile_to_enhancement.get(transcription_profile, EnhancementMode.OFF)
-
-        # 获取 refinement 配置
-        llm_task = getattr(job_settings.refinement, 'llm_task', 'off')
-        llm_scope = getattr(job_settings.refinement, 'llm_scope', 'sparse')
-        target_language = getattr(job_settings.refinement, 'target_language', 'zh')
 
         # 映射 llm_task + llm_scope -> proofread/translate
         proofread = ProofreadMode.OFF
@@ -136,13 +139,8 @@ class SolutionConfig:
             else:  # sparse
                 proofread = ProofreadMode.SPARSE
 
-        # 获取置信度阈值
-        confidence_threshold = getattr(
-            job_settings.transcription, 'patching_threshold', 0.6
-        )
-
         return cls(
-            preset_id=job_settings.preset_id,
+            preset_id=preset_id,
             enhancement=enhancement,
             proofread=proofread,
             translate=translate,

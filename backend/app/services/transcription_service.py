@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from collections import OrderedDict  # 新增导入
 from pydub import AudioSegment, silence
 from app.services.whisper_service import get_whisper_service, load_audio as whisper_load_audio
+from app.services.config_adapter import ConfigAdapter
 import torch
 import shutil
 import psutil
@@ -1349,6 +1350,8 @@ class TranscriptionService:
             job: 任务状态对象（用于获取settings）
         """
         # 添加原始设置到checkpoint（用于校验参数兼容性）
+        # 使用 ConfigAdapter 统一新旧配置
+        demucs_strategy = ConfigAdapter.get_demucs_strategy(job.settings)
         data["original_settings"] = {
             "model": job.settings.model,
             "device": job.settings.device,
@@ -1356,16 +1359,16 @@ class TranscriptionService:
             "compute_type": job.settings.compute_type,
             "batch_size": job.settings.batch_size,
             "demucs": {
-                "enabled": job.settings.demucs.enabled,
-                "mode": job.settings.demucs.mode,
+                "enabled": ConfigAdapter.is_demucs_enabled(job.settings),
+                "mode": demucs_strategy,
             }
         }
 
         # 确保 demucs 字段存在（向后兼容）
         if "demucs" not in data:
             data["demucs"] = {
-                "enabled": job.settings.demucs.enabled,
-                "mode": job.settings.demucs.mode,
+                "enabled": ConfigAdapter.is_demucs_enabled(job.settings),
+                "mode": demucs_strategy,
                 "bgm_level": "none",
                 "bgm_ratios": [],
                 "global_separation_done": False,
@@ -2708,13 +2711,13 @@ class TranscriptionService:
             sse_manager = get_sse_manager()
             channel_id = f"job:{job.job_id}"
 
-            # 构造事件数据
+            # 构造事件数据 (使用 ConfigAdapter 兼容新旧配置)
             event_data = {
                 "from_model": from_model,
                 "to_model": to_model,
                 "reason": reason,
                 "escalation_count": breaker_state.escalation_count,
-                "max_escalations": job.settings.demucs.max_escalations,
+                "max_escalations": ConfigAdapter.get_max_escalations(job.settings),
                 "stats": breaker_state.get_stats()
             }
 
@@ -3996,10 +3999,11 @@ class TranscriptionService:
                 service.load_model()
 
             # 调用转录（返回字典）
+            # 注: SenseVoice 的 language 参数实际上是自动检测，这里传入 "auto" 即可
             result_dict = service.transcribe_audio_array(
                 audio_array=audio_array,
                 sample_rate=sample_rate,
-                language=job.settings.sensevoice.preset_id if hasattr(job.settings, 'sensevoice') else "auto"
+                language="auto"
             )
 
             # 转换为 SenseVoiceResult 对象

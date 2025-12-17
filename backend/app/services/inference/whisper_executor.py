@@ -45,31 +45,37 @@ class WhisperExecutor:
     ) -> Dict[str, Any]:
         """
         执行 Whisper 推理
-        
+
         Args:
             audio: 音频数组（已切片的 Chunk 音频，不需要再次切片）
             start_time: Chunk 起始时间（秒）- 仅用于日志，不用于切片
             end_time: Chunk 结束时间（秒）- 仅用于日志，不用于切片
             language: 语言代码（zh/en/auto）
             initial_prompt: 初始提示词（用于引导识别）
-        
+
         Returns:
             Dict: 推理结果
                 - text: 识别文本
                 - confidence: 置信度估算
                 - language: 检测到的语言
-        
+
         Note:
             传入的 audio 应该是已经切片好的 Chunk 音频，
             不会再进行二次切片。
         """
+        # 自动加载模型（如果未加载）
+        if not self.is_loaded():
+            self.logger.info('Whisper 模型未加载，正在加载...')
+            self.service.load_model()
+            self.logger.info('Whisper 模型加载完成')
+
         duration = end_time - start_time
         self.logger.debug(
             f'执行 Whisper 推理: start={start_time:.2f}s, end={end_time:.2f}s, '
             f'duration={duration:.2f}s, '
             f'prompt={initial_prompt[:50] if initial_prompt else None}'
         )
-        
+
         # 直接调用 transcribe，不进行二次切片
         # 传入的 audio 已经是切片后的 Chunk 音频
         # 禁用 condition_on_previous_text 避免基于前文截断音频末尾内容
