@@ -23,6 +23,10 @@ class TextNormalizer:
     # 多余空白字符
     EXTRA_SPACES = re.compile(r'\s+')
 
+    # 错误的数字格式（如 10,00 应该是 10,000）
+    # 匹配：数字 + 逗号 + 2位数字 + 空格或结尾
+    MALFORMED_NUMBER = re.compile(r'(\d+),(\d{2})(?=\s|$)')
+
     # 标点符号映射（全角 -> 半角）
     PUNCTUATION_MAP = {
         '，': ',', '。': '.', '！': '!', '？': '?',
@@ -67,10 +71,37 @@ class TextNormalizer:
         # 3. 处理异常重复字符（保留最多2个）
         text = TextNormalizer.REPEATED_CHARS.sub(r'\1\1', text)
 
-        # 4. 规范化空白字符
+        # 4. 修复错误的数字格式（10,00 -> 10,000）
+        text = TextNormalizer._fix_malformed_numbers(text)
+
+        # 5. 规范化空白字符
         text = TextNormalizer.EXTRA_SPACES.sub(' ', text)
 
         return text.strip()
+
+    @staticmethod
+    def _fix_malformed_numbers(text: str) -> str:
+        """
+        修复错误的数字格式
+
+        常见错误：
+        - "10,00" -> "10,000"（千位分隔符后只有2位数字）
+        - "15,00" -> "15,000"
+
+        Args:
+            text: 输入文本
+
+        Returns:
+            修复后的文本
+        """
+        if not text:
+            return ""
+
+        # 修复模式：数字 + 逗号 + 2位数字 -> 数字 + 逗号 + 3位数字（补0）
+        # 例如：10,00 -> 10,000
+        fixed_text = TextNormalizer.MALFORMED_NUMBER.sub(r'\1,\g<2>0', text)
+
+        return fixed_text
 
     @classmethod
     def is_whisper_hallucination(cls, text: str) -> bool:
@@ -202,14 +233,15 @@ class TextNormalizer:
         return tags
 
     @staticmethod
-    def process(text: str, to_fullwidth: bool = True, extract_info: bool = False) -> dict:
+    def process(text: str, to_fullwidth: bool = None, extract_info: bool = False, language: str = None) -> dict:
         """
         完整处理流程
 
         Args:
             text: 原始文本
-            to_fullwidth: 是否转换为全角标点
+            to_fullwidth: 是否转换为全角标点（None=自动根据语言判断）
             extract_info: 是否提取标签信息
+            language: 语言代码（zh/en/ja等），用于自适应标点归一化
 
         Returns:
             处理结果字典，包含 text_clean 和可选的 tags
@@ -230,12 +262,56 @@ class TextNormalizer:
         # 清洗文本
         clean_text = TextNormalizer.clean(text)
 
+        # 自适应标点归一化：根据语言决定使用全角还是半角标点
+        if to_fullwidth is None:
+            # 从标签中提取语言（如果没有提取标签，先提取）
+            if language is None and result["tags"] is not None:
+                language = result["tags"].get("language")
+
+            # 自动判断：中文/日文使用全角，英文使用半角
+            if language in ['zh', 'ja', 'ko', 'yue']:
+                to_fullwidth = True
+            elif language in ['en']:
+                to_fullwidth = False
+            else:
+                # 未知语言，根据文本特征判断
+                to_fullwidth = TextNormalizer._detect_language_by_text(clean_text) in ['zh', 'ja']
+
         # 统一标点
         clean_text = TextNormalizer.normalize_punctuation(clean_text, to_fullwidth)
 
         result["text_clean"] = clean_text
 
         return result
+
+    @staticmethod
+    def _detect_language_by_text(text: str) -> str:
+        """
+        根据文本特征简单判断语言（仅用于标点归一化）
+
+        Args:
+            text: 文本
+
+        Returns:
+            str: 语言代码 zh/en/ja
+        """
+        if not text:
+            return "en"
+
+        # 统计中文字符比例
+        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        total_chars = len(text.strip())
+
+        if total_chars == 0:
+            return "en"
+
+        chinese_ratio = chinese_chars / total_chars
+
+        # 中文字符超过30%，认为是中文
+        if chinese_ratio > 0.3:
+            return "zh"
+        else:
+            return "en"
 
 
 # 单例实例

@@ -71,6 +71,8 @@ class FastWorker:
                 use_dynamic_pause=True,          # 使用动态停顿
                 pause_threshold=0.5,
                 max_duration=5.0,
+                enable_hard_limit=True,          # 启用硬上限（快流需要兜底保护）
+                hard_limit_duration=10.0,        # 硬上限 10 秒
                 merge_short_sentences=True
             )
         self.draft_splitter = SentenceSplitter(draft_split_config)

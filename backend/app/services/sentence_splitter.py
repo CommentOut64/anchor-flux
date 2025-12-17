@@ -290,13 +290,17 @@ class SplitConfig:
 
     # 长度限制
     max_duration: float = 5.0                    # 最大时长（秒），软上限，会检查语义完整性
-    max_duration_hard_ratio: float = 1.5         # 硬上限比例，超过 max_duration * 此比例 无论如何都切分
     max_chars: int = 0                           # 最大字符数，0表示不启用字符数限制
     min_chars: int = 2                           # 最小字符数（避免过短）
 
+    # 硬上限（异常保护）
+    enable_hard_limit: bool = False              # 是否启用硬上限（快流默认True，慢流默认False）
+    hard_limit_duration: float = 10.0            # 硬上限时长（秒），超过则强制切分（无视语义完整性）
+
     # 特殊处理
     merge_short_sentences: bool = True           # 合并过短句子
-    short_sentence_threshold: int = 3            # 短句阈值
+    short_sentence_threshold: int = 8            # 短句字符数阈值（从3提高到8）
+    min_duration_threshold: float = 0.5          # 短句时长阈值（秒），低于此值的句子会尝试合并
 
     # ============================================================================
     # Layer 1 新增配置
@@ -406,15 +410,15 @@ class SentenceSplitter:
             # 3. 强制长度切分
             current_duration = word.end - current_start
 
-            # 计算硬上限时长
-            hard_limit_duration = self.config.max_duration * self.config.max_duration_hard_ratio
             # 计算延迟等待的最大时长
             delay_max_duration = self.config.max_duration + self.config.delay_split_max_wait
 
-            if current_duration >= hard_limit_duration:
-                # 超过硬上限，无论如何都要切分
+            # 检查硬上限（异常保护，仅在启用时生效）
+            if self.config.enable_hard_limit and current_duration >= self.config.hard_limit_duration:
+                # 超过硬上限，无论如何都要切分（异常保护）
                 should_split = True
-                split_reason = "max_duration_hard_limit"
+                split_reason = "hard_limit_protection"
+                logger.warning(f"触发硬上限保护: {current_duration:.2f}s >= {self.config.hard_limit_duration:.2f}s")
             elif current_duration >= self.config.max_duration:
                 # 超过软上限，检查是否应该延迟切分
                 strategy = self.config.get_strategy()
@@ -512,6 +516,45 @@ class SentenceSplitter:
         # 包含中英文常见标点
         punctuation = set(',.!?;:\'\"()[]{}，。！？；：""''（）【】《》、')
         return char in punctuation
+
+    def _is_opening_quote(self, char: str) -> bool:
+        """判断字符是否为开引号"""
+        if not char:
+            return False
+        opening_quotes = set('"\'"'（([{《【')
+        return char in opening_quotes
+
+    def _should_add_space(self, current_word: str, next_word: str) -> bool:
+        """
+        判断两个词之间是否需要添加空格（英文规则）
+
+        Args:
+            current_word: 当前词
+            next_word: 下一个词
+
+        Returns:
+            bool: 是否需要添加空格
+        """
+        if not current_word or not next_word:
+            return False
+
+        current_last = current_word[-1] if current_word else ''
+        next_first = next_word[0] if next_word else ''
+
+        # 规则1：如果当前词或下一词包含中文字符，不加空格
+        if self._is_chinese_char(current_last) or self._is_chinese_char(next_first):
+            return False
+
+        # 规则2：下一个词以开引号开头，需要加空格（"He said "hello""）
+        if self._is_opening_quote(next_first):
+            return True
+
+        # 规则3：下一个词以其他标点开头（如逗号、句号、闭引号），不加空格
+        if self._is_punctuation(next_first):
+            return False
+
+        # 规则4：英文单词之间默认加空格
+        return True
 
     # ============================================================================
     # Layer 1 优化算法
@@ -702,28 +745,30 @@ class SentenceSplitter:
             return None
 
         # 智能构建文本：根据词的特性决定是否添加空格
-        # 英文单词之间需要空格，中文字符之间不需要
         text_parts = []
         for i, w in enumerate(words):
             word = w.word
             text_parts.append(word)
-            
+
             # 判断是否需要在此词后添加空格
             if i < len(words) - 1:
                 next_word = words[i + 1].word
-                # 如果当前词或下一词是中文字符，不加空格
-                # 如果当前词以标点结尾且下一词不是标点，不加空格（标点已含空格语义）
-                # 否则（英文单词之间）加空格
-                if not self._is_chinese_char(word[-1] if word else '') and \
-                   not self._is_chinese_char(next_word[0] if next_word else '') and \
-                   not self._is_punctuation(next_word[0] if next_word else ''):
+                if self._should_add_space(word, next_word):
                     text_parts.append(' ')
-        
+
         text_raw = "".join(text_parts)
+
+        # 调试日志：检查拼接后的文本
+        if len(text_parts) > 0:
+            logger.debug(f"拼接句子: words数={len(words)}, text_parts数={len(text_parts)}, 前50字符: {text_raw[:50]}")
 
         # 清洗文本（去除标签和连字符）
         normalizer = get_text_normalizer()
         text_clean = normalizer.clean(text_raw)
+
+        # 调试日志：检查清洗后的文本
+        if text_clean != text_raw:
+            logger.debug(f"文本清洗: 清洗前={text_raw[:50]}, 清洗后={text_clean[:50]}")
 
         # 过滤过短句子（基于清洗后的文本）
         if len(text_clean.strip()) < self.config.min_chars:
@@ -750,7 +795,19 @@ class SentenceSplitter:
         self,
         sentences: List['SentenceSegment']
     ) -> List['SentenceSegment']:
-        """合并过短句子"""
+        """
+        合并过短句子（增强版：同时检查字符数和时长）
+
+        合并条件：
+        1. 字符数 <= short_sentence_threshold（默认8个字符）
+        2. 或 时长 < min_duration_threshold（默认0.5秒）
+
+        Args:
+            sentences: 句子列表
+
+        Returns:
+            合并后的句子列表
+        """
         from ..models.sensevoice_models import SentenceSegment
 
         if len(sentences) <= 1:
@@ -761,19 +818,26 @@ class SentenceSplitter:
 
         while i < len(sentences):
             current = sentences[i]
+            current_duration = current.end - current.start
 
-            # 检查是否为短句
-            if len(current.text) <= self.config.short_sentence_threshold:
+            # 检查是否为短句（字符数或时长）
+            is_short_by_chars = len(current.text) <= self.config.short_sentence_threshold
+            is_short_by_duration = current_duration < self.config.min_duration_threshold
+
+            if is_short_by_chars or is_short_by_duration:
                 # 尝试与下一句合并
                 if i + 1 < len(sentences):
                     next_sent = sentences[i + 1]
                     merged_text = current.text + next_sent.text
+                    merged_text_clean = (current.text_clean or current.text) + (next_sent.text_clean or next_sent.text)
                     merged_words = current.words + next_sent.words
 
                     # 检查合并后是否超限
                     merged_duration = next_sent.end - current.start
+                    max_chars = self.config.max_chars if self.config.max_chars > 0 else 1000
+
                     if (merged_duration <= self.config.max_duration and
-                        len(merged_text) <= self.config.max_chars):
+                        len(merged_text) <= max_chars):
 
                         avg_confidence = (
                             (current.confidence * len(current.words) +
@@ -783,11 +847,23 @@ class SentenceSplitter:
 
                         merged_sentence = SentenceSegment(
                             text=merged_text,
+                            text_clean=merged_text_clean,
                             start=current.start,
                             end=next_sent.end,
                             words=merged_words,
                             confidence=avg_confidence
                         )
+
+                        # 保留其他属性
+                        merged_sentence.is_draft = current.is_draft
+                        merged_sentence.is_finalized = current.is_finalized
+                        merged_sentence.source = current.source
+
+                        logger.debug(
+                            f"合并短句: '{current.text[:20]}...' (chars={len(current.text)}, "
+                            f"dur={current_duration:.2f}s) + '{next_sent.text[:20]}...'"
+                        )
+
                         merged.append(merged_sentence)
                         i += 2
                         continue

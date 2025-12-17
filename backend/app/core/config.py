@@ -7,8 +7,11 @@
 """
 
 import os
+import logging
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectConfig:
@@ -194,8 +197,66 @@ class ProjectConfig:
         # - True: 三级异步流水线（错位并行，性能提升 30-50%）
         # - False: 串行流水线（稳定版，V3.0 兼容）
         self.USE_ASYNC_PIPELINE = os.getenv('USE_ASYNC_PIPELINE', 'true').lower() == 'true'
+
         # 队列背压大小（控制并发度，防止内存溢出）
-        self.PIPELINE_QUEUE_MAXSIZE = int(os.getenv('PIPELINE_QUEUE_MAXSIZE', '5'))
+        # 支持三种配置方式：
+        # 1. 'auto': 根据系统内存自动计算（推荐）
+        # 2. 数字: 手动指定队列大小（如 '15'）
+        # 3. 未设置: 默认 'auto'
+        queue_size_config = os.getenv('PIPELINE_QUEUE_MAXSIZE', 'auto')
+
+        if queue_size_config.lower() == 'auto':
+            self.PIPELINE_QUEUE_MAXSIZE = self._calculate_adaptive_queue_size()
+        else:
+            self.PIPELINE_QUEUE_MAXSIZE = int(queue_size_config)
+
+    def _calculate_adaptive_queue_size(self) -> int:
+        """
+        根据系统可用内存自适应计算队列大小
+
+        策略：
+        - 每个 chunk 平均占用 ~300MB（音频数据 + 对齐中间结果）
+        - 预留 30% 内存给系统和模型
+        - 队列大小 = (可用内存 × 0.7) / 300MB
+        - 限制范围：3 ~ 30
+
+        Returns:
+            int: 自适应队列大小
+        """
+        try:
+            import psutil
+
+            # 获取系统总内存（GB）
+            total_memory_gb = psutil.virtual_memory().total / (1024 ** 3)
+
+            # 根据内存档位计算队列大小
+            if total_memory_gb < 8:
+                # <8GB: 保守策略（老旧设备）
+                queue_size = 3
+                reason = "低内存(<8GB)"
+            elif total_memory_gb < 16:
+                # 8-16GB: 适中策略
+                queue_size = 8
+                reason = "中等内存(8-16GB)"
+            elif total_memory_gb < 32:
+                # 16-32GB: 平衡策略
+                queue_size = 15
+                reason = "较大内存(16-32GB)"
+            else:
+                # 32GB+: 激进策略（工作站）
+                queue_size = 25
+                reason = "大内存(32GB+)"
+
+            logger.info(
+                f"自适应队列大小: {queue_size} "
+                f"(系统内存: {total_memory_gb:.1f}GB, {reason})"
+            )
+            return queue_size
+
+        except Exception as e:
+            # psutil 不可用或出错，回退到保守默认值
+            logger.warning(f"无法检测系统内存，使用默认队列大小 10: {e}")
+            return 10
 
     def get_ffmpeg_command(self) -> str:
         """

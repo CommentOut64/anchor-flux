@@ -89,7 +89,9 @@ class DualAlignmentConfig:
                 prefer_punctuation_break=False,  # 不依赖标点
                 use_dynamic_pause=True,          # 使用动态停顿
                 pause_threshold=0.5,             # 停顿阈值
-                max_duration=5.0,                # 最大时长
+                max_duration=5.0,                # 软上限
+                enable_hard_limit=True,          # 启用硬上限（快流需要兜底保护）
+                hard_limit_duration=10.0,        # 硬上限 10 秒
                 merge_short_sentences=True       # 合并短句
                 # max_chars 默认为 0，不启用字符数限制
             )
@@ -109,7 +111,11 @@ class DualAlignmentConfig:
                 prefer_punctuation_break=True,   # 依赖标点
                 use_dynamic_pause=True,          # 使用动态停顿
                 pause_threshold=0.5,             # 停顿阈值
-                max_duration=5.0,                # 最大时长
+                max_duration=5.0,                # 软上限（监控点）
+                enable_hard_limit=True,          # 启用硬上限（异常保护，设置很宽松）
+                hard_limit_duration=20.0,        # 20秒硬上限（远大于正常句子）
+                delay_split_to_punctuation=True, # 延迟切分到标点
+                delay_split_max_wait=15.0,       # 允许延迟15秒（总计20秒）
                 merge_short_sentences=True       # 合并短句
                 # max_chars 默认为 0，不启用字符数限制
             )

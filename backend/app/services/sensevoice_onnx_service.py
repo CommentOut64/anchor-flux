@@ -555,10 +555,16 @@ class SenseVoiceONNXService:
             # 修复 "laval" 被拆分为 " la" + "val" 的问题
             word_timestamps = self._merge_tokens_to_words(word_timestamps)
 
-            # 4. 提取标签信息
+            # 4. 提取标签信息并使用语言自适应标点归一化
             from ..services.text_normalizer import get_text_normalizer
             normalizer = get_text_normalizer()
-            process_result = normalizer.process(text, extract_info=True)
+
+            # 先提取语言标签
+            tags = normalizer.extract_tags(text)
+            detected_language = tags.get("language") if tags else language
+
+            # 使用检测到的语言进行文本清洗和标点归一化
+            process_result = normalizer.process(text, extract_info=True, language=detected_language)
 
             # 5. 构建结果
             result = {
@@ -566,7 +572,7 @@ class SenseVoiceONNXService:
                 "text_clean": process_result["text_clean"],
                 "words": word_timestamps,
                 "confidence": confidence,
-                "language": process_result["tags"]["language"] if process_result["tags"] else None,
+                "language": detected_language,
                 "emotion": process_result["tags"]["emotion"] if process_result["tags"] else None,
                 "event": process_result["tags"]["event"] if process_result["tags"] else None
             }

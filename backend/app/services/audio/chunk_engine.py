@@ -138,6 +138,10 @@ class ChunkEngine:
             separation_model_used = demucs_model or self.demucs_service.config.model_name
             self.logger.info(f"Demucs 分离完成，使用模型: {separation_model_used}")
 
+            # 立即卸载 Demucs 模型释放显存
+            self.logger.info("释放 Demucs 显存...")
+            self.demucs_service.unload_model()
+
         # 3. VAD 语音检测和切分
         if progress_callback:
             progress_callback(0.6, "VAD 语音检测中...")

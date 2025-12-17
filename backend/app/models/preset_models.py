@@ -350,7 +350,7 @@ PRESET_QUALITY = MacroPreset(
     preprocessing=PreprocessingSettings(
         demucs_strategy="force_on",     # 强制开启人声分离
         demucs_model="mdx_extra",       # 使用 mdx_extra 高质量模型
-        demucs_shifts=2,                # 增加预测次数
+        demucs_shifts=1,                # 增加预测次数
         spectrum_threshold=0.35,
         vad_filter=True,
     ),

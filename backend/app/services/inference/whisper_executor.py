@@ -76,6 +76,17 @@ class WhisperExecutor:
             f'prompt={initial_prompt[:50] if initial_prompt else None}'
         )
 
+        # 自适应 beam_size：短 chunk 用 greedy（快），长 chunk 用 beam（质量）
+        if duration < 10.0:
+            beam_size = 1  # <10s：greedy 解码，速度提升 3倍
+            self.logger.debug(f'短 chunk ({duration:.1f}s)，使用 beam_size=1 快速模式')
+        elif duration < 15.0:
+            beam_size = 2  # 10-15s：小 beam，平衡
+            self.logger.debug(f'中等 chunk ({duration:.1f}s)，使用 beam_size=2 平衡模式')
+        else:
+            beam_size = 5  # >15s：大 beam，保证质量
+            self.logger.debug(f'长 chunk ({duration:.1f}s)，使用 beam_size=5 高质量模式')
+
         # 直接调用 transcribe，不进行二次切片
         # 传入的 audio 已经是切片后的 Chunk 音频
         # 禁用 condition_on_previous_text 避免基于前文截断音频末尾内容
@@ -84,7 +95,7 @@ class WhisperExecutor:
             language=language,
             initial_prompt=initial_prompt,
             word_timestamps=False,  # 使用伪对齐，不需要词级时间戳
-            beam_size=5,
+            beam_size=beam_size,  # 自适应 beam_size
             vad_filter=False,  # 已经是 VAD 切片，不需要再次 VAD
             condition_on_previous_text=False  # 禁用前文条件化，保留 prompt 用于词汇引导
         )

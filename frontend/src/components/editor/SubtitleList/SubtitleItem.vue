@@ -261,7 +261,8 @@ function renderTextWithHighlight() {
   const CRITICAL_THRESHOLD = 0.3
 
   let html = ''
-  for (const word of words) {
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]
     const conf = word.confidence !== undefined ? word.confidence : 1.0
     const wordText = escapeHtml(word.word)
 
@@ -271,6 +272,21 @@ function renderTextWithHighlight() {
       html += `<span class="word-warning">${wordText}</span>`
     } else {
       html += wordText
+    }
+
+    // 智能添加空格：英文单词之间加空格，中文字符之间不加
+    if (i < words.length - 1) {
+      const nextWord = words[i + 1].word
+      // 如果当前词或下一词是中文字符，不加空格
+      // 如果下一词是标点符号，不加空格
+      const isChinese = (char) => char && /[\u4e00-\u9fff]/.test(char)
+      const isPunctuation = (char) => char && /[,.!?;:'"()[\]{}，。！？；：""''（）【】《》、]/.test(char)
+
+      if (!isChinese(wordText[wordText.length - 1]) &&
+          !isChinese(nextWord[0]) &&
+          !isPunctuation(nextWord[0])) {
+        html += ' '
+      }
     }
   }
   return html

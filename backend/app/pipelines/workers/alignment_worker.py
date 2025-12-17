@@ -90,7 +90,11 @@ class AlignmentWorker:
                 prefer_punctuation_break=True,   # 依赖标点
                 use_dynamic_pause=True,
                 pause_threshold=0.5,
-                max_duration=5.0,
+                max_duration=5.0,                # 软上限（监控点）
+                enable_hard_limit=True,          # 启用硬上限（异常保护，设置很宽松）
+                hard_limit_duration=20.0,        # 20秒硬上限（远大于正常句子）
+                delay_split_to_punctuation=True, # 延迟切分到标点
+                delay_split_max_wait=15.0,       # 允许延迟15秒（总计20秒）
                 merge_short_sentences=True
             )
         self.final_splitter = SentenceSplitter(final_split_config)
