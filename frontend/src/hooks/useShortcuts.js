@@ -8,7 +8,7 @@ import { onMounted, onUnmounted } from 'vue'
  * 1. 播放与导航：togglePlay, stepBackward, stepForward, seekBackward, seekForward, seekToStart, seekToEnd
  * 2. 视图缩放：zoomInWave, zoomOutWave, fitWave, zoomInVideo, zoomOutVideo, fitVideo
  * 3. 字幕编辑：fontSizeUp, fontSizeDown, splitSubtitle, mergeSubtitle
- * 4. 全局操��：save, undo, redo, export, openTaskMonitor
+ * 4. 全局操作：save, undo, redo, export, openTaskMonitor
  */
 export function useShortcuts(actions) {
   const handleKeydown = (e) => {

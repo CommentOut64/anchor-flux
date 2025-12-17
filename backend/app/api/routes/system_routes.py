@@ -46,7 +46,7 @@ class ShutdownRequest(BaseModel):
 @router.post("/api/system/heartbeat")
 async def heartbeat(req: HeartbeatRequest):
     """客户端心跳"""
-    from services.client_registry import get_client_registry
+    from app.services.client_registry import get_client_registry
 
     client_registry = get_client_registry()
     success = client_registry.heartbeat(req.client_id)
@@ -65,7 +65,7 @@ async def heartbeat(req: HeartbeatRequest):
 @router.post("/api/system/register")
 async def register_client(req: RegisterRequest):
     """注册新客户端"""
-    from services.client_registry import get_client_registry
+    from app.services.client_registry import get_client_registry
 
     client_registry = get_client_registry()
     client_registry.register(req.client_id, req.user_agent)
@@ -79,7 +79,7 @@ async def register_client(req: RegisterRequest):
 @router.post("/api/system/unregister")
 async def unregister_client(req: UnregisterRequest):
     """注销客户端（页面关闭时调用）"""
-    from services.client_registry import get_client_registry
+    from app.services.client_registry import get_client_registry
 
     client_registry = get_client_registry()
     client_registry.unregister(req.client_id)
@@ -90,7 +90,7 @@ async def unregister_client(req: UnregisterRequest):
 @router.get("/api/system/has-active-clients")
 async def has_active_clients():
     """检查是否有活跃的浏览器标签页"""
-    from services.client_registry import get_client_registry
+    from app.services.client_registry import get_client_registry
 
     client_registry = get_client_registry()
     return {
@@ -116,7 +116,7 @@ async def shutdown_system(req: ShutdownRequest):
 
         # 1.1 卸载所有模型
         try:
-            from services.model_preload_manager import get_model_manager
+            from app.services.model_preload_manager import get_model_manager
             model_manager = get_model_manager()
             if model_manager:
                 model_manager.clear_cache()
@@ -143,7 +143,7 @@ async def shutdown_system(req: ShutdownRequest):
 
         # 1.3 终止 FFmpeg 子进程
         try:
-            from services.ffmpeg_manager import get_ffmpeg_manager
+            from app.services.ffmpeg_manager import get_ffmpeg_manager
             ffmpeg_mgr = get_ffmpeg_manager()
             # 这里假设有 kill_all 方法，如果没有则跳过
             if hasattr(ffmpeg_mgr, 'kill_all_subprocesses'):
@@ -159,7 +159,7 @@ async def shutdown_system(req: ShutdownRequest):
         # 1.4 清理临时文件（可选）
         if req.cleanup_temp:
             try:
-                from core.config import config
+                from app.core.config import config
                 import shutil
                 if config.TEMP_DIR.exists():
                     shutil.rmtree(config.TEMP_DIR, ignore_errors=True)

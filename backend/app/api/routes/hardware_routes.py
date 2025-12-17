@@ -5,8 +5,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
 
-from models.hardware_models import HardwareInfo, OptimizationConfig
-from services.transcription_service import TranscriptionService
+from app.models.hardware_models import HardwareInfo, OptimizationConfig
+from app.services.transcription_service import TranscriptionService
 
 router = APIRouter(prefix="/api/hardware", tags=["hardware"])
 

@@ -1,25 +1,113 @@
 """
-转录任务相关API路由
+转录任务相关API路由 - v3.5 重构版
+
+支持 1+3 预设模式:
+- 顶层: 3个快捷场景宏 (fast/balanced/quality)
+- 底层: 4个设置分组 (preprocessing/transcription/refinement/compute)
 """
 import os
 import uuid
 import shutil
 import time
-from typing import Optional
+import logging
+from typing import Optional, List
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request, Body
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import json
 
-from models.job_models import JobSettings, JobState, DemucsSettings
-from services.transcription_service import TranscriptionService
-from services.file_service import FileManagementService
-from services.sse_service import get_sse_manager
-from services.job_queue_service import get_queue_service  # 新增导入
+from app.models.job_models import (
+    JobSettings, JobState, DemucsSettings, SenseVoiceSettings,
+    PreprocessingConfig, TranscriptionConfig, RefinementConfig, ComputeConfig
+)
+from app.services.transcription_service import TranscriptionService
+from app.services.file_service import FileManagementService
+from app.services.sse_service import get_sse_manager
+from app.services.job_queue_service import get_queue_service
 
+
+# ========== v3.5 新版 API 模型 ==========
+
+class PreprocessingSettingsAPI(BaseModel):
+    """
+    分组一: 预处理与音频设置 API 模型
+    """
+    # 人声分离策略: off/auto/force_on
+    demucs_strategy: str = Field(default="auto", description="人声分离策略")
+    # 分离模型: htdemucs/htdemucs_ft/mdx_q/mdx_extra
+    demucs_model: str = Field(default="htdemucs", description="Demucs 模型")
+    # 分离预测次数: 1-5
+    demucs_shifts: int = Field(default=1, ge=1, le=5, description="分离预测次数")
+    # 分诊灵敏度: 0.0-1.0
+    spectrum_threshold: float = Field(default=0.35, ge=0.0, le=1.0, description="分诊灵敏度")
+    # VAD 静音过滤
+    vad_filter: bool = Field(default=True, description="VAD 静音过滤")
+
+
+class TranscriptionSettingsAPI(BaseModel):
+    """
+    分组二: 转录核心设置 API 模型
+    """
+    # 转录流水线模式: sensevoice_only/sv_whisper_patch/sv_whisper_dual
+    transcription_profile: str = Field(default="sensevoice_only", description="转录流水线模式")
+    # 主引擎运行设备: auto/cpu
+    sensevoice_device: str = Field(default="auto", description="SenseVoice 运行设备")
+    # 辅助/补刀模型: tiny/small/medium/large-v3
+    whisper_model: str = Field(default="medium", description="Whisper 模型")
+    # 补刀触发阈值: 0.0-1.0
+    patching_threshold: float = Field(default=0.60, ge=0.0, le=1.0, description="补刀触发阈值")
+
+
+class RefinementSettingsAPI(BaseModel):
+    """
+    分组三: 增强与润色设置 API 模型
+    """
+    # LLM 任务目标: off/proofread/translate
+    llm_task: str = Field(default="off", description="LLM 任务目标")
+    # 介入范围: sparse/global
+    llm_scope: str = Field(default="sparse", description="LLM 介入范围")
+    # 稀疏校对阈值: 0.0-1.0
+    sparse_threshold: float = Field(default=0.70, ge=0.0, le=1.0, description="稀疏校对阈值")
+    # 目标语言
+    target_language: str = Field(default="zh", description="目标语言")
+    # 模型提供商: openai_compatible/local_ollama
+    llm_provider: str = Field(default="openai_compatible", description="LLM 提供商")
+    # 模型名称
+    llm_model_name: str = Field(default="gpt-4o-mini", description="LLM 模型名称")
+
+
+class ComputeSettingsAPI(BaseModel):
+    """
+    分组四: 计算与系统设置 API 模型
+    """
+    # 并发调度策略: auto/parallel/serial
+    concurrency_strategy: str = Field(default="auto", description="并发调度策略")
+    # GPU 选择
+    gpu_id: int = Field(default=0, ge=0, description="GPU ID")
+    # 输出格式列表
+    output_formats: List[str] = Field(default=["srt"], description="输出格式")
+    # 临时文件策略: delete_on_complete/keep
+    temp_file_policy: str = Field(default="delete_on_complete", description="临时文件策略")
+
+
+class TaskConfigAPI(BaseModel):
+    """
+    v3.5 完整任务配置 API 模型
+    整合所有设置分组
+    """
+    # 选择的宏预设 ID (fast/balanced/quality/custom)
+    preset_id: str = Field(default="balanced", description="预设 ID")
+    # 四个设置分组
+    preprocessing: Optional[PreprocessingSettingsAPI] = None
+    transcription: Optional[TranscriptionSettingsAPI] = None
+    refinement: Optional[RefinementSettingsAPI] = None
+    compute: Optional[ComputeSettingsAPI] = None
+
+
+# ========== 兼容旧版 API 模型 ==========
 
 class DemucsSettingsAPI(BaseModel):
-    """Demucs配置请求模型"""
+    """Demucs配置请求模型 (兼容旧版)"""
     enabled: bool = True
     mode: str = "auto"  # auto/always/never/on_demand
     retry_threshold_logprob: float = -0.8
@@ -29,14 +117,40 @@ class DemucsSettingsAPI(BaseModel):
     ratio_threshold: float = 0.2
 
 
+class SenseVoiceSettingsAPI(BaseModel):
+    """SenseVoice 配置请求模型 (兼容旧版)"""
+    preset_id: str = "default"  # 预设ID: default/preset1-5/custom
+    enhancement: str = "off"  # off/smart_patch/deep_listen
+    proofread: str = "off"  # off/sparse/full
+    translate: str = "off"  # off/full/partial
+    target_language: str = "en"
+    confidence_threshold: float = 0.6
+    whisper_patch_threshold: float = 0.5
+
+
 class TranscribeSettings(BaseModel):
-    """转录设置请求模型"""
+    """
+    转录设置请求模型 - v3.5 重构版
+
+    支持两种配置方式:
+    1. 新版 (推荐): 使用 task_config 字段
+    2. 旧版 (兼容): 使用 engine/model/demucs/sensevoice 字段
+    """
+    # === 新版 1+3 预设配置 ===
+    task_config: Optional[TaskConfigAPI] = Field(
+        default=None,
+        description="v3.5 任务配置 (推荐使用)"
+    )
+
+    # === 旧版配置 (兼容) ===
+    engine: str = "sensevoice"  # whisper 或 sensevoice
     model: str = "medium"
     compute_type: str = "float16"
     device: str = "cuda"
     batch_size: int = 16
     word_timestamps: bool = False
-    demucs: Optional[DemucsSettingsAPI] = None  # Demucs配置（可选）
+    demucs: Optional[DemucsSettingsAPI] = None
+    sensevoice: Optional[SenseVoiceSettingsAPI] = None
 
 
 class UploadResponse(BaseModel):
@@ -142,7 +256,7 @@ def create_transcription_router(
             job = transcription_service.create_job(original_filename, input_path, settings, job_id=job_id)
 
             # 🔥 新增: 加入队列（而非直接启动）
-            queue_service = get_queue_service()
+            queue_service = get_queue_service(transcription_service)
             queue_service.add_job(job)
 
             return {
@@ -197,7 +311,7 @@ def create_transcription_router(
             }
         """
         try:
-            queue_service = get_queue_service()
+            queue_service = get_queue_service(transcription_service)
             jobs = []
             failed = []
 
@@ -252,7 +366,7 @@ def create_transcription_router(
             settings_obj = TranscribeSettings(**json.loads(settings))
 
             # 获取队列服务
-            queue_service = get_queue_service()
+            queue_service = get_queue_service(transcription_service)
             job = queue_service.get_job(job_id)
 
             if not job:
@@ -286,17 +400,60 @@ def create_transcription_router(
                     # 如果读取checkpoint失败，记录日志但继续
                     print(f"读取checkpoint设置失败: {e}")
 
-            # 应用设置
+            # 应用设置 - v3.5 重构: 支持新旧两种配置格式
             settings_dict = settings_obj.model_dump()
 
-            # 转换 Demucs 配置
-            if settings_dict.get('demucs'):
-                settings_dict['demucs'] = DemucsSettings(**settings_dict['demucs'])
-            else:
-                # 移除 None 值，让 JobSettings 的 default_factory 生效
-                settings_dict.pop('demucs', None)
+            # 检查是否使用新版 task_config
+            if settings_dict.get('task_config'):
+                # v3.5 新版配置
+                task_config = settings_dict['task_config']
+                preset_id = task_config.get('preset_id', 'balanced')
 
-            job.settings = JobSettings(**settings_dict)
+                # 如果只提供了 preset_id，从预设加载完整配置
+                if preset_id != 'custom' and not task_config.get('preprocessing'):
+                    job.settings = JobSettings.from_preset(preset_id)
+                else:
+                    # 自定义配置
+                    job.settings = JobSettings(
+                        preset_id=preset_id,
+                        preprocessing=PreprocessingConfig(
+                            **task_config.get('preprocessing', {})
+                        ) if task_config.get('preprocessing') else PreprocessingConfig(),
+                        transcription=TranscriptionConfig(
+                            **task_config.get('transcription', {})
+                        ) if task_config.get('transcription') else TranscriptionConfig(),
+                        refinement=RefinementConfig(
+                            **task_config.get('refinement', {})
+                        ) if task_config.get('refinement') else RefinementConfig(),
+                        compute=ComputeConfig(
+                            **task_config.get('compute', {})
+                        ) if task_config.get('compute') else ComputeConfig(),
+                        # 保留旧版字段兼容
+                        engine=settings_dict.get('engine', 'sensevoice'),
+                        model=settings_dict.get('model', 'medium'),
+                        compute_type=settings_dict.get('compute_type', 'float16'),
+                        device=settings_dict.get('device', 'cuda'),
+                        batch_size=settings_dict.get('batch_size', 16),
+                        word_timestamps=settings_dict.get('word_timestamps', False),
+                    )
+            else:
+                # 旧版配置 (兼容)
+                # 转换 Demucs 配置
+                if settings_dict.get('demucs'):
+                    settings_dict['demucs'] = DemucsSettings(**settings_dict['demucs'])
+                else:
+                    settings_dict.pop('demucs', None)
+
+                # 转换 SenseVoice 配置
+                if settings_dict.get('sensevoice'):
+                    settings_dict['sensevoice'] = SenseVoiceSettings(**settings_dict['sensevoice'])
+                else:
+                    settings_dict.pop('sensevoice', None)
+
+                # 移除 task_config 字段 (None)
+                settings_dict.pop('task_config', None)
+
+                job.settings = JobSettings(**settings_dict)
 
             # 🔥 关键改动: 如果任务不在队列中，加入队列
             with queue_service.lock:
@@ -340,7 +497,7 @@ def create_transcription_router(
     @router.post("/cancel/{job_id}")
     async def cancel_job(job_id: str, delete_data: bool = False):
         """取消转录任务（V2.2: 使用队列服务）"""
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         ok = queue_service.cancel_job(job_id, delete_data=delete_data)
         if not ok:
             raise HTTPException(status_code=404, detail="任务未找到")
@@ -349,7 +506,7 @@ def create_transcription_router(
     @router.post("/pause/{job_id}")
     async def pause_job(job_id: str):
         """暂停转录任务（V2.2: 使用队列服务）"""
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         ok = queue_service.pause_job(job_id)
         if not ok:
             raise HTTPException(status_code=404, detail="任务未找到")
@@ -364,7 +521,7 @@ def create_transcription_router(
         - /resume: 恢复暂停的任务，重新加入队列尾部，状态变为 queued
         - /restore-job: 从 checkpoint 断点续传
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         ok = queue_service.resume_job(job_id)
         if not ok:
             raise HTTPException(status_code=400, detail="无法恢复任务（任务未暂停或不存在）")
@@ -393,7 +550,7 @@ def create_transcription_router(
                 - "force": 强制插队，暂停当前任务A -> 执行B -> B完成后自动恢复A
                 - None: 使用默认模式（可通过 /api/queue-settings 配置）
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         result = queue_service.prioritize_job(job_id, mode=mode)
 
         if not result.get("success"):
@@ -418,7 +575,7 @@ def create_transcription_router(
         返回:
             - default_prioritize_mode: 默认插队模式 ("gentle" 或 "force")
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         return queue_service.get_settings()
 
     @router.post("/queue-settings")
@@ -433,7 +590,7 @@ def create_transcription_router(
                 - "gentle": 温和插队（默认）
                 - "force": 强制插队
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         try:
             settings = queue_service.update_settings(
                 default_prioritize_mode=default_prioritize_mode
@@ -453,7 +610,7 @@ def create_transcription_router(
         Args:
             job_ids: 按新顺序排列的任务ID列表
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         ok = queue_service.reorder_queue(job_ids)
 
         if not ok:
@@ -467,7 +624,7 @@ def create_transcription_router(
     @router.get("/queue-status")
     async def get_queue_status():
         """获取队列状态摘要"""
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         return queue_service.get_queue_status()
 
     @router.get("/events/global")
@@ -485,15 +642,15 @@ def create_transcription_router(
         - initial_state返回所有任务（处理中 + 已完成）
         - 避免客户端连接时漏掉完成任务的实时更新
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
 
         def get_initial_state():
             """
             返回所有任务列表（第二阶段修复：实时更新）
             包含活跃任务 + 历史完成任务
             """
-            from services.job_index_service import get_job_index_service
-            from core.config import config
+            from app.services.job_index_service import get_job_index_service
+            from app.core.config import config
             from pathlib import Path
             import json as json_module
 
@@ -626,12 +783,12 @@ def create_transcription_router(
         返回所有任务列表（处理中 + 已完成），前端用此接口同步后端实际存在的任务
         此接口为真实源，用于修复幽灵任务问题
         """
-        from services.job_index_service import get_job_index_service
-        from core.config import config
+        from app.services.job_index_service import get_job_index_service
+        from app.core.config import config
         from pathlib import Path
         import json as json_module
 
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         job_index = get_job_index_service(config.JOBS_DIR)
         jobs_root = Path(config.JOBS_DIR)
 
@@ -767,7 +924,7 @@ def create_transcription_router(
             job_id: 任务ID
             include_media: 是否包含媒体状态信息（默认True）
         """
-        queue_service = get_queue_service()
+        queue_service = get_queue_service(transcription_service)
         job = queue_service.get_job(job_id)
         if not job:
             # 如果队列服务中没有，尝试从transcription_service获取
@@ -1165,7 +1322,7 @@ def create_transcription_router(
         """
         try:
             # 从队列服务或转录服务获取任务
-            queue_service = get_queue_service()
+            queue_service = get_queue_service(transcription_service)
             job = queue_service.get_job(job_id)
 
             if not job:

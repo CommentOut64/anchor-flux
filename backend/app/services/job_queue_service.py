@@ -8,18 +8,71 @@ import logging
 import gc
 import json
 import os
+import sys
+import asyncio
 from collections import deque
 from typing import Dict, Optional, Literal
 from pathlib import Path
 import torch
 
-from models.job_models import JobState
-from services.sse_service import get_sse_manager
+from app.models.job_models import JobState
+from app.services.sse_service import get_sse_manager
+from app.services.config_adapter import ConfigAdapter
 
 logger = logging.getLogger(__name__)
 
 # 插队模式类型
 PrioritizeMode = Literal["gentle", "force"]
+
+
+def _run_async_safely(coro):
+    """
+    安全地运行异步协程，处理 Windows ProactorEventLoop 的已知问题。
+
+    在 Windows 上，当使用 asyncio.run() 运行包含子进程的异步代码时，
+    事件循环关闭后可能会触发 _ProactorBasePipeTransport._call_connection_lost 回调，
+    导致 "Exception in callback" 错误。这是 Python asyncio 在 Windows 上的已知问题。
+
+    解决方案：
+    1. 手动创建和管理事件循环
+    2. 在关闭前等待所有传输完成
+    3. 忽略关闭时的无害异常
+    """
+    if sys.platform == 'win32':
+        # Windows 特殊处理
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            try:
+                # 取消所有待处理的任务
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                # 运行一次以让取消生效
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                # 关闭所有异步生成器
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                # Python 3.9+ 提供了 shutdown_default_executor
+                if hasattr(loop, 'shutdown_default_executor'):
+                    loop.run_until_complete(loop.shutdown_default_executor())
+            except Exception:
+                pass
+            finally:
+                # 关闭事件循环前等待一小段时间，让传输完成清理
+                try:
+                    # 给 ProactorEventLoop 一点时间完成管道清理
+                    import time
+                    time.sleep(0.1)
+                except Exception:
+                    pass
+                loop.close()
+                asyncio.set_event_loop(None)
+    else:
+        # 非 Windows 平台使用标准方式
+        return asyncio.run(coro)
 
 
 class JobQueueService:
@@ -60,7 +113,7 @@ class JobQueueService:
         self.lock = threading.RLock()  # 使用可重入锁，避免嵌套调用死锁
 
         # 持久化文件路径
-        from core.config import config
+        from app.core.config import config
         self.queue_file = Path(config.JOBS_DIR) / "queue_state.json"
         self.settings_file = Path(config.JOBS_DIR) / "queue_settings.json"
 
@@ -315,8 +368,29 @@ class JobQueueService:
                 logger.info(f" 开始执行任务: {self.running_job_id}")
 
                 try:
-                    # 调用原有的转录流程（会阻塞到任务结束）
-                    self.transcription_service._run_pipeline(job)
+                    # 根据引擎和配置选择流水线 (使用 ConfigAdapter 统一新旧配置)
+                    engine = getattr(job.settings, 'engine', 'sensevoice')
+                    use_dual_alignment = ConfigAdapter.needs_dual_alignment(job.settings)
+                    transcription_profile = ConfigAdapter.get_transcription_profile(job.settings)
+                    preset_id = ConfigAdapter.get_preset_id(job.settings)
+
+                    # 调试日志: 输出配置来源和关键参数
+                    config_source = ConfigAdapter.get_config_source(job.settings)
+                    logger.debug(f"配置来源: {config_source}, profile={transcription_profile}, preset={preset_id}")
+
+                    if use_dual_alignment:
+                        # 双流对齐流水线 (V3.0+ 新架构)
+                        # 触发条件: transcription_profile 为 sv_whisper_patch 或 sv_whisper_dual
+                        logger.info(f"使用双流对齐流水线 (profile={transcription_profile}, preset={preset_id})")
+                        _run_async_safely(self._run_dual_alignment_pipeline(job, preset_id))
+                    elif engine == 'sensevoice':
+                        # SenseVoice 流水线（旧架构，仅 default 预设）
+                        logger.info(f"使用 SenseVoice 流水线 (极速模式)")
+                        _run_async_safely(self.transcription_service._process_video_sensevoice(job))
+                    else:
+                        # Whisper 流水线（同步，使用三点采样）
+                        logger.info(f"使用 Whisper 流水线")
+                        self.transcription_service._run_pipeline(job)
 
                     # 检查最终状态
                     if job.canceled:
@@ -349,11 +423,13 @@ class JobQueueService:
                     self.transcription_service.save_job_meta(job)
 
                     # 推送任务结束信号（单任务频道）
+                    # 使用统一的命名空间前缀格式：signal.{signal_type}
+                    signal_type = "job_complete" if job.status == "finished" else f"job_{job.status}"
                     self.sse_manager.broadcast_sync(
                         f"job:{job.job_id}",
-                        "signal",
+                        f"signal.{signal_type}",
                         {
-                            "signal": f"job_{job.status}",  # 统一使用 "signal" 字段
+                            "signal": signal_type,
                             "job_id": job.job_id,
                             "message": job.message,
                             "status": job.status,
@@ -375,7 +451,202 @@ class JobQueueService:
                 logger.error(f"Worker循环异常: {e}", exc_info=True)
                 time.sleep(1)
 
-        logger.info("🛑 Worker循环已停止")
+        logger.info("Worker循环已停止")
+
+    async def _run_dual_alignment_pipeline(self, job: 'JobState', preset_id: str):
+        """
+        运行双流对齐流水线
+
+        V3.1.0 新特性：支持两种流水线模式
+        - async: 三级异步流水线（错位并行，性能提升 30-50%）
+        - sync: 串行流水线（稳定版，V3.0 兼容）
+
+        Args:
+            job: 任务状态对象
+            preset_id: 预设 ID
+        """
+        from app.pipelines import (
+            AudioProcessingPipeline,
+            AudioProcessingConfig,
+            DualAlignmentPipeline,
+            DualAlignmentConfig,
+            AsyncDualPipeline,
+            get_audio_processing_pipeline,
+            get_dual_alignment_pipeline,
+            get_async_dual_pipeline
+        )
+        from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
+        from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
+        from app.services.sse_service import get_sse_manager
+        from pathlib import Path
+
+        def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
+            """推送信号事件"""
+            sse_manager.broadcast_sync(
+                f"job:{job_id}",
+                f"signal.{signal_code}",
+                {"signal": signal_code, "message": message}
+            )
+
+        # 初始化管理器
+        subtitle_manager = get_streaming_subtitle_manager(job.job_id)
+        progress_tracker = get_progress_tracker(job.job_id, preset_id)
+        sse_manager = get_sse_manager()
+
+        # 流水线模式选择（V3.1.0 新增）
+        # 从配置中读取，支持环境变量 USE_ASYNC_PIPELINE 控制
+        from app.core.config import config as project_config
+        use_async_pipeline = project_config.USE_ASYNC_PIPELINE
+        queue_maxsize = project_config.PIPELINE_QUEUE_MAXSIZE
+
+        try:
+            pipeline_mode = "异步流水线 (V3.1.0)" if use_async_pipeline else "串行流水线 (V3.0)"
+            logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}, 模式={pipeline_mode}")
+
+            # === 预触发 Proxy 生成（不阻塞主流程）===
+            await self._maybe_trigger_proxy_generation(job)
+
+            # 阶段 1: 音频前处理
+            progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "音频前处理...")
+
+            audio_pipeline = get_audio_processing_pipeline(
+                logger=logger
+            )
+
+            audio_result = await audio_pipeline.process(job.input_path)
+
+            # 保存音频文件供波形图使用
+            import soundfile as sf
+            audio_path = Path(job.dir) / "audio.wav"
+            sf.write(str(audio_path), audio_result.full_audio, audio_result.sample_rate)
+            logger.info(f"音频文件已保存: {audio_path}")
+
+            progress_tracker.complete_phase(ProcessPhase.EXTRACT)
+
+            # 阶段 2: 双流对齐处理
+            total_chunks = len(audio_result.chunks)
+            progress_tracker.start_phase(ProcessPhase.SENSEVOICE, total_chunks, "双流对齐...")
+
+            if use_async_pipeline:
+                # V3.1.0: 异步流水线（三级流水线，错位并行）
+                logger.info(f"[双流对齐] 使用异步流水线处理 {total_chunks} 个 Chunk (queue_maxsize={queue_maxsize})")
+                async_pipeline = get_async_dual_pipeline(
+                    job_id=job.job_id,
+                    queue_maxsize=queue_maxsize,
+                    logger=logger
+                )
+
+                # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
+                contexts = await async_pipeline.run(
+                    audio_chunks=audio_result.chunks,
+                    full_audio_array=audio_result.full_audio,
+                    full_audio_sr=audio_result.sample_rate
+                )
+
+                # 提取结果
+                all_sentences = []
+                for ctx in contexts:
+                    all_sentences.extend(ctx.final_sentences)
+
+            else:
+                # V3.0: 串行流水线（兼容模式）
+                logger.info(f"[双流对齐] 使用串行流水线处理 {total_chunks} 个 Chunk")
+                dual_config = DualAlignmentConfig()
+                dual_pipeline = get_dual_alignment_pipeline(
+                    job_id=job.job_id,
+                    config=dual_config,
+                    logger=logger
+                )
+
+                # 处理所有 Chunks（串行）
+                results = await dual_pipeline.run(audio_result.chunks)
+
+                # 提取结果
+                all_sentences = []
+                for result in results:
+                    all_sentences.extend(result.sentences)
+
+            progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
+
+            # 阶段 3: 生成字幕文件
+            progress_tracker.start_phase(ProcessPhase.SRT, 1, "生成字幕...")
+
+            # 按时间排序
+            all_sentences.sort(key=lambda s: s.start)
+
+            # 生成 SRT
+            output_path = str(Path(job.dir) / f"{job.job_id}.srt")
+            self.transcription_service._generate_subtitle_from_sentences(
+                all_sentences,
+                output_path,
+                include_translation=False
+            )
+
+            progress_tracker.complete_phase(ProcessPhase.SRT)
+
+            # 完成
+            job.status = 'completed'
+            push_signal_event(sse_manager, job.job_id, "job_complete", "处理完成")
+
+            logger.info(f"[双流对齐] 任务完成: {job.job_id}")
+
+        except Exception as e:
+            logger.error(f"[双流对齐] 任务失败: {e}", exc_info=True)
+            job.status = 'failed'
+            job.error = str(e)
+            push_signal_event(sse_manager, job.job_id, "job_failed", str(e))
+            raise
+
+        finally:
+            # 清理资源
+            remove_streaming_subtitle_manager(job.job_id)
+            remove_progress_tracker(job.job_id)
+
+    async def _maybe_trigger_proxy_generation(self, job: 'JobState'):
+        """
+        预检视频格式，提前触发 Proxy 生成（不阻塞主流程）
+
+        在转录任务开始时调用，让 H265 等不兼容格式的视频提前开始转码，
+        用户打开编辑器时可能已完成转码。
+        """
+        from app.services.media_prep_service import get_media_prep_service
+        from app.api.routes.media_routes import (
+            _get_video_codec, NEED_TRANSCODE_CODECS, NEED_TRANSCODE_FORMATS,
+            BROWSER_COMPATIBLE_FORMATS, _find_video_file
+        )
+
+        try:
+            job_dir = Path(job.dir)
+
+            # 查找视频文件
+            video_file = _find_video_file(job_dir)
+            if not video_file:
+                return
+
+            # 检查是否需要转码
+            needs_transcode = False
+            if video_file.suffix.lower() in NEED_TRANSCODE_FORMATS:
+                needs_transcode = True
+            elif video_file.suffix.lower() in BROWSER_COMPATIBLE_FORMATS:
+                codec = _get_video_codec(video_file)
+                if codec and codec in NEED_TRANSCODE_CODECS:
+                    needs_transcode = True
+
+            if needs_transcode:
+                # 先生成 360p 预览（高优先级，快速）
+                preview_360p = job_dir / "preview_360p.mp4"
+                if not preview_360p.exists():
+                    media_prep = get_media_prep_service()
+                    enqueued = media_prep.enqueue_preview(
+                        job.job_id, video_file, preview_360p, priority=5
+                    )
+                    if enqueued:
+                        logger.info(f"[Proxy预生成] 检测到不兼容格式，提前入队360p预览: {job.job_id}")
+
+                # 720p 将在 360p 完成后或转录完成后自动触发（由 media_prep_service 和 transcription_service 处理）
+        except Exception as e:
+            # 预触发失败不影响主流程
+            logger.warning(f"[Proxy预生成] 预触发失败，忽略: {e}")
 
     def _cleanup_resources(self):
         """
@@ -532,8 +803,8 @@ class JobQueueService:
             "percent": round(job.progress, 1)
         }
 
-        self.sse_manager.broadcast_sync(f"job:{job_id}", "signal", data)
-        logger.debug(f"[单任务SSE] 推送信号: {job_id[:8]}... -> {signal}")
+        self.sse_manager.broadcast_sync(f"job:{job_id}", f"signal.{signal}", data)
+        logger.debug(f"[单任务SSE] 推送信号: {job_id[:8]}... -> signal.{signal}")
 
     def _load_settings(self):
         """加载队列设置"""

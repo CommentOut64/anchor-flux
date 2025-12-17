@@ -4,6 +4,8 @@
     <div class="list-toolbar">
       <div class="toolbar-left">
         <span class="subtitle-count">{{ totalSubtitles }} 条字幕</span>
+        <!-- Phase 5: 草稿/定稿计数 -->
+        <span v-if="draftCount > 0" class="draft-count">({{ draftCount }} 草稿)</span>
       </div>
 
       <div class="toolbar-center">
@@ -34,7 +36,7 @@
       </div>
     </div>
 
-    <!-- 字幕列表 -->
+    <!-- 字幕列表 (Phase 5: 使用 SubtitleItem 组件) -->
     <div class="list-container" ref="listRef">
       <div v-if="filteredSubtitles.length === 0" class="empty-state">
         <svg viewBox="0 0 24 24" fill="currentColor">
@@ -44,92 +46,23 @@
         <button class="add-first-btn" @click="addNewSubtitle">添加第一条字幕</button>
       </div>
 
-      <div
+      <!-- Phase 5: 使用 SubtitleItem 组件替代内联渲染 -->
+      <SubtitleItem
         v-for="(subtitle, index) in filteredSubtitles"
         :key="subtitle.id"
-        class="subtitle-item"
-        :class="{
-          'is-active': activeSubtitleId === subtitle.id,
-          'is-current': currentSubtitleId === subtitle.id,
-          'has-error': hasError(index)
-        }"
-        @click="onSubtitleClick(subtitle)"
-      >
-        <!-- 序号 -->
-        <div class="item-index">{{ index + 1 }}</div>
-
-        <!-- 主内容 -->
-        <div class="item-content">
-          <!-- 时间行 -->
-          <div class="time-row">
-            <input
-              type="text"
-              class="time-input"
-              :value="formatTime(subtitle.start)"
-              @change="e => updateTime(subtitle.id, 'start', parseTime(e.target.value))"
-              @focus="e => e.target.select()"
-            />
-            <span class="time-arrow">
-              <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M16.01 11H4v2h12.01v3L20 12l-3.99-4z"/>
-              </svg>
-            </span>
-            <input
-              type="text"
-              class="time-input"
-              :value="formatTime(subtitle.end)"
-              @change="e => updateTime(subtitle.id, 'end', parseTime(e.target.value))"
-              @focus="e => e.target.select()"
-            />
-            <span class="duration-tag">{{ formatDuration(subtitle.end - subtitle.start) }}</span>
-          </div>
-
-          <!-- 文本行 -->
-          <div class="text-row">
-            <textarea
-              class="text-input"
-              :value="subtitle.text"
-              @input="e => updateText(subtitle.id, e.target.value)"
-              placeholder="输入字幕文本..."
-              rows="2"
-            ></textarea>
-            <span class="char-count" :class="{ warning: subtitle.text.length > 30 }">
-              {{ subtitle.text.length }}
-            </span>
-          </div>
-
-          <!-- 错误提示 -->
-          <div v-if="getItemErrors(index).length > 0" class="error-tags">
-            <span
-              v-for="error in getItemErrors(index)"
-              :key="error.type"
-              class="error-tag"
-              :class="error.severity"
-            >
-              {{ error.message }}
-            </span>
-          </div>
-        </div>
-
-        <!-- 操作按钮 -->
-        <div class="item-actions">
-          <button class="action-btn" @click.stop="insertBefore(index)" title="在前面插入">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M7 14l5-5 5 5z"/>
-            </svg>
-          </button>
-          <button class="action-btn" @click.stop="insertAfter(index)" title="在后面插入">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M7 10l5 5 5-5z"/>
-            </svg>
-          </button>
-          <button class="action-btn action-btn--danger" @click.stop="deleteSubtitle(subtitle.id)" title="删除">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
-            </svg>
-          </button>
-        </div>
-      </div>
+        :subtitle="subtitle"
+        :index="index"
+        :is-active="activeSubtitleId === subtitle.id"
+        :is-current="currentSubtitleId === subtitle.id"
+        :editable="props.editable"
+        :errors="getItemErrors(index)"
+        @click="onSubtitleClick"
+        @update-time="updateTime"
+        @update-text="updateText"
+        @delete="deleteSubtitle"
+        @insert-before="insertBefore(index)"
+        @insert-after="insertAfter(index)"
+      />
     </div>
   </div>
 </template>
@@ -137,6 +70,8 @@
 <script setup>
 import { ref, computed, watch, nextTick } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+// Phase 5: 导入 SubtitleItem 组件
+import SubtitleItem from './SubtitleItem.vue'
 
 // Props
 const props = defineProps({
@@ -161,6 +96,8 @@ const totalSubtitles = computed(() => projectStore.totalSubtitles)
 const validationErrors = computed(() => projectStore.validationErrors)
 const currentSubtitleId = computed(() => projectStore.currentSubtitle?.id)
 const activeSubtitleId = computed(() => projectStore.view.selectedSubtitleId)
+// Phase 5: 草稿计数
+const draftCount = computed(() => projectStore.draftSubtitleCount)
 
 const filteredSubtitles = computed(() => {
   if (!searchText.value) return subtitles.value
@@ -169,10 +106,6 @@ const filteredSubtitles = computed(() => {
 })
 
 // Methods
-function hasError(index) {
-  return validationErrors.value.some(e => e.index === index)
-}
-
 function getItemErrors(index) {
   return validationErrors.value.filter(e => e.index === index)
 }
@@ -252,29 +185,6 @@ watch(currentSubtitleId, (id) => {
     nextTick(() => scrollToItem(index))
   }
 })
-
-// 时间格式化
-function formatTime(seconds) {
-  if (isNaN(seconds)) return '00:00.000'
-  const m = Math.floor(seconds / 60)
-  const s = Math.floor(seconds % 60)
-  const ms = Math.round((seconds % 1) * 1000)
-  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`
-}
-
-function parseTime(str) {
-  const match = str.match(/(\d+):(\d+)\.?(\d*)/)
-  if (!match) return NaN
-  const m = parseInt(match[1])
-  const s = parseInt(match[2])
-  const ms = match[3] ? parseInt(match[3].padEnd(3, '0')) : 0
-  return m * 60 + s + ms / 1000
-}
-
-function formatDuration(seconds) {
-  if (isNaN(seconds) || seconds < 0) return '0.0s'
-  return seconds.toFixed(1) + 's'
-}
 </script>
 
 <style lang="scss" scoped>
@@ -300,6 +210,12 @@ function formatDuration(seconds) {
       font-size: 12px;
       color: var(--text-secondary);
       white-space: nowrap;
+    }
+    // Phase 5: 草稿计数样式
+    .draft-count {
+      font-size: 12px;
+      color: var(--warning);
+      margin-left: 4px;
     }
   }
 
@@ -449,6 +365,38 @@ function formatDuration(seconds) {
   &.has-error {
     border-color: var(--danger);
   }
+
+  // 置信度警告高亮样式
+  &.warning-low-confidence {
+    border-color: var(--warning);
+    background: rgba(210, 153, 34, 0.06);
+
+    .item-index {
+      background: var(--warning);
+      color: white;
+    }
+  }
+
+  &.warning-high-perplexity {
+    border-color: #e67700;
+    background: rgba(230, 119, 0, 0.06);
+
+    .item-index {
+      background: #e67700;
+      color: white;
+    }
+  }
+
+  &.warning-both {
+    border-color: var(--danger);
+    background: rgba(248, 81, 73, 0.08);
+    border-width: 2px;
+
+    .item-index {
+      background: var(--danger);
+      color: white;
+    }
+  }
 }
 
 // 序号 - 缩小尺寸
@@ -512,9 +460,49 @@ function formatDuration(seconds) {
   }
 }
 
-// 文本行 - 优化尺寸
+// 文本行 - 优化尺寸（支持 Toggle Mode）
 .text-row {
   position: relative;
+
+  // 只读高亮视图
+  .text-display {
+    width: 100%;
+    min-height: 45px;
+    padding: 6px 35px 6px 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    color: var(--text-normal);
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    cursor: default;
+
+    &.can-edit {
+      cursor: text;
+      &:hover {
+        border-color: var(--primary);
+        background: var(--bg-secondary);
+      }
+    }
+
+    // 字级警告高亮样式
+    :deep(.word-warning) {
+      background-color: rgba(255, 193, 7, 0.25);
+      border-bottom: 2px solid var(--warning, #ffc107);
+      padding: 0 2px;
+      border-radius: 2px;
+    }
+
+    :deep(.word-critical) {
+      background-color: rgba(244, 67, 54, 0.25);
+      border-bottom: 2px solid var(--error, #f44336);
+      padding: 0 2px;
+      border-radius: 2px;
+      font-weight: 500;
+    }
+  }
 
   .text-input {
     width: 100%;

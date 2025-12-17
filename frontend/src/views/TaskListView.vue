@@ -254,6 +254,23 @@
         </el-tab-pane>
       </el-tabs>
 
+      <!-- 转录设置区域 - v3.5 预设模式 -->
+      <div class="transcription-settings">
+        <div class="settings-header" @click="showAdvancedSettings = !showAdvancedSettings">
+          <span>转录设置</span>
+          <el-icon :class="{ 'is-expanded': showAdvancedSettings }"><ArrowDown /></el-icon>
+        </div>
+
+        <div class="settings-content" v-if="showAdvancedSettings">
+          <!-- v3.5 预设选择器组件 -->
+          <PresetSelector
+            v-model="taskConfig"
+            :compact="true"
+            @change="handlePresetChange"
+          />
+        </div>
+      </div>
+
       <template #footer>
         <div class="dialog-footer">
           <span v-if="uploadMode === 'select'" class="selection-info">
@@ -312,11 +329,13 @@ import {
   Clock,
   Loading,
   Close,
+  ArrowDown,
 } from "@element-plus/icons-vue";
 import { useUnifiedTaskStore } from "@/stores/unifiedTaskStore";
 import { transcriptionApi, systemApi } from "@/services/api";
 import fileApi from "@/services/api/fileApi"; // 导入文件 API
 import sseChannelManager from "@/services/sseChannelManager"; // 导入 SSE 频道管理器
+import PresetSelector from "@/components/editor/PresetSelector.vue"; // v3.5 预设选择器
 
 const router = useRouter();
 const taskStore = useUnifiedTaskStore();
@@ -342,6 +361,45 @@ const editingTaskId = ref(null); // 当前正在编辑的任务ID
 const editingTitle = ref(""); // 编辑中的标题
 const originalTitle = ref(""); // 原始标题（用于恢复）
 const titleInputRef = ref(null); // 输入框引用
+
+// 转录设置相关 - v3.5 预设模式
+const showAdvancedSettings = ref(false); // 是否显示高级设置
+// v3.5 任务配置（默认使用 balanced 预设）
+const taskConfig = ref({
+  preset_id: 'balanced',
+  preprocessing: {
+    demucs_strategy: 'auto',
+    demucs_model: 'htdemucs',
+    demucs_shifts: 1,
+    spectrum_threshold: 0.35,
+    vad_filter: true
+  },
+  transcription: {
+    transcription_profile: 'sv_whisper_patch',
+    sensevoice_device: 'auto',
+    whisper_model: 'medium',
+    patching_threshold: 0.60
+  },
+  refinement: {
+    llm_task: 'proofread',
+    llm_scope: 'sparse',
+    sparse_threshold: 0.70,
+    target_language: 'zh',
+    llm_provider: 'openai_compatible',
+    llm_model_name: 'gpt-4o-mini'
+  },
+  compute: {
+    concurrency_strategy: 'auto',
+    gpu_id: 0,
+    output_formats: ['srt'],
+    temp_file_policy: 'delete_on_complete'
+  }
+});
+
+// 处理预设变更事件
+function handlePresetChange(newConfig) {
+  taskConfig.value = { ...newConfig };
+}
 
 // 计算属性 - 使用 computed 包装确保响应式
 const tasks = computed(() => taskStore.tasks);
@@ -405,11 +463,38 @@ async function handleBatchCreate() {
     const filenames = selectedFiles.value.map((file) => file.name);
     const result = await fileApi.createJobsBatch(filenames);
 
-    // 处理成功的任务
+    // 处理成功的任务 - 为每个任务启动转录
     if (result.succeeded > 0) {
+      // v3.5: 构建转录设置，使用 task_config 格式
+      const transcriptionSettings = {
+        task_config: {
+          preset_id: taskConfig.value.preset_id,
+          preprocessing: { ...taskConfig.value.preprocessing },
+          transcription: { ...taskConfig.value.transcription },
+          refinement: { ...taskConfig.value.refinement },
+          compute: { ...taskConfig.value.compute }
+        },
+        // 保留旧版字段用于兼容
+        engine: 'sensevoice',
+        model: taskConfig.value.transcription.whisper_model || 'medium',
+        compute_type: 'float16',
+        device: 'cuda',
+        batch_size: 16,
+        word_timestamps: false
+      };
+
+      // 为每个成功创建的任务启动转录
+      for (const job of result.jobs) {
+        try {
+          await transcriptionApi.startJob(job.job_id, transcriptionSettings);
+        } catch (startError) {
+          console.warn(`启动任务 ${job.job_id} 失败:`, startError);
+        }
+      }
+
       // 同步任务列表
       await taskStore.syncTasksFromBackend();
-      ElMessage.success(`成功创建 ${result.succeeded} 个任务`);
+      ElMessage.success(`成功创建并启动 ${result.succeeded} 个任务`);
     }
 
     // 处理失败的任务
@@ -513,13 +598,22 @@ async function handleUpload() {
   const failCount = ref(0);
 
   try {
-    // 默认设置
-    const defaultSettings = {
-      model: "medium",
-      compute_type: "float16",
-      device: "cuda",
+    // v3.5: 构建转录设置，使用 task_config 格式
+    const transcriptionSettings = {
+      task_config: {
+        preset_id: taskConfig.value.preset_id,
+        preprocessing: { ...taskConfig.value.preprocessing },
+        transcription: { ...taskConfig.value.transcription },
+        refinement: { ...taskConfig.value.refinement },
+        compute: { ...taskConfig.value.compute }
+      },
+      // 保留旧版字段用于兼容
+      engine: 'sensevoice',
+      model: taskConfig.value.transcription.whisper_model || 'medium',
+      compute_type: 'float16',
+      device: 'cuda',
       batch_size: 16,
-      word_timestamps: false,
+      word_timestamps: false
     };
 
     // 逐个上传文件
@@ -540,11 +634,11 @@ async function handleUpload() {
           phase: "uploading",
           progress: 0,
           message: `已加入队列 (位置: ${queue_position})`,
-          settings: {},
+          settings: transcriptionSettings,
         });
 
         // 启动转录任务
-        await transcriptionApi.startJob(job_id, defaultSettings);
+        await transcriptionApi.startJob(job_id, transcriptionSettings);
 
         // 更新任务状态
         taskStore.updateTask(job_id, {
@@ -1520,4 +1614,65 @@ async function handleExit() {
     }
   }
 }
+
+// 转录设置区域
+.transcription-settings {
+  margin-top: 16px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+
+  .settings-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: var(--bg-secondary);
+    cursor: pointer;
+    transition: background var(--transition-fast);
+
+    &:hover {
+      background: var(--bg-tertiary);
+    }
+
+    span {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-secondary);
+    }
+
+    .el-icon {
+      color: var(--text-muted);
+      transition: transform var(--transition-fast);
+
+      &.is-expanded {
+        transform: rotate(180deg);
+      }
+    }
+  }
+
+  .settings-content {
+    padding: 14px;
+    background: var(--bg-primary);
+    border-top: 1px solid var(--border-default);
+  }
+
+  .setting-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+
+    &:last-child {
+      margin-bottom: 0;
+    }
+
+    label {
+      font-size: 12px;
+      color: var(--text-secondary);
+      min-width: 70px;
+    }
+  }
+}
+
 </style>

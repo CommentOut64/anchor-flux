@@ -10,7 +10,7 @@
 
 | 组件 | 当前实现 | 说明 |
 |------|----------|------|
-| 转录引擎 | WhisperX | 基于 Whisper，支持时间对齐 |
+| 转录引擎 | Faster-Whisper | 基于 Whisper，支持时间戳 |
 | VAD | Silero VAD / Pyannote | 语音活动检测 |
 | 人声分离 | Demucs (htdemucs) | 可选的背景音乐分离 |
 | 模型管理 | ModelPreloadManager | LRU 缓存，最多 3 个模型 |
@@ -23,7 +23,7 @@
 | **中文识别** | 优于 Whisper | 一般 |
 | **情感识别** | 原生支持 | 不支持 |
 | **事件检测** | 支持 BGM/掌声/笑声等 | 不支持 |
-| **时间戳** | 原生字级时间戳 | 需要 WhisperX 对齐 |
+| **时间戳** | 原生字级时间戳 | 支持 word_timestamps |
 
 ### 1.3 集成目标
 
@@ -31,7 +31,7 @@
 2. **Whisper 作为补刀引擎**：仅处理低置信度片段（<0.6）
 3. **智能熔断机制**：人声分离与 ASR 补刀协调联动
 4. **统一模型管理**：复用现有 LRU 缓存机制
-5. **向后兼容**：支持用户选择 WhisperX 或 SenseVoice
+5. **向后兼容**：支持用户选择 Faster-Whisper 或 SenseVoice
 
 ---
 

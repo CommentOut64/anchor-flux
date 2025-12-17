@@ -89,3 +89,4 @@ test_*
 tests_output/
 
 CLAUDE.md
+backend/models/pretrained/sensevoice/

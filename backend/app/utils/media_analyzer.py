@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from core.config import config
+from app.core.config import config
 
 
 # 需要转码的编码格式 (浏览器不兼容)

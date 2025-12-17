@@ -3,4 +3,4 @@
  */
 
 export { useSseManager } from './useSseManager'
-export { useVideoStatus, VIDEO_STAGES } from './useVideoStatus'
+export { useProxyVideo, ProxyState, TranscodeDecision } from './useProxyVideo'

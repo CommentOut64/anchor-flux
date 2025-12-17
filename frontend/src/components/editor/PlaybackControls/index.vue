@@ -1,17 +1,17 @@
 <template>
   <!-- 底座模式或紧凑模式 -->
-  <div class="playback-controls" :class="{ compact, pedestal }">
+  <div class="playback-controls" :class="{ compact, pedestal, disabled: !isVideoReady }">
     <!-- 主控制区 -->
     <div class="controls-main">
       <!-- 快退 -->
-      <button class="ctrl-btn" @click="seek(-seekStep)" title="快退5秒">
+      <button class="ctrl-btn" :disabled="!isVideoReady" @click="seek(-seekStep)" title="快退5秒">
         <svg viewBox="0 0 24 24" fill="currentColor">
           <path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"/>
         </svg>
       </button>
 
       <!-- 播放/暂停 -->
-      <button class="ctrl-btn ctrl-btn--play" @click="togglePlay" :title="isPlaying ? '暂停' : '播放'">
+      <button class="ctrl-btn ctrl-btn--play" :disabled="!isVideoReady" @click="togglePlay" :title="isPlaying ? '暂停' : '播放'">
         <svg v-if="!isPlaying" viewBox="0 0 24 24" fill="currentColor">
           <path d="M8 5v14l11-7z"/>
         </svg>
@@ -21,7 +21,7 @@
       </button>
 
       <!-- 快进 -->
-      <button class="ctrl-btn" @click="seek(seekStep)" title="快进5秒">
+      <button class="ctrl-btn" :disabled="!isVideoReady" @click="seek(seekStep)" title="快进5秒">
         <svg viewBox="0 0 24 24" fill="currentColor">
           <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"/>
         </svg>
@@ -105,7 +105,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, inject } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
 import { usePlaybackManager } from '@/services/PlaybackManager'
 
@@ -127,6 +127,10 @@ const projectStore = useProjectStore()
 
 // 全局播放管理器（单例）
 const playbackManager = usePlaybackManager()
+
+// 注入编辑器上下文（获取视频就绪状态）
+const editorContext = inject('editorContext', { isVideoReady: computed(() => true) })
+const isVideoReady = computed(() => editorContext.isVideoReady?.value ?? true)
 
 // Refs
 const progressRef = ref(null)
@@ -158,12 +162,20 @@ const progressPercent = computed(() => {
 
 // 播放/暂停
 function togglePlay() {
+  if (!isVideoReady.value) {
+    console.warn('[PlaybackControls] 视频未就绪，播放操作被拦截')
+    return
+  }
   playbackManager.togglePlay()
   emit(projectStore.player.isPlaying ? 'play' : 'pause')
 }
 
 // 跳转
 function seek(seconds) {
+  if (!isVideoReady.value) {
+    console.warn('[PlaybackControls] 视频未就绪，跳转操作被拦截')
+    return
+  }
   const newTime = Math.max(0, Math.min(duration.value, currentTime.value + seconds))
   playbackManager.seekTo(newTime)
   emit('seek', newTime)
@@ -171,6 +183,10 @@ function seek(seconds) {
 
 // 进度条点击
 function handleProgressClick(e) {
+  if (!isVideoReady.value) {
+    console.warn('[PlaybackControls] 视频未就绪，进度条操作被拦截')
+    return
+  }
   if (!progressRef.value || !duration.value) return
   const rect = progressRef.value.getBoundingClientRect()
   const percent = (e.clientX - rect.left) / rect.width
@@ -181,6 +197,10 @@ function handleProgressClick(e) {
 
 // 拖拽进度条
 function startDrag(e) {
+  if (!isVideoReady.value) {
+    console.warn('[PlaybackControls] 视频未就绪，拖拽操作被拦截')
+    return
+  }
   e.preventDefault()  // 阻止默认行为，防止文本选择干扰拖拽
   playbackManager.startDragging('progressBar')
   document.addEventListener('mousemove', onDrag)
@@ -309,6 +329,13 @@ onUnmounted(() => {
       font-size: 11px;
     }
   }
+
+  // 禁用状态：视频未就绪时整体变灰
+  &.disabled {
+    opacity: 0.5;
+    pointer-events: none;
+    cursor: not-allowed;
+  }
 }
 
 // 主控制按钮
@@ -370,6 +397,12 @@ onUnmounted(() => {
   &.active {
     color: var(--primary);
     background: rgba(88, 166, 255, 0.15);
+  }
+
+  &:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    pointer-events: none;
   }
 }
 

@@ -1,16 +1,27 @@
-# Phase 4: 前端适配（修订版）
+# Phase 4: 前端适配（修订版 v2.0）
 
-> 目标：更新前端界面，支持 SenseVoice 引擎选择和硬件状态显示
+> 目标：更新前端界面，支持预设方案选择、警告高亮系统和虚拟滚动
 >
-> 工期：1-2天
+> 工期：2-3天
+>
+> 版本更新：整合 [06_转录层深度优化_时空解耦架构](./06_转录层深度优化_时空解耦架构.md) 设计
 
 ---
 
 ## ⚠️ 重要修订
 
+### v2.0 新增（时空解耦架构）
+
+- ✅ **新增**：预设选择器组件（6 个预设 + 高级自定义）
+- ✅ **新增**：置信度警告高亮系统
+- ✅ **新增**：虚拟滚动优化（支持大量字幕）
+- ✅ **新增**：高级设置面板
+- ✅ **新增**：统一 SSE 事件监听（使用新 Tag）
+
+### v1.0 基础修订
+
 - ❌ **删除**：不创建使用 `hardware_detector.py` 的 API
 - ✅ **复用**：使用现有的 `hardware_service.py` 和 `hardware_routes.py`
-- ✅ **检查**：确认现有硬件 API 是否满足需求，不满足则扩展
 
 ---
 
@@ -18,594 +29,726 @@
 
 | 任务 | 文件 | 优先级 |
 |------|------|--------|
+| **预设选择器组件** | `PresetSelector.vue` | **P0** |
+| **置信度警告高亮** | `SubtitleItem.vue` | **P0** |
+| **虚拟滚动优化** | `SubtitleList.vue` | **P1** |
+| **高级设置面板** | `AdvancedSettings.vue` | **P2** |
 | 引擎选择器 | `TaskListView.vue` | P0 |
 | 硬件状态显示 | `TaskListView.vue` | P1 |
 | 实时字幕预览 | `TaskListView.vue` | P1 |
 | API 适配 | `api/index.js` | P0 |
-| **检查现有硬件 API** | `hardware_routes.py` | P0 |
 
 ---
 
-## 二、前置检查：现有硬件 API（⚠️ 重要）
+## 二、预设选择器组件（新增）
 
-在开始前端开发前，先检查现有的硬件 API 是否满足需求：
-
-### 2.1 检查现有路由
-
-```bash
-# 查看现有硬件路由
-cat backend/app/api/routes/hardware_routes.py
-```
-
-**预期发现**：
-- 现有的 `/api/hardware` 端点
-- 返回 `HardwareInfo` 数据
-
-### 2.2 验证 API 响应格式
-
-如果现有 API 返回格式类似：
-
-```json
-{
-  "gpu_count": 1,
-  "gpu_memory_mb": [8192],
-  "cuda_available": true,
-  "gpu_name": "NVIDIA GeForce RTX 3060",
-  "cpu_cores": 8,
-  "cpu_name": "Intel Core i7-10700"
-}
-```
-
-**则需要扩展**，添加 `OptimizationConfig` 信息。
-
-### 2.3 扩展现有硬件 API（如需要）
-
-**修改文件**: `backend/app/api/routes/hardware_routes.py`
-
-在现有端点中添加优化配置信息：
-
-```python
-"""
-硬件检测 API 路由（扩展）
-"""
-from fastapi import APIRouter
-from ...services.hardware_service import get_hardware_detector, get_hardware_optimizer
-
-router = APIRouter(prefix="/api/hardware", tags=["hardware"])
-
-
-@router.get("")
-async def get_hardware_info():
-    """
-    获取硬件信息（扩展版）
-
-    ✅ 复用现有服务，添加 SenseVoice 相关配置
-    """
-    # 使用现有服务
-    detector = get_hardware_detector()
-    hardware_info = detector.detect()
-
-    optimizer = get_hardware_optimizer()
-    optimization_config = optimizer.get_optimization_config(hardware_info)
-
-    # 返回硬件信息 + 优化配置
-    return {
-        # 原有硬件信息
-        "gpu_count": hardware_info.gpu_count,
-        "gpu_memory_mb": hardware_info.gpu_memory_mb,
-        "cuda_available": hardware_info.cuda_available,
-        "gpu_name": hardware_info.gpu_name,
-        "cpu_cores": hardware_info.cpu_cores,
-        "cpu_name": hardware_info.cpu_name,
-        "memory_total_mb": hardware_info.memory_total_mb,
-        "memory_available_mb": hardware_info.memory_available_mb,
-
-        # 新增：SenseVoice 优化配置
-        "sensevoice_enabled": optimization_config.enable_sensevoice,
-        "sensevoice_device": optimization_config.sensevoice_device,
-        "demucs_enabled": optimization_config.enable_demucs,
-        "demucs_model": optimization_config.demucs_model,
-        "config_note": optimization_config.note,
-
-        # 便捷字段（供前端直接使用）
-        "gpu_memory_gb": max(hardware_info.gpu_memory_mb or [0]) / 1024 if hardware_info.gpu_memory_mb else 0,
-        "has_gpu": hardware_info.cuda_available
-    }
-```
-
-**注意**：
-- ✅ 复用现有的 `get_hardware_detector()` 和 `get_hardware_optimizer()`
-- ✅ 在现有端点上扩展，不创建新端点（除非现有端点不存在）
-- ✅ 保持向后兼容，不删除原有字段
-
----
-
-## 三、修改1：引擎选择器
-
-**修改文件**: `frontend/src/views/TaskListView.vue`
-
-### 3.1 添加引擎选择组件
-
-在任务设置区域添加：
+**路径**: `frontend/src/components/PresetSelector.vue`
 
 ```vue
 <template>
-  <div class="task-settings">
-    <!-- 现有设置 ... -->
+  <div class="preset-selector">
+    <h3 class="section-title">转录方案</h3>
 
-    <!-- 引擎选择器（新增） -->
-    <div class="setting-group">
-      <label class="setting-label">转录引擎</label>
-      <select v-model="taskSettings.engine" class="select-input" @change="onEngineChange">
-        <option value="sensevoice">SenseVoice（推荐）</option>
-        <option value="whisperx">WhisperX（传统）</option>
-      </select>
-      <p class="setting-hint">
-        {{ engineHint }}
-      </p>
-    </div>
+    <!-- 预设卡片网格 -->
+    <div class="preset-grid">
+      <div
+        v-for="preset in presets"
+        :key="preset.id"
+        :class="['preset-card', { active: selectedPreset === preset.id }]"
+        @click="selectPreset(preset.id)"
+      >
+        <div class="preset-header">
+          <span class="preset-name">{{ preset.name }}</span>
+          <span v-if="preset.recommended" class="preset-badge">推荐</span>
+        </div>
+        <p class="preset-description">{{ preset.description }}</p>
+        <div class="preset-meta">
+          <span class="meta-item">
+            耗时倍率: {{ preset.timeMultiplier }}x
+          </span>
+        </div>
+      </div>
 
-    <!-- SenseVoice 专用设置（新增） -->
-    <div v-if="taskSettings.engine === 'sensevoice'" class="setting-group">
-      <label class="setting-label">
-        置信度阈值
-        <span class="hint-text">（低于此值将触发 Whisper 补刀）</span>
-      </label>
-      <div class="slider-container">
-        <input
-          type="range"
-          v-model.number="taskSettings.confidence_threshold"
-          min="0.3"
-          max="0.9"
-          step="0.1"
-          class="slider"
-        />
-        <span class="slider-value">
-          {{ taskSettings.confidence_threshold.toFixed(1) }}
-        </span>
+      <!-- 高级自定义卡片 -->
+      <div
+        :class="['preset-card', 'custom-card', { active: selectedPreset === 'custom' }]"
+        @click="openAdvancedSettings"
+      >
+        <div class="preset-header">
+          <span class="preset-name">高级自定义</span>
+        </div>
+        <p class="preset-description">自由组合各模块，适合专业用户</p>
       </div>
     </div>
 
-    <!-- 硬件状态显示（新增） -->
-    <div class="setting-group">
-      <label class="setting-label">硬件状态</label>
-      <div class="hardware-status">
-        <div class="status-item">
-          <span class="status-label">GPU:</span>
-          <span :class="['status-value', hardwareStatus.has_gpu ? 'status-ok' : 'status-warn']">
-            {{ hardwareStatus.gpu_name || '未检测到' }}
-          </span>
-        </div>
-        <div class="status-item" v-if="hardwareStatus.has_gpu">
-          <span class="status-label">显存:</span>
-          <span class="status-value">
-            {{ hardwareStatus.gpu_memory_gb.toFixed(1) }} GB
-          </span>
-        </div>
-        <div class="status-item">
-          <span class="status-label">推荐配置:</span>
-          <span class="status-value status-note">
-            {{ hardwareStatus.config_note || '检测中...' }}
-          </span>
-        </div>
+    <!-- 当前配置摘要 -->
+    <div class="config-summary" v-if="selectedPreset !== 'custom'">
+      <div class="summary-item" v-if="currentConfig.enhancement !== 'off'">
+        Whisper 补刀: {{ getEnhancementLabel(currentConfig.enhancement) }}
+      </div>
+      <div class="summary-item" v-if="currentConfig.proofread !== 'off'">
+        LLM 校对: {{ getProofreadLabel(currentConfig.proofread) }}
+      </div>
+      <div class="summary-item" v-if="currentConfig.translate !== 'off'">
+        LLM 翻译: {{ getTranslateLabel(currentConfig.translate) }}
       </div>
     </div>
   </div>
 </template>
-```
 
-### 3.2 添加 data 属性
-
-```vue
 <script>
 export default {
+  name: 'PresetSelector',
+
   data() {
     return {
-      taskSettings: {
-        engine: 'sensevoice',               // 默认 SenseVoice
-        confidence_threshold: 0.6,          // 置信度阈值
-        // ... 其他设置
-      },
-      hardwareStatus: {
-        has_gpu: false,
-        gpu_name: '',
-        gpu_memory_gb: 0,
-        config_note: '检测中...'
-      }
-    }
-  },
-  computed: {
-    engineHint() {
-      const hints = {
-        sensevoice: '高速转录，推理速度是 Whisper 的 15 倍，适合中文/英文/粤语',
-        whisperx: '传统 Whisper 引擎，支持更多语言，速度较慢'
-      }
-      return hints[this.taskSettings.engine] || ''
-    }
-  },
-  mounted() {
-    // 加载硬件状态
-    this.fetchHardwareStatus()
-  },
-  methods: {
-    async fetchHardwareStatus() {
-      try {
-        const response = await this.$api.getHardwareStatus()
-        // ✅ 使用扩展后的 API 响应
-        this.hardwareStatus = {
-          has_gpu: response.data.has_gpu,
-          gpu_name: response.data.gpu_name,
-          gpu_memory_gb: response.data.gpu_memory_gb,
-          config_note: response.data.config_note
+      selectedPreset: 'preset1',
+      presets: [
+        {
+          id: 'default',
+          name: 'SenseVoice Only',
+          description: '极速模式，仅使用 SenseVoice 转录',
+          timeMultiplier: 0.1,
+          recommended: false
+        },
+        {
+          id: 'preset1',
+          name: '智能补刀',
+          description: 'SV + Whisper 局部补刀，平衡速度与质量',
+          timeMultiplier: 0.15,
+          recommended: true
+        },
+        {
+          id: 'preset2',
+          name: '轻度校对',
+          description: '智能补刀 + LLM 按需校对问题片段',
+          timeMultiplier: 0.2,
+          recommended: false
+        },
+        {
+          id: 'preset3',
+          name: '深度校对',
+          description: '智能补刀 + LLM 全文精修润色',
+          timeMultiplier: 0.3,
+          recommended: false
+        },
+        {
+          id: 'preset4',
+          name: '校对+翻译',
+          description: '深度校对 + 全文翻译',
+          timeMultiplier: 0.5,
+          recommended: false
+        },
+        {
+          id: 'preset5',
+          name: '校对+重点翻译',
+          description: '深度校对 + 仅翻译标记的重点段落',
+          timeMultiplier: 0.35,
+          recommended: false
         }
-      } catch (error) {
-        console.error('获取硬件状态失败:', error)
-        this.hardwareStatus.config_note = '获取硬件信息失败'
+      ],
+      currentConfig: {
+        enhancement: 'smart_patch',
+        proofread: 'off',
+        translate: 'off'
       }
+    }
+  },
+
+  methods: {
+    selectPreset(presetId) {
+      this.selectedPreset = presetId
+      this.updateConfig(presetId)
+      this.$emit('preset-changed', presetId, this.currentConfig)
     },
-    onEngineChange() {
-      // 引擎切换时可以做一些处理
-      console.log('引擎已切换:', this.taskSettings.engine)
+
+    updateConfig(presetId) {
+      const configs = {
+        'default': { enhancement: 'off', proofread: 'off', translate: 'off' },
+        'preset1': { enhancement: 'smart_patch', proofread: 'off', translate: 'off' },
+        'preset2': { enhancement: 'smart_patch', proofread: 'sparse', translate: 'off' },
+        'preset3': { enhancement: 'smart_patch', proofread: 'full', translate: 'off' },
+        'preset4': { enhancement: 'smart_patch', proofread: 'full', translate: 'full' },
+        'preset5': { enhancement: 'smart_patch', proofread: 'full', translate: 'partial' }
+      }
+      this.currentConfig = configs[presetId] || configs['default']
+    },
+
+    openAdvancedSettings() {
+      this.selectedPreset = 'custom'
+      this.$emit('open-advanced')
+    },
+
+    getEnhancementLabel(mode) {
+      const labels = {
+        'off': '关闭',
+        'smart_patch': '智能补刀',
+        'deep_listen': '深度重听'
+      }
+      return labels[mode] || mode
+    },
+
+    getProofreadLabel(mode) {
+      const labels = {
+        'off': '关闭',
+        'sparse': '按需校对',
+        'full': '全文精修'
+      }
+      return labels[mode] || mode
+    },
+
+    getTranslateLabel(mode) {
+      const labels = {
+        'off': '关闭',
+        'full': '全文翻译',
+        'partial': '重点翻译'
+      }
+      return labels[mode] || mode
     }
   }
 }
 </script>
-```
 
-### 3.3 添加样式
-
-```vue
 <style scoped>
-.slider-container {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
+.preset-selector {
+  margin-bottom: 2rem;
 }
 
-.slider {
-  flex: 1;
-  height: 4px;
-  background: #ddd;
-  outline: none;
-  border-radius: 2px;
-}
-
-.slider::-webkit-slider-thumb {
-  appearance: none;
-  width: 16px;
-  height: 16px;
-  background: #42b983;
-  border-radius: 50%;
-  cursor: pointer;
-}
-
-.slider-value {
-  min-width: 3rem;
-  text-align: center;
-  font-weight: bold;
-  color: #42b983;
-}
-
-.hardware-status {
-  padding: 0.75rem;
-  background: #f5f5f5;
-  border-radius: 4px;
-  font-size: 0.9rem;
-}
-
-.status-item {
-  display: flex;
-  align-items: center;
-  margin-bottom: 0.5rem;
-}
-
-.status-item:last-child {
-  margin-bottom: 0;
-}
-
-.status-label {
-  min-width: 80px;
-  font-weight: 500;
-  color: #666;
-}
-
-.status-value {
-  flex: 1;
+.section-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
   color: #333;
 }
 
-.status-ok {
-  color: #42b983;
-  font-weight: 500;
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 1rem;
 }
 
-.status-warn {
-  color: #e67e22;
-  font-weight: 500;
+.preset-card {
+  padding: 1rem;
+  border: 2px solid #e0e0e0;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: #fff;
 }
 
-.status-note {
+.preset-card:hover {
+  border-color: #42b983;
+  box-shadow: 0 2px 8px rgba(66, 185, 131, 0.2);
+}
+
+.preset-card.active {
+  border-color: #42b983;
+  background: rgba(66, 185, 131, 0.05);
+}
+
+.preset-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.preset-name {
+  font-weight: 600;
+  color: #333;
+}
+
+.preset-badge {
+  font-size: 0.7rem;
+  padding: 0.2rem 0.5rem;
+  background: #42b983;
+  color: #fff;
+  border-radius: 4px;
+}
+
+.preset-description {
   font-size: 0.85rem;
+  color: #666;
+  margin: 0;
+  line-height: 1.4;
+}
+
+.preset-meta {
+  margin-top: 0.75rem;
+  font-size: 0.8rem;
+  color: #999;
+}
+
+.custom-card {
+  border-style: dashed;
+}
+
+.config-summary {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  background: #f5f5f5;
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+
+.summary-item {
+  display: inline-block;
+  margin-right: 1rem;
+  color: #42b983;
+}
+</style>
+```
+
+---
+
+## 三、置信度警告高亮系统（新增）
+
+**路径**: `frontend/src/components/SubtitleItem.vue`
+
+```vue
+<template>
+  <div :class="['subtitle-item', warningClass]">
+    <!-- 时间戳 -->
+    <div class="time-range">
+      {{ formatTime(subtitle.start) }} - {{ formatTime(subtitle.end) }}
+    </div>
+
+    <!-- 主文本 -->
+    <div class="text-content">
+      <span
+        v-for="(word, idx) in subtitle.words"
+        :key="idx"
+        :class="['word', getWordClass(word)]"
+        :title="getWordTooltip(word)"
+      >
+        {{ word.word }}
+      </span>
+    </div>
+
+    <!-- 来源标签 -->
+    <div class="source-badge" v-if="subtitle.is_modified">
+      <span :class="['badge', `badge-${subtitle.source}`]">
+        {{ getSourceLabel(subtitle.source) }}
+      </span>
+    </div>
+
+    <!-- 翻译（如果有） -->
+    <div class="translation" v-if="subtitle.translation">
+      {{ subtitle.translation }}
+    </div>
+
+    <!-- 警告指示器 -->
+    <div class="warning-indicator" v-if="hasWarning">
+      <span class="warning-icon" :title="warningTooltip">!</span>
+    </div>
+  </div>
+</template>
+
+<script>
+export default {
+  name: 'SubtitleItem',
+
+  props: {
+    subtitle: {
+      type: Object,
+      required: true
+    }
+  },
+
+  computed: {
+    hasWarning() {
+      return this.subtitle.warning_type && this.subtitle.warning_type !== 'none'
+    },
+
+    warningClass() {
+      const classes = {
+        'low_transcription': 'warning-low-confidence',
+        'high_perplexity': 'warning-high-perplexity',
+        'both': 'warning-critical'
+      }
+      return classes[this.subtitle.warning_type] || ''
+    },
+
+    warningTooltip() {
+      const tooltips = {
+        'low_transcription': `转录置信度较低 (${(this.subtitle.confidence * 100).toFixed(0)}%)`,
+        'high_perplexity': `校对困惑度较高 (${this.subtitle.perplexity?.toFixed(1)})`,
+        'both': '转录和校对都存在问题，建议人工复核'
+      }
+      return tooltips[this.subtitle.warning_type] || ''
+    }
+  },
+
+  methods: {
+    formatTime(seconds) {
+      const mins = Math.floor(seconds / 60)
+      const secs = Math.floor(seconds % 60)
+      const ms = Math.floor((seconds % 1) * 1000)
+      return `${mins}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`
+    },
+
+    getWordClass(word) {
+      if (word.confidence < 0.3) return 'word-critical'
+      if (word.confidence < 0.5) return 'word-warning'
+      if (word.is_pseudo) return 'word-pseudo'
+      return ''
+    },
+
+    getWordTooltip(word) {
+      const parts = []
+      parts.push(`置信度: ${(word.confidence * 100).toFixed(0)}%`)
+      if (word.is_pseudo) parts.push('(伪对齐)')
+      return parts.join(' ')
+    },
+
+    getSourceLabel(source) {
+      const labels = {
+        'sensevoice': 'SV',
+        'whisper_patch': 'W',
+        'llm_correction': 'LLM',
+        'llm_translation': 'Trans'
+      }
+      return labels[source] || source
+    }
+  }
+}
+</script>
+
+<style scoped>
+.subtitle-item {
+  position: relative;
+  padding: 0.75rem 1rem;
+  border-left: 3px solid transparent;
+  transition: all 0.2s ease;
+}
+
+.subtitle-item:hover {
+  background: rgba(0, 0, 0, 0.02);
+}
+
+/* 警告样式 */
+.warning-low-confidence {
+  border-left-color: #f39c12;
+  background: rgba(243, 156, 18, 0.05);
+}
+
+.warning-high-perplexity {
+  border-left-color: #9b59b6;
+  background: rgba(155, 89, 182, 0.05);
+}
+
+.warning-critical {
+  border-left-color: #e74c3c;
+  background: rgba(231, 76, 60, 0.08);
+}
+
+.time-range {
+  font-size: 0.8rem;
+  font-family: monospace;
+  color: #999;
+  margin-bottom: 0.25rem;
+}
+
+.text-content {
+  font-size: 1rem;
+  color: #333;
+  line-height: 1.6;
+}
+
+/* 字级警告高亮 */
+.word-warning {
+  background: rgba(243, 156, 18, 0.3);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+.word-critical {
+  background: rgba(231, 76, 60, 0.4);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+.word-pseudo {
+  border-bottom: 1px dashed #999;
+}
+
+.source-badge {
+  display: inline-block;
+  margin-left: 0.5rem;
+}
+
+.badge {
+  font-size: 0.7rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  font-weight: 500;
+}
+
+.badge-whisper_patch {
+  background: #3498db;
+  color: #fff;
+}
+
+.badge-llm_correction {
+  background: #9b59b6;
+  color: #fff;
+}
+
+.translation {
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
   color: #666;
   font-style: italic;
 }
 
-.hint-text {
-  font-size: 0.85rem;
-  color: #999;
-  margin-left: 0.5rem;
+.warning-indicator {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+}
+
+.warning-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  background: #e74c3c;
+  color: #fff;
+  border-radius: 50%;
+  font-size: 0.7rem;
+  font-weight: bold;
+  cursor: help;
 }
 </style>
 ```
 
 ---
 
-## 四、修改2：实时字幕预览
+## 四、虚拟滚动优化（新增）
 
-在任务详情页面添加实时字幕预览：
-
-### 4.1 添加预览组件
+**路径**: `frontend/src/components/SubtitleList.vue`
 
 ```vue
 <template>
-  <div class="task-detail">
-    <!-- 现有内容 ... -->
+  <div class="subtitle-list" ref="listContainer">
+    <div class="list-header">
+      <span class="header-title">字幕预览 ({{ subtitles.length }} 条)</span>
+      <div class="filter-controls">
+        <label class="filter-checkbox">
+          <input type="checkbox" v-model="showWarningsOnly" />
+          仅显示警告
+        </label>
+      </div>
+    </div>
 
-    <!-- 实时字幕预览（新增） -->
-    <div class="subtitle-preview" v-if="job.status === 'processing'">
-      <h3>实时字幕预览</h3>
-      <div class="preview-container">
-        <div
-          v-for="sentence in realtimeSubtitles"
-          :key="sentence.id"
-          class="subtitle-item"
-        >
-          <span class="subtitle-time">
-            {{ formatTime(sentence.start) }} - {{ formatTime(sentence.end) }}
-          </span>
-          <span class="subtitle-text">{{ sentence.text }}</span>
-          <span
-            v-if="!sentence.is_final"
-            class="subtitle-status status-processing"
-          >
-            处理中
-          </span>
-          <span
-            v-else
-            :class="['subtitle-confidence', getConfidenceClass(sentence.confidence)]"
-          >
-            {{ (sentence.confidence * 100).toFixed(0) }}%
-          </span>
-        </div>
+    <!-- 虚拟滚动容器 -->
+    <div
+      class="virtual-scroll-container"
+      :style="{ height: containerHeight + 'px' }"
+      @scroll="onScroll"
+    >
+      <div
+        class="virtual-scroll-content"
+        :style="{ height: totalHeight + 'px', paddingTop: offsetY + 'px' }"
+      >
+        <SubtitleItem
+          v-for="item in visibleItems"
+          :key="item.index"
+          :subtitle="item.data"
+        />
       </div>
     </div>
   </div>
 </template>
 
 <script>
+import SubtitleItem from './SubtitleItem.vue'
+
 export default {
-  data() {
-    return {
-      realtimeSubtitles: []
+  name: 'SubtitleList',
+
+  components: { SubtitleItem },
+
+  props: {
+    subtitles: {
+      type: Array,
+      default: () => []
     }
   },
+
+  data() {
+    return {
+      showWarningsOnly: false,
+      containerHeight: 500,
+      itemHeight: 80,  // 估算的每项高度
+      scrollTop: 0,
+      buffer: 5  // 缓冲项数
+    }
+  },
+
+  computed: {
+    filteredSubtitles() {
+      if (!this.showWarningsOnly) return this.subtitles
+      return this.subtitles.filter(s => s.warning_type && s.warning_type !== 'none')
+    },
+
+    totalHeight() {
+      return this.filteredSubtitles.length * this.itemHeight
+    },
+
+    startIndex() {
+      return Math.max(0, Math.floor(this.scrollTop / this.itemHeight) - this.buffer)
+    },
+
+    endIndex() {
+      const visibleCount = Math.ceil(this.containerHeight / this.itemHeight)
+      return Math.min(
+        this.filteredSubtitles.length,
+        this.startIndex + visibleCount + this.buffer * 2
+      )
+    },
+
+    visibleItems() {
+      return this.filteredSubtitles
+        .slice(this.startIndex, this.endIndex)
+        .map((data, i) => ({
+          index: this.startIndex + i,
+          data
+        }))
+    },
+
+    offsetY() {
+      return this.startIndex * this.itemHeight
+    }
+  },
+
   methods: {
-    setupSSE() {
-      // ... 现有 SSE 代码 ...
-
-      // 新增：监听句级事件
-      eventSource.addEventListener('sentence', (event) => {
-        const sentence = JSON.parse(event.data)
-        sentence.id = Date.now() + Math.random()
-        this.realtimeSubtitles.push(sentence)
-
-        // 限制预览数量（最多显示最近 20 条）
-        if (this.realtimeSubtitles.length > 20) {
-          this.realtimeSubtitles.shift()
-        }
-      })
-    },
-    formatTime(seconds) {
-      const mins = Math.floor(seconds / 60)
-      const secs = (seconds % 60).toFixed(1)
-      return `${mins}:${secs.padStart(4, '0')}`
-    },
-    getConfidenceClass(confidence) {
-      if (confidence >= 0.8) return 'confidence-high'
-      if (confidence >= 0.6) return 'confidence-medium'
-      return 'confidence-low'
+    onScroll(e) {
+      this.scrollTop = e.target.scrollTop
     }
   }
 }
 </script>
 
 <style scoped>
-.subtitle-preview {
-  margin-top: 2rem;
-  padding: 1rem;
+.subtitle-list {
   border: 1px solid #e0e0e0;
   border-radius: 8px;
-  background: #fafafa;
+  overflow: hidden;
 }
 
-.subtitle-preview h3 {
-  margin-top: 0;
-  margin-bottom: 1rem;
-  font-size: 1.1rem;
+.list-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  background: #f5f5f5;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.header-title {
+  font-weight: 600;
   color: #333;
 }
 
-.preview-container {
-  max-height: 400px;
-  overflow-y: auto;
-  padding: 0.5rem;
-  background: white;
-  border-radius: 4px;
-}
-
-.subtitle-item {
+.filter-checkbox {
   display: flex;
   align-items: center;
-  padding: 0.5rem;
-  margin-bottom: 0.5rem;
-  border-bottom: 1px solid #f0f0f0;
-  font-size: 0.9rem;
-}
-
-.subtitle-item:last-child {
-  border-bottom: none;
-}
-
-.subtitle-time {
-  min-width: 120px;
+  gap: 0.5rem;
+  font-size: 0.85rem;
   color: #666;
-  font-family: monospace;
+  cursor: pointer;
 }
 
-.subtitle-text {
-  flex: 1;
-  color: #333;
-  margin: 0 1rem;
+.virtual-scroll-container {
+  overflow-y: auto;
 }
 
-.subtitle-confidence {
-  min-width: 50px;
-  text-align: right;
-  font-weight: 500;
-  font-size: 0.85rem;
-}
-
-.confidence-high {
-  color: #27ae60;
-}
-
-.confidence-medium {
-  color: #f39c12;
-}
-
-.confidence-low {
-  color: #e74c3c;
-}
-
-.status-processing {
-  color: #3498db;
-  font-size: 0.85rem;
+.virtual-scroll-content {
+  position: relative;
 }
 </style>
 ```
 
 ---
 
-## 五、修改3：API 适配（⚠️ 修订）
+## 五、统一 SSE 事件监听（更新）
 
-**修改文件**: `frontend/src/services/api/index.js`
-
-### 5.1 新增硬件状态 API
+**修改文件**: `frontend/src/views/TaskDetailView.vue`
 
 ```javascript
-export default {
-  // ... 现有方法 ...
+// SSE 事件监听器设置
+setupSSE(jobId) {
+  const eventSource = new EventSource(`/api/sse/job:${jobId}`)
 
-  /**
-   * 获取硬件状态
-   *
-   * ✅ 使用现有的 /api/hardware 端点（已扩展）
-   */
-  async getHardwareStatus() {
-    try {
-      const response = await axios.get('/api/hardware')
-      return response
-    } catch (error) {
-      console.error('获取硬件状态失败:', error)
-      throw error
-    }
-  },
+  // ========== 进度事件 ==========
+  eventSource.addEventListener('progress.overall', (e) => {
+    const data = JSON.parse(e.data)
+    this.job.progress = data.percent
+    this.job.phase = data.phase
+    this.job.message = data.message
+  })
 
-  /**
-   * 创建转录任务（更新参数）
-   */
-  async createTranscriptionJob(params) {
-    const payload = {
-      input_path: params.inputPath,
-      output_path: params.outputPath,
-      settings: {
-        engine: params.engine || 'sensevoice',
-        confidence_threshold: params.confidenceThreshold || 0.6,
-        language: params.language || 'auto',
-        // ... 其他设置
-      }
-    }
+  // ========== 字幕流式事件 ==========
+  eventSource.addEventListener('subtitle.sv_sentence', (e) => {
+    const data = JSON.parse(e.data)
+    this.subtitles.push(data.sentence)
+  })
 
-    try {
-      const response = await axios.post('/api/transcription/jobs', payload)
-      return response
-    } catch (error) {
-      console.error('创建任务失败:', error)
-      throw error
-    }
-  }
+  eventSource.addEventListener('subtitle.whisper_patch', (e) => {
+    const data = JSON.parse(e.data)
+    this.updateSubtitle(data.index, data.sentence)
+  })
+
+  eventSource.addEventListener('subtitle.llm_proof', (e) => {
+    const data = JSON.parse(e.data)
+    this.updateSubtitle(data.index, data.sentence)
+  })
+
+  eventSource.addEventListener('subtitle.llm_trans', (e) => {
+    const data = JSON.parse(e.data)
+    this.setTranslation(data.index, data.translation)
+  })
+
+  // ========== 信号事件 ==========
+  eventSource.addEventListener('signal.job_complete', (e) => {
+    this.job.status = 'completed'
+    eventSource.close()
+  })
+
+  eventSource.addEventListener('signal.job_failed', (e) => {
+    const data = JSON.parse(e.data)
+    this.job.status = 'failed'
+    this.job.error = data.message
+    eventSource.close()
+  })
+
+  this.eventSource = eventSource
 }
 ```
 
 ---
 
-## 六、快速测试
+## 六、验收标准
 
-### 6.1 测试硬件状态显示
-
-1. 启动后端服务
-2. 打开前端页面
-3. 检查硬件状态区域是否显示正确信息
-4. ✅ 验证数据来自现有 API
-
-### 6.2 测试引擎选择
-
-1. 切换引擎选项
-2. 检查提示文字是否变化
-3. 创建任务，验证引擎参数是否正确传递
-
-### 6.3 测试实时字幕
-
-1. 创建一个转录任务
-2. 观察实时字幕预览区域
-3. 验证字幕是否实时更新
-
----
-
-## 七、验收标准
+### 基础功能
 
 - [ ] 引擎选择器可正常切换
 - [ ] 硬件状态正确显示
-- [ ] 实时字幕预览可正常工作
 - [ ] API 参数正确传递到后端
-- [ ] **使用现有硬件 API，不创建重复端点**
-- [ ] **硬件信息包含 SenseVoice 优化配置**
+
+### 时空解耦架构（新增）
+
+- [ ] 预设选择器正确显示 6 个预设
+- [ ] 点击预设正确更新配置
+- [ ] 置信度警告高亮正确显示
+- [ ] 字级低置信度高亮正确显示
+- [ ] 虚拟滚动在大量字幕时不卡顿
+- [ ] SSE 事件使用新 Tag 正确接收
 
 ---
 
-## 八、注意事项
+## 七、下一步
 
-1. **兼容性**：
-   - 确保新界面不影响现有 WhisperX 功能
-   - 保留原有配置项
-
-2. **用户体验**：
-   - 硬件状态加载失败时显示友好提示
-   - 实时字幕预览限制显示数量（避免卡顿）
-
-3. **样式一致性**：
-   - 新组件样式与现有界面保持一致
-   - 使用项目现有的颜色方案
-
-4. **⚠️ API 复用原则**（关键）：
-   - ✅ 使用现有的 `/api/hardware` 端点
-   - ✅ 扩展现有端点而非创建新端点
-   - ✅ 保持向后兼容
-
----
-
-## 九、下一步
-
-完成 Phase 4（修订版）后，进入 [Phase 5: 整合测试](./05_Phase5_整合测试.md)
-
-（Phase 5 无需修订，测试脚本可直接使用）
+完成 Phase 4（修订版 v2.0）后，进入 [Phase 5: 整合测试](./05_Phase5_整合测试_修订版.md)

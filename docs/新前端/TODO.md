@@ -51,12 +51,6 @@
 
 - [ ] 导出菜单
 - [ ] 幽灵任务，队列完成后出现
-
-[media] FFprobe 成功获取时长: 60.000000秒
-[media] 动态采样：时长60.0s → 4000个采样点
-
-16:48:34.973 [ERROR] [transcription_service] 删除任务数据失败: [WinError 32] 另一个程序正在使用此文件，进程无法访问。: 'F:\\video_to_srt_gpu\\jobs\\83e074e836ef4681894f6d1798d8e002\\test_video.mp4'
-
 - [ ] 快捷键
 - [ ] 后端写入日志
 
@@ -66,3 +60,55 @@
 
 11.校对
 
+
+
+
+
+BGM检测完成: 比例=[0.01868760338502411, 0.01807172506509757, 0.04894797753079488], 平均=0.03, 最大=0.05
+00:08:24.058 [INFO] [transcription_service] BGM检测结果: light, 比例=[0.01868760338502411, 0.01807172506509757, 0.04894797753079488], 最大=0.05
+00:08:24.088 [INFO] [transcription_service] BGM检测完成: light
+
+
+
+实时连接已断开，正在尝试重连
+
+
+
+
+
+进度条回退
+
+
+
+
+
+EditorView.vue:856  视频加载错误: Error: 视频加载失败，正在重试 (1/3)...
+    at onError (index.vue:429:17)
+    at callWithErrorHandling (chunk-256OB4QR.js?v=cf2fc920:2560:19)
+    at callWithAsyncErrorHandling (chunk-256OB4QR.js?v=cf2fc920:2567:17)
+    at HTMLVideoElement.invoker (chunk-256OB4QR.js?v=cf2fc920:11679:5)claude-sonnet-4-5-20250929[1m]
+handleVideoError @ EditorView.vue:856
+index.vue:332  [VideoStage] 视频源切换失败: Error: 加载失败
+    at HTMLVideoElement.onError (index.vue:314:18)
+
+
+
+
+
+curl -v -H "Authorization: Bearer wgh-gemini-c" "https://wgh-gb.zeabur.app/v1beta/models"
+
+
+F:\video_to_srt_gpu\.venv\lib\site-packages\torch\nn\modules\activation.py:1230: UserWarning: 1Torch was not compiled with flash attention. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\builder\windows\pytorch\aten\src\ATen\native\transformers\cuda\sdp_utils.cpp:555.)
+  return torch._native_multi_head_attention(
+
+
+
+1.Post-VAD 智能合并层
+2：强制关键补刀
+第2点特别注意：默认使用medium模型，但提供更高的配置选项，whisper模型统一接入现有的模型下载管理器；对于强制对齐的细节在文档末尾还有讨论仔细阅读分析。
+3.过滤 Tags
+4.VAD 边缘吸附
+5.Word-Level Trigger（字级触发）
+
+补充：1.理论上项目已经实现了对于字级置信度低的字在前端高亮的代码，但现在没有正常显示，分析是否忘记了在前端集成
+2.进行所有上述的修改后，要对四层分句系统进行重新审视，看哪些部分需要做调整

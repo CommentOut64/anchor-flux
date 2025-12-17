@@ -39,7 +39,7 @@ class DemucsConfig:
     # 模型选择 - 默认使用htdemucs（快速，只需1个文件）
     model_name: str = "htdemucs"
     device: str = "cuda"                   # 设备 (cuda/cpu)
-    shifts: int = 2                        # 增强次数（1=快速，2=平衡，5=最高质量）
+    shifts: int = 1                        # 增强次数（1=快速，2=平衡，5=最高质量）- 速度优先
     overlap: float = 0.5                   # 分段重叠率
     segment_length: int = 10               # 每段处理长度（秒）
 
@@ -322,6 +322,36 @@ class DemucsService:
             self.config.model_name = model_name
             # 卸载旧模型，下次使用时会加载新模型
             self.unload_model()
+
+    def preload_model(self, model_name: str = None) -> bool:
+        """
+        预加载 Demucs 模型到显存
+
+        Args:
+            model_name: 模型名称，默认使用当前配置的模型
+
+        Returns:
+            bool: 是否加载成功
+        """
+        if model_name:
+            self.set_model(model_name)
+
+        try:
+            self.logger.info(f"预加载 Demucs 模型: {self.config.model_name}")
+            self._load_model()
+            self.logger.info(f"Demucs 模型 {self.config.model_name} 预加载完成")
+            return True
+        except Exception as e:
+            self.logger.error(f"Demucs 模型预加载失败: {e}")
+            return False
+
+    def is_model_loaded(self) -> bool:
+        """检查模型是否已加载"""
+        return self._model is not None
+
+    def get_loaded_model_name(self) -> Optional[str]:
+        """获取当前加载的模型名称"""
+        return self._model_name_loaded
 
     def _load_model(self, device: str = None):
         """
@@ -719,7 +749,25 @@ class DemucsService:
         duration_sec: Optional[float] = None
     ) -> Tuple[BGMLevel, List[float]]:
         """
-        快速检测背景音乐强度（分位数采样策略）
+        [已废弃] 快速检测背景音乐强度（分位数采样 + Demucs 残差策略）
+
+        ⚠️ 此方法已废弃，Whisper/SenseVoice 流水线均已切换到频谱分诊：
+        
+        Whisper 流水线使用：
+        >>> from app.services.audio_spectrum_classifier import get_spectrum_classifier
+        >>> classifier = get_spectrum_classifier()
+        >>> level_str, avg_score = classifier.quick_global_diagnosis(audio, sr)
+        
+        SenseVoice 流水线使用：
+        >>> diagnoses = classifier.diagnose_chunks(chunks, sr)
+        
+        废弃原因：
+        - Demucs 分离即使对纯人声也有 1-3% 残差，导致误判为 light
+        - 需要加载 Demucs 模型，速度慢
+        - 新方法纯频谱分析，无需 Demucs，更快更准确
+
+        ---
+        旧文档（保留供参考）：
 
         采样策略：取音频时长的 15%、50%、85% 处各截取 10 秒
         - 15%：捕获 Intro 结束后的主歌背景音
@@ -942,6 +990,90 @@ class DemucsService:
                 f"应用质量参数: model={model_name}, "
                 f"shifts={self.config.shifts}, overlap={self.config.overlap}"
             )
+
+    def separate_chunk(
+        self,
+        audio: np.ndarray,
+        model: str = None,
+        sr: int = 16000
+    ) -> np.ndarray:
+        """
+        分离单个 Chunk 的人声（熔断决策器专用接口）
+
+        这是 separate_vocals_segment 的简化适配器，用于熔断回溯场景。
+        输入的 audio 已经是切好的 Chunk 片段，无需 start/end 参数。
+
+        Args:
+            audio: Chunk 音频数组 (samples,) 单声道
+            model: 指定模型名称（可选，不指定则使用当前配置）
+            sr: 采样率（默认 16000）
+
+        Returns:
+            np.ndarray: 分离后的人声数组 (samples,)
+        """
+        # 切换模型（如果指定）
+        if model and model != self.config.model_name:
+            self.set_model(model)
+            self._apply_quality_settings(model)
+
+        # 直接对整个 Chunk 进行分离（无需缓冲区，因为已经是完整片段）
+        # 复用 separate_vocals_segment 的核心逻辑
+        from demucs.apply import apply_model
+
+        demucs_model = self._load_model()
+
+        # 转换为立体声
+        if audio.ndim == 1:
+            segment = np.stack([audio, audio])  # (2, samples)
+        else:
+            segment = audio
+
+        # 重采样到模型要求的采样率
+        if sr != demucs_model.samplerate:
+            import librosa
+            segment = librosa.resample(segment, orig_sr=sr, target_sr=demucs_model.samplerate)
+            target_sr = demucs_model.samplerate
+        else:
+            target_sr = sr
+
+        # 转为 tensor
+        wav = torch.from_numpy(segment).float()
+        ref = wav.mean(0)
+        wav = (wav - ref.mean()) / ref.std()
+        wav = wav.unsqueeze(0)
+
+        if self.config.device == "cuda":
+            wav = wav.cuda()
+
+        # 执行分离
+        with torch.no_grad():
+            sources = apply_model(
+                demucs_model,
+                wav,
+                shifts=self.config.shifts,
+                overlap=self.config.overlap,
+                progress=False,
+                device=self.config.device
+            )
+
+        # 提取人声
+        source_names = demucs_model.sources
+        vocals_idx = source_names.index('vocals')
+        vocals = sources[0, vocals_idx]
+        vocals = vocals * ref.std() + ref.mean()
+        vocals = vocals.cpu().numpy()
+
+        # 重采样回原始采样率
+        if target_sr != sr:
+            import librosa
+            vocals = librosa.resample(vocals, orig_sr=target_sr, target_sr=sr)
+
+        # 转为单声道
+        if vocals.ndim > 1:
+            vocals = vocals.mean(axis=0)
+
+        self.logger.debug(f"Chunk 分离完成 (model={self.config.model_name})")
+        return vocals
 
 
 # 全局单例

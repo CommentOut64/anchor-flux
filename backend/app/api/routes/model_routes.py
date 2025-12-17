@@ -10,9 +10,9 @@ import json
 import time
 import logging
 
-from models.model_models import ModelInfo, AlignModelInfo
-from services.model_manager_service import get_model_manager
-from services.sse_service import get_sse_manager  # 导入统一SSE管理器
+from app.models.model_models import ModelInfo
+from app.services.model_manager_service import get_model_manager
+from app.services.sse_service import get_sse_manager  # 导入统一SSE管理器
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 logger = logging.getLogger(__name__)
@@ -34,21 +34,6 @@ async def list_whisper_models():
         return [model.to_dict() for model in models]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取模型列表失败: {str(e)}")
-
-
-@router.get("/align", response_model=List[dict])
-async def list_align_models():
-    """
-    列出所有对齐模型
-
-    Returns:
-        List[dict]: 对齐模型信息列表
-    """
-    try:
-        models = model_manager.list_align_models()
-        return [model.to_dict() for model in models]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取对齐模型列表失败: {str(e)}")
 
 
 @router.post("/whisper/{model_id}/download")
@@ -73,28 +58,6 @@ async def download_whisper_model(model_id: str):
         raise HTTPException(status_code=500, detail=f"下载失败: {str(e)}")
 
 
-@router.post("/align/{language}/download")
-async def download_align_model(language: str):
-    """
-    下载指定语言的对齐模型
-
-    Args:
-        language: 语言代码 (zh, en, ja, ko, etc.)
-
-    Returns:
-        dict: 操作结果
-    """
-    try:
-        success = model_manager.download_align_model(language)
-        if not success:
-            raise HTTPException(status_code=400, detail="语言不支持或正在下载中")
-        return {"success": True, "message": f"开始下载 {language} 对齐模型"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"下载失败: {str(e)}")
-
-
 @router.delete("/whisper/{model_id}")
 async def delete_whisper_model(model_id: str):
     """
@@ -111,28 +74,6 @@ async def delete_whisper_model(model_id: str):
         if not success:
             raise HTTPException(status_code=400, detail="删除失败：模型不存在或未下载")
         return {"success": True, "message": f"已删除模型 {model_id}"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"删除失败: {str(e)}")
-
-
-@router.delete("/align/{language}")
-async def delete_align_model(language: str):
-    """
-    删除指定的对齐模型
-
-    Args:
-        language: 语言代码
-
-    Returns:
-        dict: 操作结果
-    """
-    try:
-        success = model_manager.delete_align_model(language)
-        if not success:
-            raise HTTPException(status_code=400, detail="删除失败：模型不存在或未下载")
-        return {"success": True, "message": f"已删除对齐模型 {language}"}
     except HTTPException:
         raise
     except Exception as e:
@@ -222,13 +163,6 @@ async def stream_all_progress(request: Request):
                     "progress": m.download_progress
                 }
                 for m in model_manager.list_whisper_models()
-            },
-            "align": {
-                m.language: {
-                    "status": m.status,
-                    "progress": m.download_progress
-                }
-                for m in model_manager.list_align_models()
             }
         }
 
@@ -252,21 +186,18 @@ async def stream_single_progress(model_type: str, model_id: str):
     ⚠️ 已过时：建议使用 /events/progress 并在前端过滤，更高效
 
     Args:
-        model_type: 模型类型 (whisper 或 align)
-        model_id: 模型ID或语言代码
+        model_type: 模型类型 (whisper)
+        model_id: 模型ID
 
     Returns:
         StreamingResponse: SSE事件流
     """
     # 验证参数
-    if model_type not in ["whisper", "align"]:
-        raise HTTPException(status_code=400, detail="model_type 必须是 'whisper' 或 'align'")
+    if model_type != "whisper":
+        raise HTTPException(status_code=400, detail="model_type 必须是 'whisper'")
 
     # 验证模型存在
-    if model_type == "whisper":
-        models = {m.model_id: m for m in model_manager.list_whisper_models()}
-    else:
-        models = {m.language: m for m in model_manager.list_align_models()}
+    models = {m.model_id: m for m in model_manager.list_whisper_models()}
 
     if model_id not in models:
         raise HTTPException(status_code=404, detail=f"模型不存在: {model_type}/{model_id}")
@@ -281,10 +212,7 @@ async def stream_single_progress(model_type: str, model_id: str):
 
             while True:
                 # 获取当前模型状态
-                if model_type == "whisper":
-                    current_models = {m.model_id: m for m in model_manager.list_whisper_models()}
-                else:
-                    current_models = {m.language: m for m in model_manager.list_align_models()}
+                current_models = {m.model_id: m for m in model_manager.list_whisper_models()}
 
                 if model_id not in current_models:
                     break

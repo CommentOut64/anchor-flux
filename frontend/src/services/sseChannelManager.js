@@ -87,7 +87,10 @@ class SSEChannelManager extends EventEmitter {
    *     onSignal: (signal, data) => void,
    *     onComplete: (data) => void,
    *     onFailed: (data) => void,
-   *     onProxyProgress: (progress) => void
+   *     onProxyProgress: (progress) => void,
+   *     // Phase 5: 双模态架构新增
+   *     onDraft: (data) => void,           // 草稿字幕（快流/SenseVoice）
+   *     onReplaceChunk: (data) => void     // 替换 Chunk（慢流/Whisper）
    *   }
    * @returns {Function} 取消订阅函数
    */
@@ -95,64 +98,194 @@ class SSEChannelManager extends EventEmitter {
     const channelId = `job:${jobId}`
     const url = `${this.baseURL}/api/stream/${jobId}`
 
+    // 统一的进度处理函数
+    const handleProgress = (data) => {
+      const percent = data.percent ?? data.progress ?? 0
+      console.log(`[SSE Job ${jobId}] 进度:`, percent)
+      handlers.onProgress?.({ ...data, percent })
+    }
+
+    // 统一的信号处理函数
+    const handleSignal = (data) => {
+      const signal = data.signal || data.code
+      console.log(`[SSE Job ${jobId}] 信号:`, signal)
+
+      // 分发特定信号事件
+      if (signal === 'job_complete') {
+        handlers.onComplete?.(data)
+      } else if (signal === 'job_failed') {
+        handlers.onFailed?.(data)
+      } else if (signal === 'job_paused') {
+        handlers.onPaused?.(data)
+      } else if (signal === 'job_canceled') {
+        handlers.onCanceled?.(data)
+      } else if (signal === 'job_resumed') {
+        handlers.onResumed?.(data)
+      }
+
+      handlers.onSignal?.(signal, data)
+    }
+
+    // 统一的片段处理函数
+    const handleSegment = (data) => {
+      console.log(`[SSE Job ${jobId}] 片段:`, data)
+      handlers.onSegment?.(data)
+    }
+
+    // 统一的对齐完成处理函数
+    const handleAligned = (data) => {
+      console.log(`[SSE Job ${jobId}] 对齐完成:`, data)
+      handlers.onAligned?.(data)
+    }
+
+    // 统一的对齐进度处理函数
+    const handleAlignProgress = (data) => {
+      console.log(`[SSE Job ${jobId}] 对齐进度:`, data)
+      handlers.onAlignProgress?.(data)
+    }
+
     return this._subscribe(channelId, url, {
+      // === 初始状态 ===
       initial_state: (data) => {
         console.log(`[SSE Job ${jobId}] 初始状态:`, data)
         handlers.onInitialState?.(data)
       },
-      progress: (data) => {
-        // 兼容处理：优先使用percent，fallback到progress
-        const percent = data.percent ?? data.progress ?? 0
-        console.log(`[SSE Job ${jobId}] 进度:`, percent)
-        handlers.onProgress?.({ ...data, percent })
-      },
-      signal: (data) => {
-        // 兼容处理：优先使用signal，fallback到code
-        const signal = data.signal || data.code
-        console.log(`[SSE Job ${jobId}] 信号:`, signal)
 
-        // 分发特定信号事件
-        if (signal === 'job_complete') {
-          handlers.onComplete?.(data)
-        } else if (signal === 'job_failed') {
-          handlers.onFailed?.(data)
-        } else if (signal === 'job_paused') {
-          handlers.onPaused?.(data)
-        } else if (signal === 'job_canceled') {
-          handlers.onCanceled?.(data)
-        } else if (signal === 'job_resumed') {
-          // 新增：处理任务恢复信号
-          handlers.onResumed?.(data)
-        }
+      // === 进度事件（新格式带命名空间前缀） ===
+      'progress.overall': handleProgress,
+      'progress.extract': handleProgress,
+      'progress.bgm_detect': handleProgress,
+      'progress.spectrum_analysis': handleProgress,
+      'progress.demucs': handleProgress,
+      'progress.vad': handleProgress,
+      'progress.sensevoice': handleProgress,
+      'progress.whisper': handleProgress,
+      'progress.llm_proof': handleProgress,
+      'progress.llm_trans': handleProgress,
+      'progress.srt': handleProgress,
+      'progress.align': handleAlignProgress,
 
-        handlers.onSignal?.(signal, data)
+      // === 信号事件（新格式带命名空间前缀） ===
+      'signal.job_start': handleSignal,
+      'signal.job_complete': handleSignal,
+      'signal.job_failed': handleSignal,
+      'signal.job_paused': handleSignal,
+      'signal.job_canceled': handleSignal,
+      'signal.job_resumed': handleSignal,
+      'signal.phase_start': handleSignal,
+      'signal.phase_complete': handleSignal,
+      'signal.circuit_breaker': (data) => {
+        console.log(`[SSE Job ${jobId}] 熔断事件:`, data)
+        handlers.onCircuitBreaker?.(data)
+        handleSignal(data)
       },
-      align_progress: (data) => {
-        console.log(`[SSE Job ${jobId}] 对齐进度:`, data)
-        handlers.onAlignProgress?.(data)
+      'signal.model_upgrade': (data) => {
+        console.log(`[SSE Job ${jobId}] 模型升级:`, data)
+        handlers.onModelUpgrade?.(data)
+        handleSignal(data)
       },
-      segment: (data) => {
-        console.log(`[SSE Job ${jobId}] 片段:`, data)
-        handlers.onSegment?.(data)
+      'signal.bgm_detected': (data) => {
+        console.log(`[SSE Job ${jobId}] BGM 检测:`, data)
+        handlers.onBgmDetected?.(data)
       },
-      aligned: (data) => {
-        console.log(`[SSE Job ${jobId}] 对齐完成:`, data)
-        handlers.onAligned?.(data)
+      'signal.separation_strategy': (data) => {
+        console.log(`[SSE Job ${jobId}] 分离策略:`, data)
+        handlers.onSeparationStrategy?.(data)
       },
+
+      // === 字幕流式事件（新格式带命名空间前缀） ===
+      'subtitle.segment': handleSegment,
+      'subtitle.aligned': handleAligned,
+
+      // Phase 5: 双模态架构 - 草稿事件（快流/SenseVoice）
+      'subtitle.draft': (data) => {
+        console.log(`[SSE Job ${jobId}] 草稿字幕:`, data)
+        handlers.onDraft?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+
+      // Phase 5: 双模态架构 - 替换 Chunk 事件（慢流/Whisper）
+      'subtitle.replace_chunk': (data) => {
+        console.log(`[SSE Job ${jobId}] 替换 Chunk:`, data)
+        handlers.onReplaceChunk?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+
+      // 旧版事件 (兼容)
+      'subtitle.sv_sentence': (data) => {
+        console.log(`[SSE Job ${jobId}] SenseVoice 句子:`, data)
+        handlers.onSvSentence?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+      'subtitle.whisper_patch': (data) => {
+        console.log(`[SSE Job ${jobId}] Whisper 补刀:`, data)
+        handlers.onWhisperPatch?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+      'subtitle.llm_proof': (data) => {
+        console.log(`[SSE Job ${jobId}] LLM 校对:`, data)
+        handlers.onLlmProof?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+      'subtitle.llm_trans': (data) => {
+        console.log(`[SSE Job ${jobId}] LLM 翻译:`, data)
+        handlers.onLlmTrans?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+      'subtitle.batch_update': (data) => {
+        console.log(`[SSE Job ${jobId}] 批量更新:`, data)
+        handlers.onBatchUpdate?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+
+      // === 视频转码相关事件 ===
+      // 分析完成事件（新增：智能转码决策）
+      analyze_complete: (data) => {
+        console.log(`[SSE Job ${jobId}] 分析完成:`, data.decision)
+        handlers.onAnalyzeComplete?.(data)
+      },
+      // 容器重封装进度（新增：零转码优化）
+      remux_progress: (data) => {
+        console.log(`[SSE Job ${jobId}] 重封装进度:`, data.progress)
+        handlers.onRemuxProgress?.(data)
+      },
+      // 容器重封装完成（新增）
+      remux_complete: (data) => {
+        console.log(`[SSE Job ${jobId}] 重封装完成`)
+        handlers.onRemuxComplete?.(data)
+      },
+      // Proxy 错误事件（新增：统一错误处理）
+      proxy_error: (data) => {
+        console.error(`[SSE Job ${jobId}] Proxy 错误:`, data.message)
+        handlers.onProxyError?.(data)
+      },
+      // 360p 预览进度
+      preview_360p_progress: (data) => {
+        console.log(`[SSE Job ${jobId}] 360p 预览进度:`, data.progress)
+        handlers.onPreview360pProgress?.(data)
+      },
+      // 360p 预览完成
+      preview_360p_complete: (data) => {
+        console.log(`[SSE Job ${jobId}] 360p 预览完成:`, data)
+        handlers.onPreview360pComplete?.(data)
+      },
+      // 720p Proxy 进度
       proxy_progress: (data) => {
         console.log(`[SSE Job ${jobId}] Proxy 进度:`, data.progress)
-        handlers.onProxyProgress?.(data)  // 传递完整的data对象
+        handlers.onProxyProgress?.(data)
       },
+      // 720p Proxy 完成
       proxy_complete: (data) => {
-        console.log(`[SSE Job ${jobId}] Proxy 完成，完整数据:`, data)
-        handlers.onProxyComplete?.(data)  // 传递data对象（包含video_url等）
+        console.log(`[SSE Job ${jobId}] Proxy 完成:`, data)
+        handlers.onProxyComplete?.(data)
       },
+
+      // === 连接和心跳 ===
       connected: (data) => {
         console.log(`[SSE Job ${jobId}] 连接成功`)
         handlers.onConnected?.(data)
       },
       ping: () => {
-        // 心跳事件，用于保持连接活跃
         handlers.onPing?.()
       }
     })

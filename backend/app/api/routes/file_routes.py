@@ -4,7 +4,7 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from typing import List
 
-from services.file_service import FileManagementService
+from app.services.file_service import FileManagementService
 
 router = APIRouter(prefix="/api", tags=["files"])
 

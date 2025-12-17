@@ -197,54 +197,12 @@ class MediaAPI {
   }
 
   /**
-   * 获取渐进式加载状态
-   * @param {string} jobId - 任务ID
-   * @returns {Promise<{
-   *   job_id: string,
-   *   needs_transcode: boolean,
-   *   transcode_reason: string,
-   *   preview_360p: { exists: boolean, url: string, size: number },
-   *   proxy_720p: { exists: boolean, url: string, size: number, status: Object },
-   *   source: { exists: boolean, filename: string, compatible: boolean, url: string },
-   *   recommended_url: string,
-   *   current_resolution: string
-   * }>}
-   */
-  async getProgressiveStatus(jobId) {
-    return apiClient.get(`/api/media/${jobId}/status/progressive`)
-  }
-
-  /**
    * 触发 360p 预览视频生成
    * @param {string} jobId - 任务ID
    * @returns {Promise<{ success: boolean, message: string, url?: string, generating?: boolean }>}
    */
   async generatePreview(jobId) {
     return apiClient.post(`/api/media/${jobId}/generate-preview`)
-  }
-
-  /**
-   * 智能获取最佳视频 URL（根据渐进式加载状态）
-   * @param {string} jobId - 任务ID
-   * @returns {Promise<{ url: string, resolution: string, upgrading: boolean }>}
-   */
-  async getBestVideoUrl(jobId) {
-    try {
-      const status = await this.getProgressiveStatus(jobId)
-      return {
-        url: status.recommended_url,
-        resolution: status.current_resolution,
-        upgrading: status.proxy_720p?.status?.status === 'processing'
-      }
-    } catch (error) {
-      // 降级到默认 URL
-      console.warn('[MediaAPI] 获取渐进式状态失败，使用默认URL:', error)
-      return {
-        url: this.getVideoUrl(jobId),
-        resolution: 'unknown',
-        upgrading: false
-      }
-    }
   }
 }
 

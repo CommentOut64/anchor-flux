@@ -7,8 +7,11 @@
 """
 
 import os
+import logging
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectConfig:
@@ -26,8 +29,8 @@ class ProjectConfig:
         self.JOBS_DIR = self.BASE_DIR / "jobs"
         self.TEMP_DIR = self.BASE_DIR / "temp"
 
-        # FFmpeg路径（优先使用项目内的，支持独立打包）
-        self.FFMPEG_DIR = self.BASE_DIR / "ffmpeg" / "bin"
+        # FFmpeg路径（优先使用项目内的tools目录，支持独立打包）
+        self.FFMPEG_DIR = self.BASE_DIR / "tools"
         self.FFMPEG_EXE = self.FFMPEG_DIR / "ffmpeg.exe"
 
         # 模型缓存目录（强制接管，不使用默认的用户目录）
@@ -59,7 +62,7 @@ class ProjectConfig:
             print(f"使用 HuggingFace 官方源: {self.HF_ENDPOINT}")
             print("提示：如遇访问问题，可设置环境变量 USE_HF_MIRROR=true 使用镜像源")
 
-        # 确保目录存在
+        # 确保目录存在（tools目录不自动创建，需用户手动准备）
         for dir_path in [
             self.INPUT_DIR,
             self.OUTPUT_DIR,
@@ -67,8 +70,7 @@ class ProjectConfig:
             self.TEMP_DIR,
             self.MODELS_DIR,
             self.HF_CACHE_DIR,
-            self.TORCH_CACHE_DIR,
-            self.FFMPEG_DIR
+            self.TORCH_CACHE_DIR
         ]:
             dir_path.mkdir(parents=True, exist_ok=True)
 
@@ -137,6 +139,125 @@ class ProjectConfig:
         self.PREVIEW_PRESET = "ultrafast"        # 预览视频编码预设
         self.PROXY_PRESET = "fast"               # 高质量视频编码预设
 
+        # ========== Proxy 视频配置（重构新增）==========
+        # 统一管理所有 Proxy 转码相关参数
+        self.PROXY_CONFIG = {
+            # 360p 预览参数（极速模式）
+            "preview_360p": {
+                "scale": 360,
+                "preset": "ultrafast",
+                "crf": 28,
+                "gop": 30,              # 关键帧间隔
+                "keyint_min": 15,       # 最小关键帧间隔
+                "audio": True,          # 包含音频（字幕编辑必需）
+                "audio_bitrate": "64k", # 低码率音频（加速生成）
+                "tune": "fastdecode",   # 优化解码速度
+            },
+            # 720p 高清参数（平衡质量和速度）
+            "proxy_720p": {
+                "scale": 720,
+                "preset": "fast",
+                "crf": 23,
+                "gop": 30,
+                "keyint_min": 15,
+                "audio_bitrate": "128k",
+                "audio_sample_rate": 44100,
+            },
+            # 容器重封装配置（零转码）
+            "remux": {
+                "enabled": True,                          # 是否启用重封装优化
+                "compatible_codecs": {"h264", "aac", "mp3"},  # 可直接复制的编解码器
+                "target_container": "mp4",                # 目标容器格式
+            },
+            # SSE 推送配置
+            "sse": {
+                "progress_interval": 0.5,   # 进度推送间隔（秒）
+                "retry_count": 3,           # 推送失败重试次数
+                "retry_delay": 0.1,         # 重试延迟（秒）
+            }
+        }
+
+        # ========== 浏览器兼容性配置 ==========
+        # 用于智能转码决策
+        self.BROWSER_COMPATIBILITY = {
+            # 浏览器原生支持的容器格式
+            "compatible_containers": {".mp4", ".webm"},
+            # 浏览器原生支持的视频编解码器
+            "compatible_video_codecs": {"h264", "vp8"},
+            # 浏览器原生支持的音频编解码器
+            "compatible_audio_codecs": {"aac", "mp3", "opus", "vorbis"},
+            # 需要强制转码的视频编解码器
+            "need_transcode_codecs": {"hevc", "h265", "vp9", "av1", "mpeg2video"},
+            # 需要转码的容器格式
+            "need_transcode_formats": {".mkv", ".avi", ".mov", ".wmv", ".flv", ".m4v"},
+        }
+
+        # ========== 流水线配置（V3.1.0 新增）==========
+        # 双流对齐流水线模式
+        # - True: 三级异步流水线（错位并行，性能提升 30-50%）
+        # - False: 串行流水线（稳定版，V3.0 兼容）
+        self.USE_ASYNC_PIPELINE = os.getenv('USE_ASYNC_PIPELINE', 'true').lower() == 'true'
+
+        # 队列背压大小（控制并发度，防止内存溢出）
+        # 支持三种配置方式：
+        # 1. 'auto': 根据系统内存自动计算（推荐）
+        # 2. 数字: 手动指定队列大小（如 '15'）
+        # 3. 未设置: 默认 'auto'
+        queue_size_config = os.getenv('PIPELINE_QUEUE_MAXSIZE', 'auto')
+
+        if queue_size_config.lower() == 'auto':
+            self.PIPELINE_QUEUE_MAXSIZE = self._calculate_adaptive_queue_size()
+        else:
+            self.PIPELINE_QUEUE_MAXSIZE = int(queue_size_config)
+
+    def _calculate_adaptive_queue_size(self) -> int:
+        """
+        根据系统可用内存自适应计算队列大小
+
+        策略：
+        - 每个 chunk 平均占用 ~300MB（音频数据 + 对齐中间结果）
+        - 预留 30% 内存给系统和模型
+        - 队列大小 = (可用内存 × 0.7) / 300MB
+        - 限制范围：3 ~ 30
+
+        Returns:
+            int: 自适应队列大小
+        """
+        try:
+            import psutil
+
+            # 获取系统总内存（GB）
+            total_memory_gb = psutil.virtual_memory().total / (1024 ** 3)
+
+            # 根据内存档位计算队列大小
+            if total_memory_gb < 8:
+                # <8GB: 保守策略（老旧设备）
+                queue_size = 3
+                reason = "低内存(<8GB)"
+            elif total_memory_gb < 16:
+                # 8-16GB: 适中策略
+                queue_size = 8
+                reason = "中等内存(8-16GB)"
+            elif total_memory_gb < 32:
+                # 16-32GB: 平衡策略
+                queue_size = 15
+                reason = "较大内存(16-32GB)"
+            else:
+                # 32GB+: 激进策略（工作站）
+                queue_size = 25
+                reason = "大内存(32GB+)"
+
+            logger.info(
+                f"自适应队列大小: {queue_size} "
+                f"(系统内存: {total_memory_gb:.1f}GB, {reason})"
+            )
+            return queue_size
+
+        except Exception as e:
+            # psutil 不可用或出错，回退到保守默认值
+            logger.warning(f"无法检测系统内存，使用默认队列大小 10: {e}")
+            return 10
+
     def get_ffmpeg_command(self) -> str:
         """
         获取FFmpeg命令
@@ -194,6 +315,48 @@ class ProjectConfig:
             "max_cache_size": self.MAX_CACHE_SIZE,
             "memory_threshold": self.MEMORY_THRESHOLD
         }
+
+    def calculate_dynamic_weights(
+        self,
+        engine: str,
+        total_segments: int,
+        segments_to_separate: int,
+        segments_to_retry: int
+    ) -> dict:
+        """
+        根据引擎和实际场景动态计算权重
+
+        Args:
+            engine: 'faster_whisper' | 'sensevoice'
+            total_segments: 总片段数
+            segments_to_separate: 需要分离的片段数
+            segments_to_retry: 需要补刀的片段数
+
+        Returns:
+            动态权重字典
+        """
+        if engine == 'faster_whisper':
+            return self.PHASE_WEIGHTS.copy()
+
+        base_weights = self.PHASE_WEIGHTS.copy()
+
+        if total_segments > 0:
+            sep_ratio = segments_to_separate / total_segments
+            retry_ratio = segments_to_retry / total_segments
+
+            base_weights['demucs_global'] = int(15 * sep_ratio)
+            base_weights['transcribe'] = 70
+            base_weights['align'] = 0
+
+            if 'retry' not in base_weights:
+                base_weights['retry'] = 0
+            base_weights['retry'] = int(15 * retry_ratio)
+
+            used = sum(base_weights.values())
+            if used < 100:
+                base_weights['transcribe'] += (100 - used)
+
+        return base_weights
 
 
 # 全局配置实例
