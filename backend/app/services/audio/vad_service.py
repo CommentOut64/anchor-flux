@@ -40,17 +40,29 @@ class VADConfig:
     - min_speech_duration_ms：最小语音段长度，避免误检碎片音（推荐300-500ms）
     - min_silence_duration_ms：最小静音长度，越长越能过滤背景音乐（推荐300-500ms）
 
+    Post-VAD合并参数（2025-12-17 迁移自旧架构 _merge_vad_segments）：
+    - merge_max_gap：允许合并的最大静音间隔，超过1.5秒通常意味着换气或换话题
+    - merge_max_duration：合并后的最大时长，12秒是甜蜜点，避免Whisper幻觉和对齐算法爆炸
+    - merge_min_fragment：短于此时长的片段强制尝试合并（碎片保护）
+
     修改历史：
     - 2025-12: onset 从 0.7 降低至 0.5，offset 从 0.5 降低至 0.4
       原因：避免语音起始被截断，提高时间戳准确性
+    - 2025-12-17: 新增 Post-VAD 合并参数，迁移自旧架构
+      max_duration 从 25.0 改为 12.0，max_gap 从 1.0 改为 1.5
     """
     method: VADMethod = VADMethod.SILERO  # 默认使用Silero
     hf_token: Optional[str] = None         # Pyannote需要的HF Token
-    onset: float = 0.5                     # 语音开始阈值（降低至0.5避免截断）
-    offset: float = 0.4                    # 语音结束阈值（对应onset=0.5的调整）
+    onset: float = 0.4                     # 语音开始阈值（恢复旧值，保持向后兼容）
+    offset: float = 0.4                    # 语音结束阈值（恢复旧值）
     chunk_size: int = 30                   # 最大段长（秒）
-    min_speech_duration_ms: int = 500      # 最小语音段长度（提升至500ms，过滤短噪音）
-    min_silence_duration_ms: int = 500     # 最小静音长度（提升至500ms，确保断句清晰）
+    min_speech_duration_ms: int = 250      # 最小语音段长度（恢复旧值400ms）
+    min_silence_duration_ms: int = 400     # 最小静音长度（恢复旧值400ms）
+    speech_pad_ms: int = 300
+    # Post-VAD 合并参数
+    merge_max_gap: float = 1.0             # 允许合并的最大静音间隔（秒），恢复旧值1.0s
+    merge_max_duration: float = 12.0       # 合并后的最大时长（秒），恢复旧值25.0s
+    merge_min_fragment: float = 1.0        # 短于此时长的片段强制尝试合并（碎片保护）
 
     def validate(self) -> bool:
         """验证配置有效性"""
@@ -81,7 +93,8 @@ class VADService:
         self,
         audio_array: np.ndarray,
         sr: int,
-        config: VADConfig
+        config: VADConfig,
+        enable_merge: bool = True
     ) -> List[Dict]:
         """
         检测语音段
@@ -90,6 +103,7 @@ class VADService:
             audio_array: 音频数组
             sr: 采样率
             config: VAD 配置
+            enable_merge: 是否启用 Post-VAD 智能合并（默认启用）
 
         Returns:
             List[Dict]: 分段元数据列表，每个元素包含:
@@ -106,15 +120,21 @@ class VADService:
 
         try:
             if config.method == VADMethod.SILERO:
-                return self._vad_silero(audio_array, sr, config)
+                segments = self._vad_silero(audio_array, sr, config)
             elif config.method == VADMethod.PYANNOTE:
-                return self._vad_pyannote(audio_array, sr, config)
+                segments = self._vad_pyannote(audio_array, sr, config)
             else:
                 raise ValueError(f"不支持的 VAD 方法: {config.method}")
         except Exception as e:
             self.logger.error(f"VAD 检测失败: {e}")
             self.logger.warning("降级到能量检测分段")
-            return self._energy_based_split(audio_array, sr, config.chunk_size)
+            segments = self._energy_based_split(audio_array, sr, config.chunk_size)
+
+        # Post-VAD 智能合并（默认启用）
+        if enable_merge and len(segments) > 1:
+            segments = self.merge_vad_segments(segments, config)
+
+        return segments
 
     def _vad_silero(
         self,
@@ -166,9 +186,10 @@ class VADService:
             audio_tensor,
             model,
             sampling_rate=sr,
-            threshold=vad_config.onset,                    # 检测阈值（从config读取，默认0.5）
-            min_speech_duration_ms=vad_config.min_speech_duration_ms,   # 最小语音段长度（默认500ms）
-            min_silence_duration_ms=vad_config.min_silence_duration_ms, # 最小静音长度（默认500ms）
+            threshold=vad_config.onset,                    # 检测阈值（从config读取，默认0.4）
+            min_speech_duration_ms=vad_config.min_speech_duration_ms,   # 最小语音段长度（默认250ms）
+            min_silence_duration_ms=vad_config.min_silence_duration_ms, # 最小静音长度（默认400ms）
+            speech_pad_ms=vad_config.speech_pad_ms,        # 语音段前后padding（默认300ms）
             return_seconds=False  # 返回采样点而非秒数
         )
 
@@ -381,6 +402,77 @@ class VADService:
 
         self.logger.info(f"能量检测分段完成: {len(segments_metadata)}段")
         return segments_metadata
+
+    def merge_vad_segments(
+        self,
+        segments: List[Dict],
+        config: VADConfig
+    ) -> List[Dict]:
+        """
+        Post-VAD 智能合并层
+
+        迁移自旧架构 transcription_service.py:_merge_vad_segments (2025-12-17)
+
+        策略：宁可错合（依赖 SentenceSplitter 分句），不可错分（导致 ASR 丢失上下文）。
+
+        合并条件1：基础合并 - 间隔小且总长不超标
+        合并条件2：碎片保护 - 当前段极短（可能是被切断的单词），强制合并
+
+        Args:
+            segments: VAD 切分后的原始片段列表 [{start, end, index, mode}, ...]
+            config: VAD 配置，包含合并参数
+
+        Returns:
+            合并后的片段列表
+        """
+        if not segments:
+            return []
+
+        max_gap = config.merge_max_gap            # 默认 1.5s
+        max_duration = config.merge_max_duration  # 默认 12.0s
+        min_fragment = config.merge_min_fragment  # 默认 1.0s
+
+        merged = []
+        current = segments[0].copy()
+
+        for next_seg in segments[1:]:
+            gap = next_seg['start'] - current['end']
+            current_duration = current['end'] - current['start']
+            combined_duration = next_seg['end'] - current['start']
+
+            should_merge = False
+
+            # 条件 1: 基础合并（间隔小且总长不超标）
+            if gap <= max_gap and combined_duration <= max_duration:
+                should_merge = True
+
+            # 条件 2: 碎片保护（当前段极短，可能是被切断的单词）
+            # 例如: "It's" (0.5s) ... [gap 1.5s] ... "only..."
+            elif current_duration < min_fragment and combined_duration <= max_duration:
+                # 限制 gap 不超过 3s，避免引入过长静音
+                if gap < 3.0:
+                    self.logger.debug(
+                        f"碎片强制合并: fragment={current_duration:.2f}s, gap={gap:.2f}s"
+                    )
+                    should_merge = True
+
+            if should_merge:
+                current['end'] = next_seg['end']
+            else:
+                merged.append(current)
+                current = next_seg.copy()
+
+        merged.append(current)
+
+        # 重新编号
+        for i, seg in enumerate(merged):
+            seg['index'] = i
+
+        self.logger.info(
+            f"Post-VAD 智能合并: 原始 {len(segments)} -> 合并后 {len(merged)} 段 "
+            f"(max_gap={max_gap}s, max_dur={max_duration}s)"
+        )
+        return merged
 
 
 # 便捷函数
