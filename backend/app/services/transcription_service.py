@@ -11,6 +11,9 @@ from collections import OrderedDict  # 新增导入
 from pydub import AudioSegment, silence
 from app.services.whisper_service import get_whisper_service, load_audio as whisper_load_audio
 from app.services.config_adapter import ConfigAdapter
+# 从新架构导入 VAD 配置（2025-12-17 统一配置定义）
+from app.services.audio.vad_service import VADConfig, VADMethod, get_vad_service
+from app.services.audio.chunk_engine import ChunkEngine, AudioChunk
 import torch
 import shutil
 import psutil
@@ -21,51 +24,11 @@ class ProcessingMode(Enum):
     """
     处理模式枚举
     用于智能决策使用内存模式还是硬盘模式进行音频处理
+
+    注意：DISK 模式（硬盘分段）已废弃，仅保留 MEMORY 模式
     """
     MEMORY = "memory"  # 内存模式（默认，高性能）
-    DISK = "disk"      # 硬盘模式（降级，稳定性优先）
-
-
-class VADMethod(Enum):
-    """
-    VAD模型选择枚举
-    用于选择语音活动检测（Voice Activity Detection）模型
-    """
-    SILERO = "silero"      # 默认，无需认证，速度快
-    PYANNOTE = "pyannote"  # 可选，需要HF Token，精度更高
-
-
-@dataclass
-class VADConfig:
-    """
-    VAD配置数据类
-    用于配置语音活动检测的参数
-    
-    参数说明：
-    - onset (0.0-1.0)：语音开始阈值，越高越严格，推荐0.5-0.6以避免截断语音起始
-    - offset (0.0-1.0)：语音结束阈值，通常为onset的80%左右
-    - min_speech_duration_ms：最小语音段长度，避免误检碎片音（推荐300-500ms）
-    - min_silence_duration_ms：最小静音长度，越长越能过滤背景音乐（推荐300-500ms）
-
-    修改历史：
-    - 2025-12: onset 从 0.7 降低至 0.5，offset 从 0.5 降低至 0.4
-      原因：避免语音起始被截断，提高时间戳准确性
-    """
-    method: VADMethod = VADMethod.SILERO  # 默认使用Silero
-    hf_token: Optional[str] = None         # Pyannote需要的HF Token
-    onset: float = 0.5                     # 语音开始阈值（降低至0.5避免截断）
-    offset: float = 0.4                    # 语音结束阈值（对应onset=0.5的调整）
-    chunk_size: int = 30                   # 最大段长（秒）
-    min_speech_duration_ms: int = 500      # 最小语音段长度（提升至500ms，过滤短噪音）
-    min_silence_duration_ms: int = 500     # 最小静音长度（提升至500ms，确保断句清晰）
-
-    def validate(self) -> bool:
-        """验证配置有效性"""
-        if self.method == VADMethod.PYANNOTE and not self.hf_token:
-            return False  # Pyannote需要Token
-        if not (0.0 <= self.onset <= 1.0) or not (0.0 <= self.offset <= 1.0):
-            return False  # 阈值必须在0-1之间
-        return True
+    DISK = "disk"      # 硬盘模式（已废弃，仅保留用于向后兼容）
 
 
 class BreakToGlobalSeparation(Exception):
