@@ -6,7 +6,7 @@
   落地步骤大概是：在 job_queue_service/async_dual_pipeline 初始化 chunk 时调用频谱诊断，给 ProcessingContext 填入 need_separation 标记；FastWorker before SenseVoice 把需要分离的 chunk 异步喂给 demucs_service.separate_chunk（或在 VAD 结束后一次性跑完）并及时 unload_model()。这样既保留新架构的 streaming 优势，又恢复旧架构的按需分离策略，是收益最大的一条路。
 5. 引入微型标点模型 (Punctuator)，在 CPU 上跑一个极小的 BERT-based 标点恢复模型（ONNX 格式，几十 MB）
   流程：SenseVoice 文本 -> Punctuator (CPU 10ms) -> 带标点文本 -> 推送。
-模型：CT-Transformer (FunASR/Sherpa 版本)
+  模型：CT-Transformer (FunASR/Sherpa 版本)
 
 ### 🚀 实施方案
 
@@ -126,3 +126,7 @@ if __name__ == "__main__":
 
 * **输入处理**：上面的 `_tokenize` 是一个最简化的字符级实现。由于 `tokens.txt` 里包含了常见的汉字和英文字母/单词，直接查表通常能覆盖 95% 的情况。如果遇到英文单词识别不准，可以考虑简单的正则：英文按词查，中文按字查。
 * **文件位置**：将 `model.onnx` (5.6MB) 和 `tokens.txt` 放入打包资源中，对最终包体积的影响微乎其微。
+
+
+
+
