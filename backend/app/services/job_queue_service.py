@@ -388,9 +388,10 @@ class JobQueueService:
                         logger.info(f"使用 SenseVoice 流水线 (极速模式)")
                         _run_async_safely(self.transcription_service._process_video_sensevoice(job))
                     else:
-                        # Whisper 流水线（同步，使用三点采样）
-                        logger.info(f"使用 Whisper 流水线")
-                        self.transcription_service._run_pipeline(job)
+                        # 新架构 Pipeline 流水线（2025-12-17 架构改造）
+                        # 使用 AudioProcessingPipeline + AsyncDualPipeline
+                        logger.info(f"使用新架构 Pipeline 流水线")
+                        _run_async_safely(self.transcription_service._run_pipeline_v2(job))
 
                     # 检查最终状态
                     if job.canceled:
@@ -513,7 +514,18 @@ class JobQueueService:
                 logger=logger
             )
 
-            audio_result = await audio_pipeline.process(job.input_path)
+            # 使用配置适配器获取 Demucs 策略（修复直通模式不生效的问题）
+            from app.services.config_adapter import ConfigAdapter
+            demucs_strategy = ConfigAdapter.get_demucs_strategy(job.settings)
+            enable_demucs = demucs_strategy != "off"
+            logger.info(f"Demucs 策略: {demucs_strategy}, 启用: {enable_demucs}")
+
+            audio_config = AudioProcessingConfig(
+                enable_demucs=enable_demucs,
+                demucs_model=ConfigAdapter.get_demucs_model(job.settings)
+            )
+
+            audio_result = await audio_pipeline.process(job.input_path, config=audio_config)
 
             # 保存音频文件供波形图使用
             import soundfile as sf
