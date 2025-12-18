@@ -6,11 +6,13 @@ FastWorker - 快流推理 Worker（CPU）
 2. 立即分句（Layer 1 + Layer 2）
 3. 立即推送草稿到 SSE（确保用户体验）
 4. 填充 ProcessingContext.sv_result
+5. 熔断回溯（可选）：监控转录质量，自动升级分离模型
 
 特点：
 - 速度优先（~1秒/Chunk）
 - 分句策略：主要依赖 VAD 停顿，不依赖标点
 - 语义分组：依赖物理约束（时间间隔、句子长度）
+- 熔断回溯：低置信度+BGM标签时自动升级分离
 """
 import logging
 from typing import Dict, List, Optional, Any
@@ -22,6 +24,9 @@ from app.services.sentence_splitter import SentenceSplitter, SplitConfig
 from app.services.semantic_grouper import SemanticGrouper, GroupConfig
 from app.services.streaming_subtitle import StreamingSubtitleManager, get_streaming_subtitle_manager
 from app.models.sensevoice_models import SentenceSegment, TextSource, WordTimestamp
+from app.services.fuse_breaker_v2 import FuseBreakerV2
+from app.services.demucs_service import DemucsService, get_demucs_service
+from app.models.circuit_breaker_models import FuseAction
 
 
 class FastWorker:
@@ -42,6 +47,12 @@ class FastWorker:
         draft_group_config: Optional[GroupConfig] = None,
         enable_semantic_grouping: bool = True,
         sensevoice_executor: Optional[SenseVoiceExecutor] = None,
+        # 熔断回溯相关参数（新增）
+        enable_fuse_breaker: bool = False,
+        fuse_max_retry: int = 2,
+        fuse_confidence_threshold: float = 0.5,
+        fuse_auto_upgrade: bool = True,
+        demucs_service: Optional[DemucsService] = None,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -54,6 +65,11 @@ class FastWorker:
             draft_group_config: 快流语义分组配置
             enable_semantic_grouping: 是否启用语义分组
             sensevoice_executor: SenseVoice 执行器
+            enable_fuse_breaker: 是否启用熔断回溯（默认False，保持向后兼容）
+            fuse_max_retry: 熔断最大重试次数
+            fuse_confidence_threshold: 熔断置信度阈值
+            fuse_auto_upgrade: 第二次重试是否自动升级到最强模型
+            demucs_service: Demucs服务实例
             logger: 日志记录器
         """
         self.job_id = job_id
@@ -63,6 +79,24 @@ class FastWorker:
 
         # 初始化执行器
         self.sensevoice_executor = sensevoice_executor or SenseVoiceExecutor()
+
+        # 初始化熔断决策器（新增）
+        self.enable_fuse_breaker = enable_fuse_breaker
+        if enable_fuse_breaker:
+            self.fuse_breaker = FuseBreakerV2(
+                max_retry=fuse_max_retry,
+                confidence_threshold=fuse_confidence_threshold,
+                auto_upgrade=fuse_auto_upgrade,
+                logger=self.logger
+            )
+            self.demucs_service = demucs_service or get_demucs_service()
+            self.logger.info(
+                f"熔断回溯已启用: max_retry={fuse_max_retry}, "
+                f"threshold={fuse_confidence_threshold}, auto_upgrade={fuse_auto_upgrade}"
+            )
+        else:
+            self.fuse_breaker = None
+            self.demucs_service = None
 
         # 初始化快流分句器（主要依赖 VAD 停顿）
         if draft_split_config is None:
@@ -96,9 +130,26 @@ class FastWorker:
 
         流程：
         1. SenseVoice 推理
-        2. 分句（Layer 1 + Layer 2）
-        3. 立即推送草稿
-        4. 填充 ctx.sv_result
+        2. 熔断决策（如果启用）
+        3. 升级分离（如果需要）
+        4. 分句（Layer 1 + Layer 2）
+        5. 立即推送草稿
+        6. 填充 ctx.sv_result
+
+        Args:
+            ctx: 处理上下文
+        """
+        chunk = ctx.audio_chunk
+
+        # 熔断循环（如果启用熔断回溯）
+        if self.enable_fuse_breaker:
+            await self._process_with_fuse(ctx)
+        else:
+            await self._process_without_fuse(ctx)
+
+    async def _process_without_fuse(self, ctx: ProcessingContext):
+        """
+        不带熔断回溯的处理流程（原有逻辑）
 
         Args:
             ctx: 处理上下文
@@ -118,6 +169,84 @@ class FastWorker:
 
         self.logger.info(
             f"Chunk {ctx.chunk_index}: 草稿已推送 ({len(draft_sentences)} 个句子)"
+        )
+
+    async def _process_with_fuse(self, ctx: ProcessingContext):
+        """
+        带熔断回溯的处理流程（新增）
+
+        流程：
+        1. 熔断循环：SenseVoice推理 → 熔断决策 → 升级分离（如果需要）
+        2. 分句和推送
+
+        Args:
+            ctx: 处理上下文
+        """
+        chunk = ctx.audio_chunk
+
+        # 熔断循环
+        while True:
+            # 阶段 1: SenseVoice 推理
+            self.logger.debug(
+                f"Chunk {ctx.chunk_index}: SenseVoice 快流推理 "
+                f"(重试次数: {chunk.fuse_retry_count})"
+            )
+            sv_result = await self._run_sensevoice(chunk)
+            ctx.sv_result = sv_result
+
+            # 阶段 2: 熔断决策
+            decision = self.fuse_breaker.should_fuse(chunk, sv_result)
+
+            if decision.action == FuseAction.ACCEPT:
+                # 接受结果，退出循环
+                self.logger.debug(
+                    f"Chunk {ctx.chunk_index}: 熔断决策 - 接受结果 ({decision.reason})"
+                )
+                break
+
+            elif decision.action == FuseAction.UPGRADE_SEPARATION:
+                # 升级分离，继续循环
+                self.logger.info(
+                    f"Chunk {ctx.chunk_index}: 熔断决策 - 升级分离 "
+                    f"({decision.reason})"
+                )
+
+                try:
+                    # 执行升级分离
+                    chunk = await self.fuse_breaker.execute_upgrade(
+                        chunk=chunk,
+                        target_level=decision.target_level,
+                        demucs_service=self.demucs_service
+                    )
+                    # 更新ctx中的chunk引用
+                    ctx.audio_chunk = chunk
+
+                    # 继续循环，重新推理
+                    continue
+
+                except Exception as e:
+                    # 升级失败，接受当前结果
+                    self.logger.error(
+                        f"Chunk {ctx.chunk_index}: 升级分离失败 - {e}，接受当前结果"
+                    )
+                    break
+
+            else:
+                # 未知动作，接受结果
+                self.logger.warning(
+                    f"Chunk {ctx.chunk_index}: 未知熔断动作 - {decision.action}，接受当前结果"
+                )
+                break
+
+        # 阶段 3: 分句（Layer 1 + Layer 2）
+        draft_sentences = self._split_sentences(sv_result, chunk, is_draft=True)
+
+        # 阶段 4: 立即推送草稿（关键：不等待 Whisper）
+        self.subtitle_manager.add_draft_sentences(ctx.chunk_index, draft_sentences)
+
+        self.logger.info(
+            f"Chunk {ctx.chunk_index}: 草稿已推送 ({len(draft_sentences)} 个句子), "
+            f"分离级别: {chunk.separation_level.value}, 重试次数: {chunk.fuse_retry_count}"
         )
 
     async def _run_sensevoice(self, chunk: AudioChunk) -> Dict[str, Any]:

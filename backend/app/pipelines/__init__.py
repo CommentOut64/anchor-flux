@@ -28,6 +28,11 @@ from app.pipelines.async_dual_pipeline import (
     get_async_dual_pipeline
 )
 
+from app.pipelines.preprocessing_pipeline import (
+    PreprocessingPipeline,
+    get_preprocessing_pipeline
+)
+
 __all__ = [
     # 音频前处理流水线
     'AudioProcessingPipeline',
@@ -46,4 +51,8 @@ __all__ = [
     # 异步双流流水线（V3.1.0 - 流水线）
     'AsyncDualPipeline',
     'get_async_dual_pipeline',
+
+    # 预处理流水线（新架构 - Stage模式）
+    'PreprocessingPipeline',
+    'get_preprocessing_pipeline',
 ]

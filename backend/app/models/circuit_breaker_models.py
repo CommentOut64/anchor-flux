@@ -72,6 +72,26 @@ class SeparationLevel(Enum):
     HTDEMUCS = "htdemucs"      # 轻度分离
     MDX_EXTRA = "mdx_extra"    # 重度分离（最高级别）
 
+    def can_upgrade(self) -> bool:
+        """是否可以升级到更高级别"""
+        return self != SeparationLevel.MDX_EXTRA
+
+    def next_level(self) -> Optional['SeparationLevel']:
+        """
+        获取下一个分离级别
+
+        升级路径：NONE → HTDEMUCS → MDX_EXTRA
+
+        Returns:
+            下一个级别，如果已是最高级别则返回None
+        """
+        if self == SeparationLevel.NONE:
+            return SeparationLevel.HTDEMUCS
+        elif self == SeparationLevel.HTDEMUCS:
+            return SeparationLevel.MDX_EXTRA
+        else:
+            return None
+
 
 class FuseAction(Enum):
     """熔断动作（仅升级分离相关）"""
@@ -133,5 +153,5 @@ class ChunkProcessState:
 class FuseDecision:
     """熔断决策结果"""
     action: FuseAction
-    reason: str
-    next_separation_level: Optional[SeparationLevel] = None
+    target_level: Optional[SeparationLevel] = None
+    reason: str = ""

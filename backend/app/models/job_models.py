@@ -17,9 +17,10 @@ if TYPE_CHECKING:
 @dataclass
 class PreprocessingConfig:
     """
-    预处理与音频配置 (Demucs 人声分离)
+    预处理与音频配置 (Demucs 人声分离 + 频谱分诊 + 熔断回溯)
     对应文档分组一
     """
+    # ========== 人声分离配置 ==========
     # 人声分离策略: off/auto/force_on
     demucs_strategy: str = "auto"
 
@@ -29,9 +30,30 @@ class PreprocessingConfig:
     # 分离预测次数: 1-5
     demucs_shifts: int = 1
 
+    # 分离模式: global/on_demand (新增)
+    separation_mode: str = "on_demand"
+
+    # ========== 频谱分诊配置 ==========
+    # 是否启用频谱分诊 (新增)
+    enable_spectral_triage: bool = True
+
     # 分诊灵敏度: 0.0-1.0 (默认从 spectrum_thresholds.py: 0.35)
     spectrum_threshold: float = 0.35
 
+    # ========== 熔断回溯配置 (新增) ==========
+    # 是否启用熔断回溯
+    enable_fuse_breaker: bool = True
+
+    # 最大重试次数
+    fuse_max_retry: int = 2
+
+    # 置信度阈值
+    fuse_confidence_threshold: float = 0.5
+
+    # 第二次重试是否自动升级到最强模型
+    fuse_auto_upgrade: bool = True
+
+    # ========== VAD配置 ==========
     # VAD 静音过滤开关
     vad_filter: bool = True
 

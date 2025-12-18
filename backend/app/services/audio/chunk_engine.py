@@ -17,22 +17,40 @@ import librosa
 
 from app.services.audio.vad_service import VADService, VADConfig, VADMethod
 from app.services.demucs_service import DemucsService, BGMLevel
+from app.models.circuit_breaker_models import SeparationLevel, SpectrumDiagnosis
 
 
 @dataclass
 class AudioChunk:
     """
-    音频片段数据结构
+    音频片段数据结构 - 扩展版
 
     表示一个经过 VAD 切分的音频片段，包含时间信息和音频数据。
+    支持频谱分诊、人声分离和熔断回溯功能。
     """
+    # 基础字段
     index: int                          # 片段索引
     start: float                        # 起始时间（秒）
     end: float                          # 结束时间（秒）
     audio: np.ndarray                   # 音频数组（单声道，16kHz）
     sample_rate: int = 16000            # 采样率
+
+    # 分离状态字段（原有）
     is_separated: bool = False          # 是否已进行人声分离
     separation_model: Optional[str] = None  # 使用的分离模型
+
+    # 频谱分诊相关字段（新增）
+    needs_separation: bool = False      # 是否需要人声分离
+    recommended_model: Optional[str] = None  # 推荐模型 (htdemucs/mdx_extra)
+    spectrum_diagnosis: Optional[SpectrumDiagnosis] = None  # 完整的分诊结果
+
+    # 分离级别相关字段（新增）
+    separation_level: SeparationLevel = SeparationLevel.NONE  # 分离级别
+    original_audio: Optional[np.ndarray] = None  # 原始音频（用于熔断回溯）
+
+    # 熔断回溯相关字段（新增）
+    fuse_retry_count: int = 0           # 熔断重试次数
+    last_confidence: float = 1.0        # 上次转录的置信度
 
     @property
     def duration(self) -> float:
@@ -49,7 +67,13 @@ class AudioChunk:
             "sample_rate": self.sample_rate,
             "is_separated": self.is_separated,
             "separation_model": self.separation_model,
-            "audio_shape": self.audio.shape if self.audio is not None else None
+            "audio_shape": self.audio.shape if self.audio is not None else None,
+            # 新增字段
+            "needs_separation": self.needs_separation,
+            "recommended_model": self.recommended_model,
+            "separation_level": self.separation_level.value if self.separation_level else None,
+            "fuse_retry_count": self.fuse_retry_count,
+            "last_confidence": self.last_confidence
         }
 
 
