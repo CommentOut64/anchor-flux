@@ -4855,9 +4855,11 @@ class TranscriptionService:
         progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
 
         try:
-            # 1. 音频提取
+            # 1. 音频提取（使用新架构方法）
             progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "提取音频...")
-            audio_array, sr = self._extract_audio_with_array(job.input_path, job, target_sr=16000)
+            import librosa
+            audio_array, sr = librosa.load(job.input_path, sr=16000, mono=True)
+            self.logger.info(f"音频加载完成: {len(audio_array)/sr:.2f}秒")
 
             # 保存音频文件供波形图使用
             import soundfile as sf
@@ -4867,17 +4869,13 @@ class TranscriptionService:
 
             progress_tracker.complete_phase(ProcessPhase.EXTRACT)
 
-            # 2. VAD 物理切分
+            # 2. VAD 物理切分 + Post-VAD 智能合并（使用新架构 VADService）
             progress_tracker.start_phase(ProcessPhase.VAD, 1, "VAD 切分...")
-            raw_vad_segments = self._memory_vad_split(audio_array, sr, job)
-
-            # 【阶段二】Post-VAD 智能合并层
-            # max_gap=1.0s 涵盖慢语速场景，碎片保护避免短片段孤立
-            vad_segments = self._merge_vad_segments(
-                raw_vad_segments,
-                max_gap=1.0,
-                max_duration=25.0,
-                min_fragment_duration=1.0
+            from app.services.audio.vad_service import get_vad_service, VADConfig
+            vad_service = get_vad_service(self.logger)
+            vad_config = VADConfig()  # 使用默认参数（已恢复到旧值）
+            vad_segments = vad_service.detect_speech_segments(
+                audio_array, sr, vad_config, enable_merge=True
             )
             progress_tracker.complete_phase(ProcessPhase.VAD)
 
