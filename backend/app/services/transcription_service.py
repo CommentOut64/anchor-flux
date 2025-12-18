@@ -672,9 +672,20 @@ class TranscriptionService:
         if not audio_path.exists():
             self.logger.info(f"[{job_id}] 启动后台音频提取...")
             import threading
+
+            def extract_audio_for_waveform():
+                """后台提取音频供波形图使用"""
+                try:
+                    import librosa
+                    import soundfile as sf
+                    audio_array, sr = librosa.load(str(dest_path), sr=16000, mono=True)
+                    sf.write(str(audio_path), audio_array, sr)
+                    self.logger.info(f"[{job_id}] 音频提取完成: {audio_path}")
+                except Exception as e:
+                    self.logger.error(f"[{job_id}] 音频提取失败: {e}")
+
             threading.Thread(
-                target=self._extract_audio_async_wrapper,
-                args=(str(dest_path), str(audio_path), job_id),
+                target=extract_audio_for_waveform,
                 daemon=True,
                 name=f"AudioExtract-{job_id[:8]}"
             ).start()
@@ -1689,7 +1700,9 @@ class TranscriptionService:
 
             bgm_level = BGMLevel.NONE
             bgm_ratios = []
-            demucs_settings = job.settings.demucs
+            # 使用配置适配器获取 Demucs 策略（修复直通模式不生效的问题）
+            demucs_strategy = ConfigAdapter.get_demucs_strategy(job.settings)
+            demucs_settings = job.settings.demucs  # 保留旧版对象用于策略解析器
 
             # 从checkpoint恢复BGM检测结果
             if checkpoint and 'demucs' in checkpoint:
@@ -1700,7 +1713,7 @@ class TranscriptionService:
                 self.logger.info(f"从检查点恢复BGM检测结果: {bgm_level.value}")
             else:
                 # 执行BGM检测（如果启用且模式需要）
-                if demucs_settings.enabled and demucs_settings.mode in ["auto", "always"]:
+                if demucs_strategy in ["auto", "force_on"]:
                     bgm_level, bgm_ratios = self._detect_bgm(str(audio_path), job)
                     self.logger.info(f"BGM检测完成: {bgm_level.value}")
 
@@ -1719,8 +1732,8 @@ class TranscriptionService:
             vocals_path = None
             separation_strategy = None
 
-            # 只有启用 Demucs 时才生成分离策略
-            if demucs_settings.enabled:
+            # 只有启用 Demucs 时才生成分离策略（使用配置适配器判断）
+            if demucs_strategy != "off":
                 # 【新增】使用策略解析器决定分离策略
                 from app.services.demucs_service import SeparationStrategyResolver, get_demucs_service
                 strategy_resolver = SeparationStrategyResolver(demucs_settings)
