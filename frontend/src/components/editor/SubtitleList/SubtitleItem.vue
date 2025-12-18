@@ -84,7 +84,7 @@
           rows="2"
         ></textarea>
 
-        <span class="char-count" :class="{ warning: subtitle.text.length > 30 }">
+        <span class="char-count">
           {{ subtitle.text.length }}
         </span>
       </div>
@@ -94,17 +94,6 @@
         <span class="warning-text">{{ warningMessage }}</span>
       </div>
 
-      <!-- 错误标签 -->
-      <div v-if="errors.length > 0" class="error-tags">
-        <span
-          v-for="error in errors"
-          :key="error.type"
-          class="error-tag"
-          :class="error.severity"
-        >
-          {{ error.message }}
-        </span>
-      </div>
     </div>
 
     <!-- 操作按钮 -->
@@ -145,7 +134,6 @@ const props = defineProps({
   isActive: { type: Boolean, default: false },
   isCurrent: { type: Boolean, default: false },
   editable: { type: Boolean, default: true },
-  errors: { type: Array, default: () => [] }
 })
 
 const emit = defineEmits([
@@ -167,7 +155,6 @@ const itemClasses = computed(() => ({
   'is-active': props.isActive,
   'is-current': props.isCurrent,
   'is-draft': props.subtitle.isDraft,
-  'has-error': props.errors.length > 0,
   'warning-low-confidence': props.subtitle.warning_type === 'low_confidence',
   'warning-high-perplexity': props.subtitle.warning_type === 'high_perplexity',
   'warning-both': props.subtitle.warning_type === 'both'
@@ -351,10 +338,6 @@ function formatDuration(seconds) {
     border-color: var(--success);
     background: rgba(63, 185, 80, 0.08);
     .item-index { background: var(--success); color: white; }
-  }
-
-  &.has-error {
-    border-color: var(--danger);
   }
 
   // 草稿状态样式
@@ -593,7 +576,6 @@ function formatDuration(seconds) {
     font-family: var(--font-mono);
     color: var(--text-muted);
 
-    &.warning { color: var(--warning); }
   }
 }
 
@@ -608,30 +590,6 @@ function formatDuration(seconds) {
   .warning-text {
     font-size: 11px;
     color: var(--warning);
-  }
-}
-
-// 错误标签
-.error-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 6px;
-
-  .error-tag {
-    padding: 2px 6px;
-    font-size: 10px;
-    border-radius: var(--radius-full);
-
-    &.error {
-      background: rgba(248, 81, 73, 0.15);
-      color: var(--danger);
-    }
-
-    &.warning {
-      background: rgba(210, 153, 34, 0.15);
-      color: var(--warning);
-    }
   }
 }
 

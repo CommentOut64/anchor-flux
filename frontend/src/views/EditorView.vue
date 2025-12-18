@@ -128,20 +128,7 @@
                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
               </svg>
               <h3>问题检查</h3>
-              <p v-if="errorCount === 0">没有发现问题</p>
-              <p v-else>发现 {{ errorCount }} 个问题</p>
-              <div class="error-list" v-if="errorCount > 0">
-                <div
-                  v-for="error in validationErrors"
-                  :key="`${error.type}-${error.index}`"
-                  class="error-item"
-                  :class="error.severity"
-                  @click="jumpToError(error)"
-                >
-                  <span class="error-index">#{{ error.index + 1 }}</span>
-                  <span class="error-message">{{ error.message }}</span>
-                </div>
-              </div>
+              <p>功能已移除</p>
             </div>
           </div>
 
@@ -312,12 +299,6 @@ const currentSubtitleIndex = computed(() =>
 // 撤销/重做
 const canUndo = computed(() => projectStore.canUndo)
 const canRedo = computed(() => projectStore.canRedo)
-
-// 验证错误
-const validationErrors = computed(() => projectStore.validationErrors)
-const errorCount = computed(() =>
-  validationErrors.value.filter(e => e.severity === 'error').length
-)
 
 // 队列进度计算
 const queueCompleted = computed(() =>
@@ -1034,15 +1015,6 @@ function handleSubtitleClick(subtitle) {
 
 function handleSubtitleEdit(id, field, value) {
   console.log('字幕编辑:', id, field, value)
-}
-
-function jumpToError(error) {
-  const subtitle = projectStore.subtitles[error.index]
-  if (subtitle) {
-    projectStore.view.selectedSubtitleId = subtitle.id
-    projectStore.seekTo(subtitle.start)
-    activeTab.value = 'subtitles'
-  }
 }
 
 function showSettings() {

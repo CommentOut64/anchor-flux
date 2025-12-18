@@ -55,7 +55,6 @@
         :is-active="activeSubtitleId === subtitle.id"
         :is-current="currentSubtitleId === subtitle.id"
         :editable="props.editable"
-        :errors="getItemErrors(index)"
         @click="onSubtitleClick"
         @update-time="updateTime"
         @update-text="updateText"
@@ -93,7 +92,6 @@ const searchText = ref('')
 // Computed
 const subtitles = computed(() => projectStore.subtitles)
 const totalSubtitles = computed(() => projectStore.totalSubtitles)
-const validationErrors = computed(() => projectStore.validationErrors)
 const currentSubtitleId = computed(() => projectStore.currentSubtitle?.id)
 const activeSubtitleId = computed(() => projectStore.view.selectedSubtitleId)
 // Phase 5: 草稿计数
@@ -106,10 +104,6 @@ const filteredSubtitles = computed(() => {
 })
 
 // Methods
-function getItemErrors(index) {
-  return validationErrors.value.filter(e => e.index === index)
-}
-
 function onSubtitleClick(subtitle) {
   projectStore.view.selectedSubtitleId = subtitle.id
   projectStore.seekTo(subtitle.start)
@@ -362,10 +356,6 @@ watch(currentSubtitleId, (id) => {
     .item-index { background: var(--success); color: white; }
   }
 
-  &.has-error {
-    border-color: var(--danger);
-  }
-
   // 置信度警告高亮样式
   &.warning-low-confidence {
     border-color: var(--warning);
@@ -532,31 +522,6 @@ watch(currentSubtitleId, (id) => {
     font-family: var(--font-mono);
     color: var(--text-muted);
 
-    &.warning { color: var(--warning); }
-  }
-}
-
-// 错误标签
-.error-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 6px;
-
-  .error-tag {
-    padding: 2px 6px;
-    font-size: 10px;
-    border-radius: var(--radius-full);
-
-    &.error {
-      background: rgba(248, 81, 73, 0.15);
-      color: var(--danger);
-    }
-
-    &.warning {
-      background: rgba(210, 153, 34, 0.15);
-      color: var(--warning);
-    }
   }
 }
 
