@@ -365,6 +365,14 @@ class TranscriptionService:
         self.sse_manager = get_sse_manager()
         self.logger.info("SSE管理器已集成")
 
+        # 初始化新架构 Pipeline（2025-12-17 架构改造）
+        from app.pipelines.audio_processing_pipeline import AudioProcessingPipeline
+        from app.pipelines.async_dual_pipeline import AsyncDualPipeline
+
+        self.audio_pipeline = None  # 延迟初始化，等硬件检测完成
+        self.transcription_pipeline = None  # 延迟初始化，等硬件检测完成
+        self.logger.info("Pipeline 架构已准备")
+
         # 记录CPU信息
         sys_info = self.cpu_manager.get_system_info()
         if sys_info.get('supported', False):
@@ -396,8 +404,162 @@ class TranscriptionService:
                            f"CPU: {hw.cpu_cores}核/{hw.cpu_threads}线程, "
                            f"内存: {hw.memory_total_mb}MB, "
                            f"优化配置: batch={opt.batch_size}, device={opt.recommended_device}")
+
+            # 硬件检测完成后，初始化 Pipeline
+            self._initialize_pipelines()
         except Exception as e:
             self.logger.error(f"硬件检测失败: {e}")
+
+    def _initialize_pipelines(self):
+        """
+        初始化新架构 Pipeline（2025-12-17 架构改造）
+
+        职责：组装 - 根据硬件配置初始化 AudioProcessingPipeline 和 AsyncDualPipeline
+        """
+        try:
+            from app.pipelines.audio_processing_pipeline import (
+                AudioProcessingPipeline,
+                AudioProcessingConfig
+            )
+            from app.pipelines.async_dual_pipeline import AsyncDualPipeline
+
+            # 初始化音频处理流水线
+            audio_config = AudioProcessingConfig(
+                vad_config=VADConfig(),  # 使用默认 VAD 配置
+                enable_demucs=True,
+                auto_strategy=True
+            )
+            self.audio_pipeline = AudioProcessingPipeline(
+                config=audio_config,
+                logger=self.logger
+            )
+
+            # 初始化转录流水线
+            self.transcription_pipeline = AsyncDualPipeline(
+                job_id="",  # 每次处理时动态设置
+                sse_manager=self.sse_manager,
+                logger=self.logger
+            )
+
+            self.logger.info("Pipeline 初始化完成")
+        except Exception as e:
+            self.logger.error(f"Pipeline 初始化失败: {e}")
+            self.audio_pipeline = None
+            self.transcription_pipeline = None
+
+    async def _run_pipeline_v2(self, job: JobState):
+        """
+        新架构 Pipeline 入口方法（2025-12-17 架构改造）
+
+        职责：
+        1. 触发：接收任务，传给 Pipeline
+        2. 收尾：拿到结果，生成 SRT 文件
+
+        注意：此方法是简化版，暂不支持断点续传、任务状态管理等复杂功能
+        这些功能将在后续阶段逐步集成
+
+        Args:
+            job: 任务状态对象
+        """
+        try:
+            # 检查 Pipeline 是否初始化
+            if not self.audio_pipeline or not self.transcription_pipeline:
+                raise RuntimeError("Pipeline 未初始化")
+
+            job_dir = Path(job.dir)
+            input_path = job_dir / job.filename
+
+            # ==========================================
+            # 阶段 1: 音频前处理（AudioProcessingPipeline）
+            # ==========================================
+            self._update_progress(job, 'audio_processing', 0, '音频处理中...')
+
+            # 调用音频处理流水线
+            audio_result = await self.audio_pipeline.process(
+                video_path=str(input_path),
+                progress_callback=lambda p: self._update_progress(
+                    job, 'audio_processing', p, f'音频处理中 {int(p*100)}%'
+                )
+            )
+
+            chunks = audio_result.chunks
+            job.total = len(chunks)
+            self.logger.info(f"音频处理完成: {len(chunks)} 个 Chunk")
+
+            # ==========================================
+            # 阶段 2: 异步双流转录（AsyncDualPipeline）
+            # ==========================================
+            self._update_progress(job, 'transcription', 0, '转录中...')
+
+            # 更新 Pipeline 的 job_id
+            self.transcription_pipeline.job_id = job.job_id
+
+            # 调用转录流水线
+            final_sentences = await self.transcription_pipeline.run(
+                chunks=chunks,
+                job_settings=job.settings
+            )
+
+            self.logger.info(f"转录完成: {len(final_sentences)} 个句子")
+
+            # ==========================================
+            # 阶段 3: 生成 SRT 文件（收尾）
+            # ==========================================
+            self._update_progress(job, 'finalize', 0, '生成字幕文件...')
+
+            srt_path = job_dir / f"{Path(job.filename).stem}.srt"
+            self._generate_srt_from_sentences(final_sentences, srt_path)
+
+            job.srt_path = str(srt_path)
+            job.status = 'completed'
+            job.message = '转录完成'
+            job.progress = 100
+
+            self.logger.info(f"任务完成: {job.job_id}")
+
+        except Exception as e:
+            self.logger.error(f"Pipeline 执行失败: {e}", exc_info=True)
+            job.status = 'failed'
+            job.error = str(e)
+            job.message = f'失败: {str(e)}'
+            raise
+
+    def _generate_srt_from_sentences(self, sentences: List, output_path: Path):
+        """
+        从句子列表生成 SRT 文件
+
+        Args:
+            sentences: 句子列表
+            output_path: 输出路径
+        """
+        srt_content = []
+
+        for i, sentence in enumerate(sentences, 1):
+            start = self._format_srt_timestamp(sentence.start)
+            end = self._format_srt_timestamp(sentence.end)
+            text = sentence.text
+
+            srt_content.append(f"{i}\n{start} --> {end}\n{text}\n")
+
+        output_path.write_text('\n'.join(srt_content), encoding='utf-8')
+        self.logger.info(f"SRT 文件已生成: {output_path}")
+
+    def _format_srt_timestamp(self, seconds: float) -> str:
+        """
+        格式化 SRT 时间戳
+
+        Args:
+            seconds: 秒数
+
+        Returns:
+            SRT 格式时间戳 (HH:MM:SS,mmm)
+        """
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int((seconds % 1) * 1000)
+
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
     def _load_all_jobs_from_disk(self):
         """
