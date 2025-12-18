@@ -539,16 +539,25 @@ class SenseVoiceONNXService:
             # 3. CTC 解码
             text, word_timestamps, confidence = self.decoder.decode(logits, self.time_stride)
 
-            # 【阶段一】过滤特殊标记，修复时间戳前移问题
+            # 【阶段一】过滤特殊标记，并补偿时间偏移
             # 特殊标记格式：<|xxx|>，如 <|en|>, <|EMO_UNKNOWN|>, <|Speech|>, <|withitn|>
-            # 这些标记占用时间轴约 0.24s，导致字幕时间戳整体前移
+            # 这些标记占用时间轴（每个约60ms），过滤时需要累计其持续时间并从后续词中扣除
             clean_word_timestamps = []
+            removed_duration = 0.0  # 累计被删除标记的持续时间
+
             for w in word_timestamps:
                 word = w.get("word", "")
                 if word.startswith("<|") and word.endswith("|>"):
-                    # 跳过特殊标记，它们不应占用时间轴
+                    # 累计被删除标记的持续时间
+                    removed_duration += w.get("end", 0) - w.get("start", 0)
                     continue
-                clean_word_timestamps.append(w)
+
+                # 从后续词的时间戳中扣除累计的偏移，补偿标记占用的时间
+                adjusted_w = w.copy()
+                adjusted_w["start"] = max(0.0, w.get("start", 0) - removed_duration)
+                adjusted_w["end"] = max(0.0, w.get("end", 0) - removed_duration)
+                clean_word_timestamps.append(adjusted_w)
+
             word_timestamps = clean_word_timestamps
 
             # 【新增】Token 合并：将 BPE/SentencePiece Subword Tokens 合并为完整单词
