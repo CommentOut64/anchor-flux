@@ -295,23 +295,38 @@ class AsyncDualPipeline:
 
     async def _slow_loop(self):
         """
-        SlowWorker 循环（中间消费者-生产者）
+        SlowWorker 循环（中间消费者-生产者）- 死等模式
 
         职责：
-        1. 从 queue_inter 取 context
+        1. 从 queue_inter 取 context（无超时，死等）
         2. 调用 SlowWorker.process()
         3. 将 context 放入 queue_final
         4. 透传结束/错误信号
 
+        设计原则（2025-12-19 重构）：
+        - 纯信号驱动，不使用超时机制
+        - FastWorker 保证在任何情况下都会发送 is_end 信号
+        - SequencedQueue.put_direct() 会等待缓冲区清空后再放入结束信号
+        - 背压机制保证内存不会爆，SequencedQueue 保证顺序
         """
         try:
             while True:
-                # 从队列取 context
+                # 死等！不加 timeout
+                # 只要 FastWorker 没发 is_end，就一直等待
+                # 背压机制保证了内存不会爆，SequencedQueue 保证了顺序
                 ctx = await self.queue_inter.get()
 
-                # 检查结束信号或错误
-                if ctx.is_end or ctx.error:
-                    await self.queue_final.put(ctx)  # 透传
+                # 检查结束信号
+                if ctx.is_end:
+                    self.logger.info("[Phase1-乱序执行] SlowWorker 收到结束信号，准备退出")
+                    # 关键：必须把结束信号传递给下一个环节 (AlignmentWorker)
+                    await self.queue_final.put(ctx)
+                    break
+
+                # 检查错误信号（上游报错，透传并退出）
+                if ctx.error:
+                    self.logger.error(f"[Phase1-乱序执行] SlowWorker 收到错误信号: {ctx.error}")
+                    await self.queue_final.put(ctx)
                     break
 
                 # SlowWorker 处理（Whisper 推理 + 幻觉检测）
@@ -322,16 +337,16 @@ class AsyncDualPipeline:
                     whisper_text = ctx.whisper_result.get('text', '')
                     self.slow_worker.update_prompt_cache(whisper_text)
 
-                # 放入队列
+                # 放入下一级队列
                 await self.queue_final.put(ctx)
 
-            self.logger.info("SlowWorker 循环完成")
+            self.logger.info("[Phase1-乱序执行] SlowWorker 循环正常结束")
 
         except Exception as e:
             self.logger.error(f"SlowWorker 循环异常: {e}", exc_info=True)
             self.errors.append(e)
 
-            # 发送错误信号
+            # 发送错误信号防止死锁
             error_ctx = ProcessingContext(
                 job_id=self.job_id,
                 chunk_index=-1,

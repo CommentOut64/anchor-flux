@@ -119,17 +119,85 @@ class SequencedAsyncQueue(Generic[T]):
             )
             await asyncio.sleep(0.1)
 
-    async def put_direct(self, item: T):
+    async def put_direct(self, item: T, is_end_signal: bool = True):
         """
         直接放入内部队列（不经过排序）
 
-        用于特殊场景，如发送结束信号
+        用于特殊场景，如发送结束信号。
+
+        当 is_end_signal=True 时（默认）：
+        - 先尝试正常flush
+        - 如果buffer仍非空（说明有chunk丢失），强制将剩余数据按index排序全部吐出
+        - 这样可以避免死锁，同时尽可能保留已到达的数据
+
+        死锁预防原理：
+        - 场景: Chunk 0,1 到了，Chunk 2 丢了，Chunk 3 在 Buffer 里
+        - 旧方案: put_direct 会无限等待 Chunk 2，导致死锁
+        - 新方案: 强制将 Chunk 3 吐出，然后放入结束信号
 
         Args:
             item: 要放入的元素
+            is_end_signal: 是否是结束信号（默认True，会触发强制Flush）
         """
+        async with self._lock:
+            if is_end_signal:
+                # 首先尝试正常flush（处理已经可以按顺序输出的数据）
+                await self._try_flush()
+
+                # 检查buffer是否仍有剩余数据
+                if self._buffer:
+                    # 上游说结束了，但 Buffer 里还有数据
+                    # 说明中间有 Chunk 丢了，或者逻辑错位
+                    # 策略：将剩余数据全部强制按 Key 排序发出，不再等待缺失的序号
+                    orphaned_indices = sorted(self._buffer.keys())
+                    self.logger.warning(
+                        f"收到结束信号时 Buffer 非空 (len={len(self._buffer)})，"
+                        f"强制Flush剩余数据: {orphaned_indices}，"
+                        f"缺失的序号: {self._next_expected_index} 到 {min(orphaned_indices)-1 if orphaned_indices else '无'}"
+                    )
+
+                    for idx in orphaned_indices:
+                        orphaned_item = self._buffer.pop(idx)
+                        self._put_timestamps.pop(idx, None)
+                        # 使用put_nowait避免在锁内阻塞
+                        # 如果inner_queue满了，这里会抛异常，但这种情况不应该发生
+                        # 因为结束信号意味着不会有新数据了
+                        try:
+                            self._inner_queue.put_nowait(orphaned_item)
+                            self._total_processed += 1
+                            self.logger.info(f"强制输出孤儿 Chunk index={idx}")
+                        except asyncio.QueueFull:
+                            # inner_queue满了，等待后重试
+                            # 释放锁后等待，避免死锁
+                            self.logger.warning(f"inner_queue满，等待后重试放入 index={idx}")
+                            # 把数据放回buffer，稍后在锁外处理
+                            self._buffer[idx] = orphaned_item
+
+                    # 如果还有数据因为队列满没放进去，在锁外处理
+                    if self._buffer:
+                        # 需要在锁外处理，先释放锁
+                        pass
+
+            # 更新 next_expected_index（虽然此时已无意义，但保持一致性）
+            if self._buffer:
+                # 还有数据没放进去，需要在锁外处理
+                remaining = dict(self._buffer)
+                self._buffer.clear()
+            else:
+                remaining = {}
+
+        # 在锁外处理因队列满而未能放入的数据
+        for idx in sorted(remaining.keys()):
+            orphaned_item = remaining[idx]
+            await self._inner_queue.put(orphaned_item)  # 使用await版本，会等待
+            self._total_processed += 1
+            self.logger.info(f"(锁外)强制输出孤儿 Chunk index={idx}")
+
+        # 最后放入结束信号
         await self._inner_queue.put(item)
-        self.logger.debug("直接放入元素（不经过排序）")
+        self.logger.debug(
+            f"直接放入元素（is_end_signal={is_end_signal}）"
+        )
 
     async def mark_failed(self, index: int, reason: str = ""):
         """
