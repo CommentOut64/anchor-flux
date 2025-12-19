@@ -436,14 +436,26 @@ class TranscriptionService:
                 logger=self.logger
             )
 
-            # 初始化转录流水线
+            # 初始化转录流水线（2025-12-19 Phase 1: 乱序执行核心）
+            # 并发参数配置
+            import multiprocessing
+            cpu_count = multiprocessing.cpu_count()
+            max_concurrent = max(1, cpu_count - 2)  # 预留2个核心给系统
+
             self.transcription_pipeline = AsyncDualPipeline(
                 job_id="",  # 每次处理时动态设置
-                sse_manager=self.sse_manager,
+                queue_maxsize=5,           # 队列背压上限
+                max_concurrent=max_concurrent,  # FastWorker并发数
+                max_buffer_size=100,       # 乱序缓冲区上限
+                timeout_seconds=60.0,      # 单chunk超时时间
                 logger=self.logger
             )
 
-            self.logger.info("Pipeline 初始化完成")
+            self.logger.info(
+                f"Pipeline 初始化完成 - 乱序执行模式已启用: "
+                f"FastWorker并发数={max_concurrent}, "
+                f"CPU核心数={cpu_count}"
+            )
         except Exception as e:
             self.logger.error(f"Pipeline 初始化失败: {e}")
             self.audio_pipeline = None
@@ -505,18 +517,38 @@ class TranscriptionService:
             self.logger.info(f"音频处理完成: {len(chunks)} 个 Chunk")
 
             # ==========================================
-            # 阶段 2: 异步双流转录（AsyncDualPipeline）
+            # 阶段 2: 异步双流转录（AsyncDualPipeline - 乱序执行模式）
             # ==========================================
             self._update_progress(job, 'transcription', 0, '转录中...')
 
             # 更新 Pipeline 的 job_id
             self.transcription_pipeline.job_id = job.job_id
 
-            # 调用转录流水线
-            final_sentences = await self.transcription_pipeline.run(
-                chunks=chunks,
-                job_settings=job.settings
+            # 打印并发状态日志
+            self.logger.info(
+                f"[Phase1-乱序执行] 开始转录 {len(chunks)} 个 Chunk, "
+                f"并发数={self.transcription_pipeline.max_concurrent}"
             )
+
+            # 调用转录流水线（2025-12-19 修复调用签名）
+            results = await self.transcription_pipeline.run(
+                audio_chunks=chunks
+            )
+
+            # 打印并发处理统计
+            stats = self.transcription_pipeline.get_statistics()
+            self.logger.info(
+                f"[Phase1-乱序执行] 转录完成统计: "
+                f"已处理={stats['queue_inter_total_processed']}, "
+                f"失败跳号={stats['queue_inter_failed_count']}, "
+                f"最大缓冲区={stats['queue_inter_max_buffer_seen']}"
+            )
+
+            # 从ProcessingContext提取final_sentences
+            final_sentences = []
+            for ctx in results:
+                if hasattr(ctx, 'final_sentences') and ctx.final_sentences:
+                    final_sentences.extend(ctx.final_sentences)
 
             self.logger.info(f"转录完成: {len(final_sentences)} 个句子")
 

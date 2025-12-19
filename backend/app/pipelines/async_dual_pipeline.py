@@ -1,46 +1,53 @@
 """
 AsyncDualPipeline - 三级异步流水线控制器
 
-核心架构：
-    AudioChunk → [FastWorker (CPU)]
-                   ↓ Queue1 (maxsize=5)
-                 [SlowWorker (GPU)]
+核心架构（乱序执行，顺序提交）：
+    AudioChunk → [FastWorker (CPU并发)]
+                   ↓ SequencedQueue (智能序列化)
+                 [SlowWorker (GPU顺序)]
                    ↓ Queue2 (maxsize=5)
                  [AlignmentWorker (CPU)]
                    ↓ 完成
 
 设计决策：
-- 生产者-消费者模型：数据单向流动
+- 乱序执行：FastWorker并发处理，通过Semaphore控制并发数
+- 顺序提交：SequencedAsyncQueue保证下游接收顺序数据
 - 队列背压：asyncio.Queue(maxsize=5) 防止内存溢出
-- 错位并行：当 SlowWorker 处理 Chunk N 时，FastWorker 同时处理 Chunk N+1
+- 失败跳号：mark_failed()标记失败chunk，不阻塞后续处理
 - 异常传播：任何 Worker 的异常都会传播到 run() 方法
 - 结束信号：使用 ProcessingContext.is_end 通知下游停止
 """
 import asyncio
 import logging
+import multiprocessing
 from typing import List, Optional, Any
 
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.sse_service import get_sse_manager
 from app.pipelines.workers import FastWorker, SlowWorker, AlignmentWorker
+from app.utils.sequenced_queue import SequencedAsyncQueue
 
 
 class AsyncDualPipeline:
     """
-    三级异步流水线控制器
+    三级异步流水线控制器（乱序执行，顺序提交）
 
     职责：
     1. 编排三个 Worker 的生命周期
     2. 管理队列和背压
     3. 处理异常传播
     4. 推送 SSE 事件
+    5. 通过SequencedAsyncQueue实现乱序放入、顺序取出
     """
 
     def __init__(
         self,
         job_id: str,
         queue_maxsize: int = 5,
+        max_concurrent: Optional[int] = None,
+        max_buffer_size: int = 100,
+        timeout_seconds: float = 60.0,
         sensevoice_language: str = "auto",
         whisper_language: str = "auto",
         user_glossary: Optional[list] = None,
@@ -55,6 +62,9 @@ class AsyncDualPipeline:
         Args:
             job_id: 任务 ID
             queue_maxsize: 队列最大长度（背压控制）
+            max_concurrent: FastWorker最大并发数（默认CPU核心数-2）
+            max_buffer_size: SequencedQueue乱序缓冲区最大大小
+            timeout_seconds: 单个chunk超时时间
             sensevoice_language: SenseVoice 语言设置
             whisper_language: Whisper 语言设置
             user_glossary: 用户词表
@@ -66,9 +76,19 @@ class AsyncDualPipeline:
         self.job_id = job_id
         self.logger = logger or logging.getLogger(__name__)
 
-        # 创建队列（带背压）
-        self.queue_inter = asyncio.Queue(maxsize=queue_maxsize)  # FastWorker → SlowWorker
-        self.queue_final = asyncio.Queue(maxsize=queue_maxsize)  # SlowWorker → AlignmentWorker
+        # 并发控制参数
+        self.max_concurrent = max_concurrent or max(1, multiprocessing.cpu_count() - 2)
+
+        # 创建队列
+        # FastWorker → SlowWorker: 使用SequencedAsyncQueue实现乱序放入、顺序取出
+        self.queue_inter = SequencedAsyncQueue(
+            maxsize=queue_maxsize,
+            max_buffer_size=max_buffer_size,
+            timeout_seconds=timeout_seconds,
+            logger=self.logger
+        )
+        # SlowWorker → AlignmentWorker: 普通队列（SlowWorker已经是顺序处理）
+        self.queue_final = asyncio.Queue(maxsize=queue_maxsize)
 
         # 实例化三个 Worker
         self.fast_worker = FastWorker(
@@ -122,7 +142,14 @@ class AsyncDualPipeline:
         Returns:
             List[ProcessingContext]: 处理结果列表
         """
-        self.logger.info(f"开始三级流水线: {len(audio_chunks)} 个 Chunk")
+        # [Phase1-乱序执行] 启动日志
+        self.logger.info(
+            f"[Phase1-乱序执行] 启动三级流水线: "
+            f"Chunk数量={len(audio_chunks)}, "
+            f"FastWorker并发数={self.max_concurrent}, "
+            f"队列背压={self.queue_inter._inner_queue.maxsize}, "
+            f"缓冲区上限={self.queue_inter._max_buffer_size}"
+        )
 
         # 存储结果
         results: List[ProcessingContext] = []
@@ -151,7 +178,14 @@ class AsyncDualPipeline:
             self.logger.error(f"流水线执行中发生 {len(self.errors)} 个错误")
             raise self.errors[0]
 
-        self.logger.info(f"三级流水线完成: {len(results)} 个 Chunk 已处理")
+        # [Phase1-乱序执行] 完成日志
+        stats = self.get_statistics()
+        self.logger.info(
+            f"[Phase1-乱序执行] 三级流水线完成: "
+            f"已处理={len(results)} Chunk, "
+            f"失败跳号={stats['queue_inter_failed_count']}, "
+            f"最大缓冲区使用={stats['queue_inter_max_buffer_seen']}"
+        )
 
         return results
 
@@ -162,47 +196,88 @@ class AsyncDualPipeline:
         full_audio_sr: int = 16000
     ):
         """
-        FastWorker 循环（生产者）
+        FastWorker 并发循环（生产者）
 
         职责：
-        1. 遍历所有 audio_chunks
+        1. 并发处理所有 audio_chunks（通过Semaphore控制并发数）
         2. 每个 chunk 包装为 ProcessingContext
         3. 调用 FastWorker.process()
-        4. 将 context 放入 queue_inter
-        5. 发送结束信号
+        4. 将 context 放入 SequencedQueue（乱序放入，顺序取出）
+        5. 失败的chunk标记为失败，不阻塞后续处理
+        6. 发送结束信号
 
         Args:
             chunks: AudioChunk 列表
             full_audio_array: 完整音频数组（用于 Audio Overlap）
             full_audio_sr: 完整音频采样率
         """
+        # 设置总元素数量，用于完成检测
+        self.queue_inter.set_total(len(chunks))
+
+        # CPU并发信号量
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+
+        async def process_chunk(i: int, chunk: AudioChunk):
+            """处理单个chunk（并发执行）"""
+            try:
+                async with semaphore:
+                    # 创建处理上下文（包含完整音频数组）
+                    ctx = ProcessingContext(
+                        job_id=self.job_id,
+                        chunk_index=i,
+                        audio_chunk=chunk,
+                        full_audio_array=full_audio_array,
+                        full_audio_sr=full_audio_sr
+                    )
+
+                    # FastWorker 处理（SenseVoice 推理 + 分句 + 推送草稿）
+                    await self.fast_worker.process(ctx)
+
+                    # 放入SequencedQueue（乱序放入，由队列保证顺序取出）
+                    await self.queue_inter.put(ctx)
+
+            except asyncio.CancelledError:
+                # 任务被取消，标记为失败
+                await self.queue_inter.mark_failed(i, "cancelled")
+                raise
+            except Exception as e:
+                # 处理异常，标记chunk为失败（不阻塞后续处理）
+                self.logger.error(f"FastWorker 处理 chunk {i} 异常: {e}", exc_info=True)
+                await self.queue_inter.mark_failed(i, str(e))
+
         try:
-            for i, chunk in enumerate(chunks):
-                # 创建处理上下文（包含完整音频数组）
-                ctx = ProcessingContext(
-                    job_id=self.job_id,
-                    chunk_index=i,
-                    audio_chunk=chunk,
-                    full_audio_array=full_audio_array,
-                    full_audio_sr=full_audio_sr
-                )
+            # [Phase1-乱序执行] 并发启动所有任务
+            import time
+            start_time = time.time()
+            self.logger.info(
+                f"[Phase1-乱序执行] FastWorker 并发启动 {len(chunks)} 个任务, "
+                f"并发数={self.max_concurrent}"
+            )
+            tasks = [asyncio.create_task(process_chunk(i, chunk)) for i, chunk in enumerate(chunks)]
 
-                # FastWorker 处理（SenseVoice 推理 + 分句 + 推送草稿）
-                await self.fast_worker.process(ctx)
+            # 等待所有任务完成（return_exceptions=True 防止单个失败影响其他任务）
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-                # 放入队列（如果队列满了，会自动阻塞，实现背压）
-                await self.queue_inter.put(ctx)
+            elapsed = time.time() - start_time
+            stats = self.queue_inter.get_statistics()
 
-            # 发送结束信号
+            # 发送结束信号（直接放入，不经过排序）
             end_ctx = ProcessingContext(
                 job_id=self.job_id,
                 chunk_index=-1,
                 audio_chunk=None,
                 is_end=True
             )
-            await self.queue_inter.put(end_ctx)
+            await self.queue_inter.put_direct(end_ctx)
 
-            self.logger.info("FastWorker 循环完成")
+            # [Phase1-乱序执行] 完成统计
+            self.logger.info(
+                f"[Phase1-乱序执行] FastWorker 并发处理完成: "
+                f"耗时={elapsed:.2f}s, "
+                f"已处理={stats.total_processed}, "
+                f"失败={stats.failed_count}, "
+                f"最大缓冲区={stats.max_buffer_seen}"
+            )
 
         except Exception as e:
             self.logger.error(f"FastWorker 循环异常: {e}", exc_info=True)
@@ -216,7 +291,7 @@ class AsyncDualPipeline:
                 is_end=True,
                 error=e
             )
-            await self.queue_inter.put(error_ctx)
+            await self.queue_inter.put_direct(error_ctx)
 
     async def _slow_loop(self):
         """
@@ -310,9 +385,17 @@ class AsyncDualPipeline:
         Returns:
             dict: 统计信息
         """
+        # 获取SequencedQueue统计
+        seq_stats = self.queue_inter.get_statistics()
         return {
-            "queue_inter_size": self.queue_inter.qsize(),
+            "queue_inter_buffer_size": seq_stats.buffer_size,
+            "queue_inter_inner_size": seq_stats.inner_queue_size,
+            "queue_inter_next_expected": seq_stats.next_expected,
+            "queue_inter_total_processed": seq_stats.total_processed,
+            "queue_inter_failed_count": seq_stats.failed_count,
+            "queue_inter_max_buffer_seen": seq_stats.max_buffer_seen,
             "queue_final_size": self.queue_final.qsize(),
+            "max_concurrent": self.max_concurrent,
             "errors": len(self.errors)
         }
 
@@ -321,6 +404,9 @@ class AsyncDualPipeline:
 def get_async_dual_pipeline(
     job_id: str,
     queue_maxsize: int = 5,
+    max_concurrent: Optional[int] = None,
+    max_buffer_size: int = 100,
+    timeout_seconds: float = 60.0,
     logger: Optional[logging.Logger] = None
 ) -> AsyncDualPipeline:
     """
@@ -329,6 +415,9 @@ def get_async_dual_pipeline(
     Args:
         job_id: 任务 ID
         queue_maxsize: 队列最大长度
+        max_concurrent: FastWorker最大并发数（默认CPU核心数-2）
+        max_buffer_size: SequencedQueue乱序缓冲区最大大小
+        timeout_seconds: 单个chunk超时时间
         logger: 日志记录器
 
     Returns:
@@ -337,5 +426,8 @@ def get_async_dual_pipeline(
     return AsyncDualPipeline(
         job_id=job_id,
         queue_maxsize=queue_maxsize,
+        max_concurrent=max_concurrent,
+        max_buffer_size=max_buffer_size,
+        timeout_seconds=timeout_seconds,
         logger=logger
     )

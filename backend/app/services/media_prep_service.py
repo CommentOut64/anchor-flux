@@ -526,8 +526,8 @@ class MediaPrepService:
                     import time
                     time.sleep(10)  # 等待10秒
 
-                    # 检查队列是否空闲
-                    queue_idle = self._is_transcription_queue_idle()
+                    # 检查队列是否空闲（使用 busy 方法取反）
+                    queue_idle = not self._is_transcription_queue_busy()
                     logger.info(f"[MediaPrep] 360p完成后10秒检查: 队列空闲={queue_idle}")
 
                     if queue_idle:
