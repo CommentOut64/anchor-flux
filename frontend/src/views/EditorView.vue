@@ -100,7 +100,6 @@
             @click="activeTab = 'validation'"
           >
             问题检查
-            <span v-if="errorCount > 0" class="badge">{{ errorCount }}</span>
           </button>
           <button
             class="tab-btn"
@@ -164,9 +163,6 @@
       </div>
 
       <div class="footer-right">
-        <span v-if="errorCount > 0" class="error-indicator" @click="activeTab = 'validation'">
-          {{ errorCount }} 个问题
-        </span>
         <span class="divider">|</span>
         <button class="settings-btn" @click="showSettings" title="设置">
           <svg viewBox="0 0 24 24" fill="currentColor">

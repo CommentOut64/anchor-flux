@@ -124,11 +124,25 @@ class WhisperExecutor:
     def is_loaded(self) -> bool:
         """
         检查模型是否已加载
-        
+
         Returns:
             bool: 是否已加载
         """
         return self.service.model is not None
+
+    async def warmup(self):
+        """
+        预加载 Whisper 模型（热身）
+
+        在后台加载模型到显存，不执行推理。
+        用于流水线启动时并行预加载，掩盖加载延迟。
+        """
+        if not self.is_loaded():
+            self.logger.info('Whisper 模型未加载，正在加载...')
+            self.service.load_model()
+            self.logger.info('Whisper 模型加载完成')
+        else:
+            self.logger.debug('Whisper 模型已加载，跳过预热')
     
     def get_model_info(self) -> Dict[str, Any]:
         """

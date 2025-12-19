@@ -279,9 +279,22 @@ class ChunkEngine:
         """
         chunks = []
 
+        # V3.2.3: 添加详细的 Chunk 时间范围日志，便于诊断字幕丢失问题
+        self.logger.info(f"创建 {len(segments)} 个 Chunk，时间范围详情：")
         for seg in segments:
             start_sec = seg["start"]
             end_sec = seg["end"]
+            duration = end_sec - start_sec
+
+            # 格式化时间为 MM:SS.mmm
+            def fmt_time(sec: float) -> str:
+                m, s = divmod(sec, 60)
+                return f"{int(m):02d}:{s:06.3f}"
+
+            self.logger.info(
+                f"  Chunk {seg['index']:2d}: [{fmt_time(start_sec)} - {fmt_time(end_sec)}] "
+                f"(duration={duration:.2f}s)"
+            )
 
             # 提取音频片段
             start_sample = int(start_sec * sr)

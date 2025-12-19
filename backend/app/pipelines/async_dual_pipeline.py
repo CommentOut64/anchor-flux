@@ -46,7 +46,7 @@ class AsyncDualPipeline:
         job_id: str,
         queue_maxsize: int = 5,
         max_concurrent: Optional[int] = None,
-        max_buffer_size: int = 100,
+        max_buffer_size: int = 10,  # V3.2.1: 降低默认值，实现真正背压
         timeout_seconds: float = 60.0,
         sensevoice_language: str = "auto",
         whisper_language: str = "auto",
@@ -61,9 +61,9 @@ class AsyncDualPipeline:
 
         Args:
             job_id: 任务 ID
-            queue_maxsize: 队列最大长度（背压控制）
+            queue_maxsize: 队列最大长度（内部队列背压控制）
             max_concurrent: FastWorker最大并发数（默认CPU核心数-2）
-            max_buffer_size: SequencedQueue乱序缓冲区最大大小
+            max_buffer_size: SequencedQueue 背压阈值（buffer + inner_queue 总量上限，V3.2.1 默认 10）
             timeout_seconds: 单个chunk超时时间
             sensevoice_language: SenseVoice 语言设置
             whisper_language: Whisper 语言设置
@@ -196,15 +196,20 @@ class AsyncDualPipeline:
         full_audio_sr: int = 16000
     ):
         """
-        FastWorker 并发循环（生产者）
+        FastWorker 并发循环（生产者）- V3.2.1 队列内置背压版本
 
         职责：
-        1. 并发处理所有 audio_chunks（通过Semaphore控制并发数）
+        1. 并发处理所有 audio_chunks（通过 cpu_semaphore 控制 CPU 并发）
         2. 每个 chunk 包装为 ProcessingContext
         3. 调用 FastWorker.process()
-        4. 将 context 放入 SequencedQueue（乱序放入，顺序取出）
+        4. 将 context 放入 SequencedQueue（队列内置背压，put() 会阻塞）
         5. 失败的chunk标记为失败，不阻塞后续处理
         6. 发送结束信号
+
+        V3.2.1 改进（2025-12-19）：
+        - 移除外部 buffer_semaphore，改用 SequencedQueue 内置背压
+        - 背压基于 buffer + inner_queue 总量，当超过 max_buffer_size 时 put() 阻塞
+        - 保留 cpu_semaphore 控制 CPU 密集型推理的并发数
 
         Args:
             chunks: AudioChunk 列表
@@ -214,13 +219,30 @@ class AsyncDualPipeline:
         # 设置总元素数量，用于完成检测
         self.queue_inter.set_total(len(chunks))
 
-        # CPU并发信号量
-        semaphore = asyncio.Semaphore(self.max_concurrent)
+        # =========================================================
+        # [V3.2.0] 启动时立即触发 Whisper 预加载
+        # 不要 await，让它在后台加载，利用 SenseVoice 的处理时间掩盖加载耗时
+        # =========================================================
+        self.logger.info("[Phase1-乱序执行] 并行预加载 Whisper 模型...")
+        preload_task = asyncio.create_task(self.slow_worker.preload_model())
+
+        # =========================================================
+        # [V3.2.1] CPU 并发控制（背压由 SequencedQueue.put() 内置实现）
+        # =========================================================
+        # cpu_semaphore: 限制 CPU 密集型的 SenseVoice 推理并发数
+        cpu_semaphore = asyncio.Semaphore(self.max_concurrent)
+
+        self.logger.info(
+            f"[Phase1-乱序执行] 背压参数: "
+            f"cpu_semaphore={self.max_concurrent}, "
+            f"queue_backpressure_limit={self.queue_inter._max_buffer_size}"
+        )
 
         async def process_chunk(i: int, chunk: AudioChunk):
-            """处理单个chunk（并发执行）"""
+            """处理单个chunk（并发执行，队列内置背压）"""
             try:
-                async with semaphore:
+                # CPU 资源控制（限制并发推理数）
+                async with cpu_semaphore:
                     # 创建处理上下文（包含完整音频数组）
                     ctx = ProcessingContext(
                         job_id=self.job_id,
@@ -233,8 +255,9 @@ class AsyncDualPipeline:
                     # FastWorker 处理（SenseVoice 推理 + 分句 + 推送草稿）
                     await self.fast_worker.process(ctx)
 
-                    # 放入SequencedQueue（乱序放入，由队列保证顺序取出）
-                    await self.queue_inter.put(ctx)
+                # 放入SequencedQueue（乱序放入，由队列保证顺序取出）
+                # V3.2.1: put() 内置背压，当 buffer + inner_queue >= max_buffer_size 时阻塞
+                await self.queue_inter.put(ctx)
 
             except asyncio.CancelledError:
                 # 任务被取消，标记为失败
@@ -251,12 +274,20 @@ class AsyncDualPipeline:
             start_time = time.time()
             self.logger.info(
                 f"[Phase1-乱序执行] FastWorker 并发启动 {len(chunks)} 个任务, "
-                f"并发数={self.max_concurrent}"
+                f"CPU并发数={self.max_concurrent}, 队列背压限制={self.queue_inter._max_buffer_size}"
             )
+
+            # 创建任务（V3.2.1: 背压由 put() 内置，任务会在 put() 处阻塞等待空间）
             tasks = [asyncio.create_task(process_chunk(i, chunk)) for i, chunk in enumerate(chunks)]
 
             # 等待所有任务完成（return_exceptions=True 防止单个失败影响其他任务）
             await asyncio.gather(*tasks, return_exceptions=True)
+
+            # 确保预加载任务完成（通常此时早已完成）
+            try:
+                await asyncio.wait_for(preload_task, timeout=1.0)
+            except asyncio.TimeoutError:
+                self.logger.warning("Whisper 预加载超时，可能已在推理中完成加载")
 
             elapsed = time.time() - start_time
             stats = self.queue_inter.get_statistics()
@@ -420,7 +451,7 @@ def get_async_dual_pipeline(
     job_id: str,
     queue_maxsize: int = 5,
     max_concurrent: Optional[int] = None,
-    max_buffer_size: int = 100,
+    max_buffer_size: int = 10,  # V3.2.1: 降低默认值，实现真正背压
     timeout_seconds: float = 60.0,
     logger: Optional[logging.Logger] = None
 ) -> AsyncDualPipeline:
@@ -429,9 +460,9 @@ def get_async_dual_pipeline(
 
     Args:
         job_id: 任务 ID
-        queue_maxsize: 队列最大长度
+        queue_maxsize: 内部队列最大长度
         max_concurrent: FastWorker最大并发数（默认CPU核心数-2）
-        max_buffer_size: SequencedQueue乱序缓冲区最大大小
+        max_buffer_size: SequencedQueue 背压阈值（buffer + inner_queue 总量上限）
         timeout_seconds: 单个chunk超时时间
         logger: 日志记录器
 

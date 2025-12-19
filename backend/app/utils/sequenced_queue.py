@@ -51,7 +51,7 @@ class SequencedAsyncQueue(Generic[T]):
 
         Args:
             maxsize: 内部队列最大大小（0表示无限制）
-            max_buffer_size: 乱序缓冲区最大大小
+            max_buffer_size: 乱序缓冲区最大大小（V3.2.1: 背压基于 buffer + inner_queue 总量）
             timeout_seconds: 单个index的超时时间（秒）
             logger: 日志记录器
         """
@@ -69,6 +69,11 @@ class SequencedAsyncQueue(Generic[T]):
         self._total_processed = 0  # 已处理的元素总数
         self._max_buffer_seen = 0  # 观察到的最大缓冲区大小
 
+        # V3.2.3: 使用 Condition 替代 Event，实现精确唤醒
+        # Event.set() 会唤醒所有等待者，导致惊群效应
+        # Condition.notify() 只唤醒一个等待者
+        self._space_condition = asyncio.Condition(self._lock)
+
         self.logger = logger or logging.getLogger(__name__)
 
     def set_total(self, total: int):
@@ -83,7 +88,12 @@ class SequencedAsyncQueue(Generic[T]):
 
     async def put(self, item: T):
         """
-        放入元素（乱序）
+        放入元素（乱序）- V3.2.3 Condition 背压版本
+
+        背压机制（V3.2.3 修复）：
+        - 当 buffer + inner_queue 总量超过 max_buffer_size 时阻塞
+        - 使用 Condition.wait() 等待，避免惊群效应
+        - 当 SlowWorker 消费数据后，通过 get() 触发 Condition.notify()
 
         Args:
             item: 要放入的元素，必须有chunk_index属性
@@ -96,28 +106,35 @@ class SequencedAsyncQueue(Generic[T]):
         if index is None:
             raise ValueError("item must have chunk_index attribute")
 
-        # 背压控制：缓冲区满时等待（在锁外等待，避免死锁）
-        while True:
-            async with self._lock:
-                if not self._is_buffer_full():
-                    # 存入缓冲区
+        # V3.2.3: 使用 Condition 实现背压，避免惊群效应
+        async with self._space_condition:
+            # 等待直到有空间
+            while True:
+                total_in_flight = len(self._buffer) + self._inner_queue.qsize()
+
+                if total_in_flight < self._max_buffer_size:
+                    # 有空间，存入缓冲区
                     self._buffer[index] = item
                     self._put_timestamps[index] = time.time()
 
                     # 更新统计
                     self._max_buffer_seen = max(self._max_buffer_seen, len(self._buffer))
 
-                    self.logger.debug(f"放入 index={index}，缓冲区大小={len(self._buffer)}")
+                    self.logger.debug(
+                        f"放入 index={index}，buffer={len(self._buffer)}，"
+                        f"inner_queue={self._inner_queue.qsize()}，总在途={total_in_flight + 1}"
+                    )
 
                     # 尝试刷新到内部队列
                     await self._try_flush()
                     return
-
-            # 缓冲区满，释放锁后等待
-            self.logger.warning(
-                f"缓冲区已满 ({self._max_buffer_size})，等待..."
-            )
-            await asyncio.sleep(0.1)
+                else:
+                    # 队列满，等待 Condition 通知
+                    self.logger.debug(
+                        f"[背压] 等待空间: index={index}, buffer={len(self._buffer)}, "
+                        f"inner_queue={self._inner_queue.qsize()}, limit={self._max_buffer_size}"
+                    )
+                    await self._space_condition.wait()
 
     async def put_direct(self, item: T, is_end_signal: bool = True):
         """
@@ -139,7 +156,8 @@ class SequencedAsyncQueue(Generic[T]):
             item: 要放入的元素
             is_end_signal: 是否是结束信号（默认True，会触发强制Flush）
         """
-        async with self._lock:
+        # V3.2.3: 使用 _space_condition（内部封装了 _lock）
+        async with self._space_condition:
             if is_end_signal:
                 # 首先尝试正常flush（处理已经可以按顺序输出的数据）
                 await self._try_flush()
@@ -286,7 +304,9 @@ class SequencedAsyncQueue(Generic[T]):
 
     async def get(self, timeout: Optional[float] = None) -> T:
         """
-        获取下一个有序元素
+        获取下一个有序元素 - V3.2.3 Condition 背压释放版本
+
+        消费数据后触发背压释放，允许 put() 继续。
 
         Args:
             timeout: 超时时间（秒），None表示使用默认超时
@@ -298,19 +318,27 @@ class SequencedAsyncQueue(Generic[T]):
             asyncio.TimeoutError: 超时
         """
         timeout = timeout or self._timeout_seconds
-        return await asyncio.wait_for(
+        item = await asyncio.wait_for(
             self._inner_queue.get(),
             timeout=timeout
         )
 
+        # V3.2.3: 消费后释放背压，通知一个等待的 put()
+        # 使用 Condition.notify() 只唤醒一个等待者，避免惊群效应
+        async with self._space_condition:
+            self._space_condition.notify()
+
+        return item
+
     def _is_buffer_full(self) -> bool:
         """
-        检查缓冲区是否已满
+        检查是否达到背压阈值（V3.2.1: buffer + inner_queue 总量）
 
         Returns:
-            True表示缓冲区已满
+            True表示达到背压阈值
         """
-        return len(self._buffer) >= self._max_buffer_size
+        total_in_flight = len(self._buffer) + self._inner_queue.qsize()
+        return total_in_flight >= self._max_buffer_size
 
     def buffer_size(self) -> int:
         """

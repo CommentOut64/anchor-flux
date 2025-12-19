@@ -370,6 +370,9 @@ class SentenceSplitter:
         current_words: List[WordTimestamp] = []
         current_start = words[0].start
 
+        # V3.2.0: 追踪硬上限触发状态，用于尾部强制保留
+        hard_limit_triggered_in_chunk = False
+
         for i, word in enumerate(words):
             current_words.append(word)
 
@@ -418,6 +421,8 @@ class SentenceSplitter:
                 # 超过硬上限，无论如何都要切分（异常保护）
                 should_split = True
                 split_reason = "hard_limit_protection"
+                # V3.2.0: 标记本chunk触发了硬上限，尾部将强制保留
+                hard_limit_triggered_in_chunk = True
                 logger.warning(f"触发硬上限保护: {current_duration:.2f}s >= {self.config.hard_limit_duration:.2f}s")
             elif current_duration >= self.config.max_duration:
                 # 超过软上限，检查是否应该延迟切分
@@ -478,7 +483,20 @@ class SentenceSplitter:
 
             # 执行切分
             if should_split and current_words:
-                sentence = self._create_sentence(current_words)
+                # V3.2.2: 硬上限相关的强制保留逻辑
+                # 1. hard_limit_protection 分支本身触发时，强制保留当前内容
+                # 2. end_of_input 且本 chunk 曾触发过硬上限时，强制保留尾部
+                force_create = (
+                    split_reason == "hard_limit_protection" or
+                    (split_reason == "end_of_input" and hard_limit_triggered_in_chunk)
+                )
+                if force_create:
+                    logger.info(
+                        f"硬上限强制保留: reason={split_reason}, words数={len(current_words)}, "
+                        f"文本='{current_words[0].word if current_words else ''}...'"
+                    )
+
+                sentence = self._create_sentence(current_words, force_create=force_create)
                 if sentence:
                     sentences.append(sentence)
                     logger.debug(f"分句: '{sentence.text[-50:]}' (原因: {split_reason}, 时长: {current_duration:.2f}s)")
@@ -770,8 +788,21 @@ class SentenceSplitter:
 
         return result
 
-    def _create_sentence(self, words: List['WordTimestamp']) -> Optional['SentenceSegment']:
-        """创建句子对象 (集成边界修剪)"""
+    def _create_sentence(
+        self,
+        words: List['WordTimestamp'],
+        force_create: bool = False
+    ) -> Optional['SentenceSegment']:
+        """
+        创建句子对象 (集成边界修剪)
+
+        Args:
+            words: 词列表
+            force_create: 强制创建句子，跳过 min_chars 检查（用于硬上限后的尾部保留）
+
+        Returns:
+            SentenceSegment 或 None
+        """
         from ..models.sensevoice_models import SentenceSegment
         from ..services.text_normalizer import get_text_normalizer
 
@@ -805,7 +836,8 @@ class SentenceSplitter:
             logger.debug(f"文本清洗: 清洗前={text_raw[:50]}, 清洗后={text_clean[:50]}")
 
         # 过滤过短句子（基于清洗后的文本）
-        if len(text_clean.strip()) < self.config.min_chars:
+        # force_create=True 时跳过此检查（硬上限后的尾部强制保留）
+        if not force_create and len(text_clean.strip()) < self.config.min_chars:
             return None
 
         # 计算平均置信度

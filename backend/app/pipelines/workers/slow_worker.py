@@ -57,6 +57,15 @@ class SlowWorker:
         # Prompt 缓存（上一个 Chunk 的定稿文本）
         self.previous_whisper_text: Optional[str] = None
 
+    async def preload_model(self):
+        """
+        预加载 Whisper 模型（热身）
+
+        在后台加载模型到显存，不执行推理。
+        用于流水线启动时并行预加载，利用 SenseVoice 处理时间掩盖加载延迟。
+        """
+        await self.whisper_executor.warmup()
+
     async def process(self, ctx: ProcessingContext):
         """
         处理单个 Chunk（慢流）
@@ -77,7 +86,11 @@ class SlowWorker:
         prompt = self._build_safe_prompt()
 
         # 阶段 2: Whisper 推理（带 Audio Overlap）
-        self.logger.debug(f"Chunk {ctx.chunk_index}: Whisper 慢流推理（带 Audio Overlap）")
+        # V3.2.3: 增强日志，便于诊断字幕丢失问题
+        self.logger.info(
+            f"Chunk {ctx.chunk_index}: Whisper 推理 "
+            f"[{chunk.start:.2f}s - {chunk.end:.2f}s] (duration={chunk.duration:.2f}s)"
+        )
         whisper_result = await self._run_whisper_with_overlap(ctx, prompt)
 
         # 阶段 3: 幻觉检测
