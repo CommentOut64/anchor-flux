@@ -192,11 +192,15 @@ class FuseBreakerV2:
             f"Chunk {chunk.index}: 使用模型 {model} 重新分离"
         )
 
-        # TODO: 调用DemucsService的chunk级别分离方法
-        # 暂时使用占位逻辑
-        separated_audio = chunk.original_audio.copy()
-        self.logger.warning(
-            f"Chunk {chunk.index}: Chunk级别分离暂未实现，使用原始音频"
+        # 调用DemucsService的chunk级别分离方法
+        separated_audio = demucs_service.separate_chunk(
+            audio=chunk.original_audio,
+            model=model,
+            sr=chunk.sample_rate
+        )
+
+        self.logger.info(
+            f"Chunk {chunk.index}: 分离完成，模型={model}"
         )
 
         # 更新chunk

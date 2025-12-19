@@ -196,17 +196,15 @@ class SeparationStage:
         Returns:
             分离后的人声音频数组
         """
-        # 调用DemucsService的separate_vocals_segment方法
-        # 注意：这里需要将chunk的音频数据传递给Demucs
-        # 由于separate_vocals_segment需要完整音频和时间范围，
-        # 我们需要使用一个临时的方法来处理chunk级别的分离
-
-        # TODO: 实现chunk级别的分离
-        # 暂时返回原始音频
-        self.logger.warning(
-            f"Chunk级别分离暂未完全实现，使用模型: {model}"
+        # 调用DemucsService的chunk级别分离方法
+        separated_audio = self.demucs_service.separate_chunk(
+            audio=audio,
+            model=model,
+            sr=sr
         )
-        return audio
+
+        self.logger.debug(f"Chunk分离完成，模型={model}")
+        return separated_audio
 
     def get_statistics(self, chunks: List[AudioChunk]) -> dict:
         """

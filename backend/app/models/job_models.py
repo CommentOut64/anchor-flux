@@ -294,7 +294,13 @@ class JobSettings:
                 demucs_strategy=preprocessing_data.get("demucs_strategy", "auto"),
                 demucs_model=preprocessing_data.get("demucs_model", "htdemucs"),
                 demucs_shifts=preprocessing_data.get("demucs_shifts", 1),
+                separation_mode=preprocessing_data.get("separation_mode", "on_demand"),
+                enable_spectral_triage=preprocessing_data.get("enable_spectral_triage", True),
                 spectrum_threshold=preprocessing_data.get("spectrum_threshold", 0.35),
+                enable_fuse_breaker=preprocessing_data.get("enable_fuse_breaker", True),
+                fuse_max_retry=preprocessing_data.get("fuse_max_retry", 2),
+                fuse_confidence_threshold=preprocessing_data.get("fuse_confidence_threshold", 0.5),
+                fuse_auto_upgrade=preprocessing_data.get("fuse_auto_upgrade", True),
                 vad_filter=preprocessing_data.get("vad_filter", True),
             ),
             transcription=TranscriptionConfig(

@@ -56,14 +56,14 @@ class SpectralTriageStage:
         self.logger.info(f"开始频谱分诊，共 {len(chunks)} 个chunk")
 
         # 提取音频数据和采样率
-        audio_list = [chunk.audio for chunk in chunks]
+        # diagnose_chunks 期望的格式: List[Tuple[audio, start, end]]
+        chunk_tuples = [(chunk.audio, chunk.start, chunk.end) for chunk in chunks]
         sample_rate = chunks[0].sample_rate if chunks else 16000
 
         # 批量分诊
         diagnoses = self.classifier.diagnose_chunks(
-            chunks=audio_list,
-            sr=sample_rate,
-            threshold=self.threshold
+            chunks=chunk_tuples,
+            sr=sample_rate
         )
 
         # 为每个chunk添加分诊结果

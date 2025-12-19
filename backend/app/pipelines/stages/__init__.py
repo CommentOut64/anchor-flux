@@ -1,9 +1,9 @@
-"""
-Stages !W - �6�
+﻿"""
+Stages 包 - 流水线阶段
 
-+:
-- SpectralTriageStage: �1�6�
-- SeparationStage: ���6�
+包含:
+- SpectralTriageStage: 频谱分诊阶段
+- SeparationStage: 人声分离阶段
 """
 
 from app.pipelines.stages.spectral_triage_stage import SpectralTriageStage

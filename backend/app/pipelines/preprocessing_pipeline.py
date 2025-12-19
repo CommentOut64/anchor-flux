@@ -163,11 +163,8 @@ class PreprocessingPipeline:
         Returns:
             List[AudioChunk]: VAD切分后的 Chunk 列表
         """
-        # 构建 VAD 配置
-        vad_config = VADConfig(
-            enabled=self.config.vad_filter,
-            # 可以根据 config 添加更多 VAD 参数
-        )
+        # 构建 VAD 配置（使用默认配置）
+        vad_config = VADConfig()
 
         # 定义进度回调
         def progress_callback(progress: float, message: str):

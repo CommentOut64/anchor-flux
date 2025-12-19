@@ -376,7 +376,8 @@ class JobQueueService:
 
                     # 调试日志: 输出配置来源和关键参数
                     config_source = ConfigAdapter.get_config_source(job.settings)
-                    logger.debug(f"配置来源: {config_source}, profile={transcription_profile}, preset={preset_id}")
+                    logger.info(f"路由决策: engine={engine}, use_dual_alignment={use_dual_alignment}, profile={transcription_profile}, preset={preset_id}")
+                    logger.debug(f"配置来源: {config_source}")
 
                     if use_dual_alignment:
                         # 双流对齐流水线 (V3.0+ 新架构)
@@ -507,36 +508,53 @@ class JobQueueService:
             # === 预触发 Proxy 生成（不阻塞主流程）===
             await self._maybe_trigger_proxy_generation(job)
 
-            # 阶段 1: 音频前处理
+            # 阶段 1: 音频前处理（使用新架构 PreprocessingPipeline）
             progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "音频前处理...")
 
-            audio_pipeline = get_audio_processing_pipeline(
+            from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
+            import soundfile as sf
+            import librosa
+
+            logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
+
+            # 创建预处理流水线
+            preprocessing_pipeline = PreprocessingPipeline(
+                config=job.settings.preprocessing,
                 logger=logger
             )
 
-            # 使用配置适配器获取 Demucs 策略（修复直通模式不生效的问题）
-            from app.services.config_adapter import ConfigAdapter
-            demucs_strategy = ConfigAdapter.get_demucs_strategy(job.settings)
-            enable_demucs = demucs_strategy != "off"
-            logger.info(f"Demucs 策略: {demucs_strategy}, 启用: {enable_demucs}")
-
-            audio_config = AudioProcessingConfig(
-                enable_demucs=enable_demucs,
-                demucs_model=ConfigAdapter.get_demucs_model(job.settings)
+            # 执行预处理（包含：音频提取、VAD、频谱分诊、按需分离）
+            audio_chunks = await preprocessing_pipeline.process(
+                video_path=job.input_path,
+                job_state=job
             )
 
-            audio_result = await audio_pipeline.process(job.input_path, config=audio_config)
+            # 获取预处理统计信息
+            stats = preprocessing_pipeline.get_statistics(audio_chunks)
+            logger.info(
+                f"PreprocessingPipeline 完成: "
+                f"总chunk数={stats['total_chunks']}, "
+                f"需要分离={stats['need_separation']}, "
+                f"已分离={stats['separated']}, "
+                f"分离比例={stats['separation_ratio']:.2%}"
+            )
 
-            # 保存音频文件供波形图使用
-            import soundfile as sf
-            audio_path = Path(job.dir) / "audio.wav"
-            sf.write(str(audio_path), audio_result.full_audio, audio_result.sample_rate)
-            logger.info(f"音频文件已保存: {audio_path}")
+            # 加载完整音频（用于双流对齐的 Audio Overlap 功能）
+            if audio_chunks:
+                sr = audio_chunks[0].sample_rate
+                full_audio, _ = librosa.load(job.input_path, sr=sr, mono=True)
+
+                # 保存音频文件供波形图使用
+                audio_path = Path(job.dir) / "audio.wav"
+                sf.write(str(audio_path), full_audio, sr)
+                logger.info(f"音频文件已保存: {audio_path}")
+            else:
+                raise RuntimeError("PreprocessingPipeline 未返回任何 AudioChunk")
 
             progress_tracker.complete_phase(ProcessPhase.EXTRACT)
 
             # 阶段 2: 双流对齐处理
-            total_chunks = len(audio_result.chunks)
+            total_chunks = len(audio_chunks)
             progress_tracker.start_phase(ProcessPhase.SENSEVOICE, total_chunks, "双流对齐...")
 
             if use_async_pipeline:
@@ -550,9 +568,9 @@ class JobQueueService:
 
                 # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
                 contexts = await async_pipeline.run(
-                    audio_chunks=audio_result.chunks,
-                    full_audio_array=audio_result.full_audio,
-                    full_audio_sr=audio_result.sample_rate
+                    audio_chunks=audio_chunks,
+                    full_audio_array=full_audio,
+                    full_audio_sr=sr
                 )
 
                 # 提取结果
@@ -571,7 +589,7 @@ class JobQueueService:
                 )
 
                 # 处理所有 Chunks（串行）
-                results = await dual_pipeline.run(audio_result.chunks)
+                results = await dual_pipeline.run(audio_chunks)
 
                 # 提取结果
                 all_sentences = []

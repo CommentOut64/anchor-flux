@@ -415,6 +415,8 @@ class TranscriptionService:
         初始化新架构 Pipeline（2025-12-17 架构改造）
 
         职责：组装 - 根据硬件配置初始化 AudioProcessingPipeline 和 AsyncDualPipeline
+
+        注意：PreprocessingPipeline 不在这里初始化，因为它需要动态配置（每个任务可能不同）
         """
         try:
             from app.pipelines.audio_processing_pipeline import (
@@ -423,7 +425,7 @@ class TranscriptionService:
             )
             from app.pipelines.async_dual_pipeline import AsyncDualPipeline
 
-            # 初始化音频处理流水线
+            # 初始化音频处理流水线（旧架构，保持向后兼容）
             audio_config = AudioProcessingConfig(
                 vad_config=VADConfig(),  # 使用默认 VAD 配置
                 enable_demucs=True,
@@ -458,31 +460,47 @@ class TranscriptionService:
         注意：此方法是简化版，暂不支持断点续传、任务状态管理等复杂功能
         这些功能将在后续阶段逐步集成
 
+        支持两种预处理模式：
+        - 新架构：PreprocessingPipeline（Stage模式，支持频谱分诊、按需分离、熔断回溯）
+        - 旧架构：AudioProcessingPipeline（整轨分离）
+
         Args:
             job: 任务状态对象
         """
         try:
             # 检查 Pipeline 是否初始化
-            if not self.audio_pipeline or not self.transcription_pipeline:
+            if not self.transcription_pipeline:
                 raise RuntimeError("Pipeline 未初始化")
 
             job_dir = Path(job.dir)
             input_path = job_dir / job.filename
 
             # ==========================================
-            # 阶段 1: 音频前处理（AudioProcessingPipeline）
+            # 阶段 1: 音频前处理
             # ==========================================
             self._update_progress(job, 'audio_processing', 0, '音频处理中...')
 
-            # 调用音频处理流水线
-            audio_result = await self.audio_pipeline.process(
-                video_path=str(input_path),
-                progress_callback=lambda p: self._update_progress(
-                    job, 'audio_processing', p, f'音频处理中 {int(p*100)}%'
-                )
-            )
+            # 判断使用哪种预处理架构
+            use_new_preprocessing = self._should_use_new_preprocessing(job.settings)
 
-            chunks = audio_result.chunks
+            if use_new_preprocessing:
+                # 使用新架构：PreprocessingPipeline（Stage模式）
+                self.logger.info("使用新架构预处理流水线（Stage模式）")
+                chunks = await self._run_new_preprocessing(job, input_path)
+            else:
+                # 使用旧架构：AudioProcessingPipeline（整轨分离）
+                self.logger.info("使用旧架构预处理流水线（整轨分离）")
+                if not self.audio_pipeline:
+                    raise RuntimeError("旧架构 Pipeline 未初始化")
+
+                audio_result = await self.audio_pipeline.process(
+                    video_path=str(input_path),
+                    progress_callback=lambda p: self._update_progress(
+                        job, 'audio_processing', p, f'音频处理中 {int(p*100)}%'
+                    )
+                )
+                chunks = audio_result.chunks
+
             job.total = len(chunks)
             self.logger.info(f"音频处理完成: {len(chunks)} 个 Chunk")
 
@@ -560,6 +578,82 @@ class TranscriptionService:
         millis = int((seconds % 1) * 1000)
 
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+    def _should_use_new_preprocessing(self, settings: JobSettings) -> bool:
+        """
+        判断是否使用新架构预处理流水线
+
+        判断逻辑：
+        - 如果启用了频谱分诊（enable_spectral_triage=True）
+        - 或者启用了熔断回溯（enable_fuse_breaker=True）
+        - 或者使用按需分离模式（separation_mode='on_demand'）
+        则使用新架构
+
+        Args:
+            settings: 任务设置
+
+        Returns:
+            bool: True表示使用新架构，False表示使用旧架构
+        """
+        preprocessing = settings.preprocessing
+
+        # 调试日志：输出配置值
+        self.logger.info(
+            f"预处理配置检查: "
+            f"enable_spectral_triage={preprocessing.enable_spectral_triage}, "
+            f"enable_fuse_breaker={preprocessing.enable_fuse_breaker}, "
+            f"separation_mode={preprocessing.separation_mode}"
+        )
+
+        # 检查是否启用了新功能
+        use_new = (
+            preprocessing.enable_spectral_triage or
+            preprocessing.enable_fuse_breaker or
+            preprocessing.separation_mode == 'on_demand'
+        )
+
+        self.logger.info(f"使用{'新' if use_new else '旧'}架构预处理流水线")
+
+        return use_new
+
+    async def _run_new_preprocessing(self, job: JobState, input_path: Path) -> List:
+        """
+        使用新架构预处理流水线处理音频
+
+        Args:
+            job: 任务状态对象
+            input_path: 输入文件路径
+
+        Returns:
+            List[AudioChunk]: 预处理完成的 Chunk 列表
+        """
+        from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
+
+        # 创建 PreprocessingPipeline 实例
+        preprocessing_pipeline = PreprocessingPipeline(
+            config=job.settings.preprocessing,
+            logger=self.logger
+        )
+
+        # 执行预处理
+        chunks = await preprocessing_pipeline.process(
+            video_path=str(input_path),
+            job_state=job
+        )
+
+        # 记录统计信息
+        stats = preprocessing_pipeline.get_statistics(chunks)
+        self.logger.info(
+            f"预处理统计: "
+            f"总chunk数={stats['total_chunks']}, "
+            f"需要分离={stats['need_separation']}, "
+            f"已分离={stats['separated']}, "
+            f"分离比例={stats['separation_ratio']:.2%}, "
+            f"熔断重试总次数={stats['fuse_retry_total']}, "
+            f"最大重试次数={stats['fuse_retry_max']}"
+        )
+
+        return chunks
 
     def _load_all_jobs_from_disk(self):
         """
@@ -3390,6 +3484,48 @@ class TranscriptionService:
         self.logger.info(f"Chunk 状态初始化完成")
         return states
 
+    def _convert_audio_chunks_to_states(
+        self,
+        audio_chunks: List['AudioChunk']
+    ) -> List['ChunkProcessState']:
+        """
+        将 AudioChunk 列表转换为 ChunkProcessState 列表
+
+        用于将新架构 PreprocessingPipeline 的输出转换为旧架构的数据结构，
+        以便复用现有的 _transcribe_chunk_with_fusing 方法。
+
+        Args:
+            audio_chunks: PreprocessingPipeline 输出的 AudioChunk 列表
+
+        Returns:
+            List[ChunkProcessState]: 转换后的 Chunk 状态列表
+        """
+        from app.models.circuit_breaker_models import ChunkProcessState
+        from app.services.audio.chunk_engine import AudioChunk
+
+        self.logger.info(f"转换 {len(audio_chunks)} 个 AudioChunk 到 ChunkProcessState...")
+
+        states = []
+        for chunk in audio_chunks:
+            state = ChunkProcessState(
+                chunk_index=chunk.index,
+                start_time=chunk.start,
+                end_time=chunk.end,
+                # 音频引用：original_audio 用于熔断回溯
+                original_audio=chunk.original_audio if chunk.original_audio is not None else chunk.audio.copy(),
+                current_audio=chunk.audio,
+                sample_rate=chunk.sample_rate,
+                # 分离状态
+                separation_level=chunk.separation_level,
+                separation_model_used=chunk.separation_model,
+                # 熔断状态
+                fuse_retry_count=chunk.fuse_retry_count,
+            )
+            states.append(state)
+
+        self.logger.info(f"AudioChunk 转换完成: {len(states)} 个 ChunkProcessState")
+        return states
+
     async def _transcribe_chunk_with_fusing(
         self,
         chunk_state: 'ChunkProcessState',
@@ -4258,10 +4394,8 @@ class TranscriptionService:
         from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
         from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
         from app.services.solution_matrix import SolutionConfig, TranslateMode
-        from app.services.audio_spectrum_classifier import get_spectrum_classifier
         from app.services.demucs_service import get_demucs_service
         from app.services.sse_service import get_sse_manager
-        from app.models.circuit_breaker_models import SeparationLevel
         from pathlib import Path
 
         def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
@@ -4291,70 +4425,52 @@ class TranscriptionService:
         progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
 
         try:
-            # 1. 音频提取（使用新架构方法）
-            progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "提取音频...")
-            import librosa
-            audio_array, sr = librosa.load(job.input_path, sr=16000, mono=True)
-            self.logger.info(f"音频加载完成: {len(audio_array)/sr:.2f}秒")
-
-            # 保存音频文件供波形图使用
+            # ========== 新架构：使用 PreprocessingPipeline ==========
+            # 统一执行：音频提取 + VAD切分 + 频谱分诊 + 按需分离
+            from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
             import soundfile as sf
-            audio_path = Path(job.dir) / "audio.wav"
-            sf.write(str(audio_path), audio_array, sr)
-            self.logger.info(f"音频文件已保存: {audio_path}")
 
+            self.logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
+
+            # 创建预处理流水线
+            preprocessing_pipeline = PreprocessingPipeline(
+                config=job.settings.preprocessing,
+                logger=self.logger
+            )
+
+            # 执行预处理（包含：音频提取、VAD、频谱分诊、按需分离）
+            progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "预处理流水线...")
+            audio_chunks = await preprocessing_pipeline.process(
+                video_path=job.input_path,
+                job_state=job
+            )
             progress_tracker.complete_phase(ProcessPhase.EXTRACT)
 
-            # 2. VAD 物理切分 + Post-VAD 智能合并（使用新架构 VADService）
-            progress_tracker.start_phase(ProcessPhase.VAD, 1, "VAD 切分...")
-            from app.services.audio.vad_service import get_vad_service, VADConfig
-            vad_service = get_vad_service(self.logger)
-            vad_config = VADConfig()  # 使用默认参数（已恢复到旧值）
-            vad_segments = vad_service.detect_speech_segments(
-                audio_array, sr, vad_config, enable_merge=True
+            # 获取预处理统计信息
+            stats = preprocessing_pipeline.get_statistics(audio_chunks)
+            self.logger.info(
+                f"PreprocessingPipeline 完成: "
+                f"总chunk数={stats['total_chunks']}, "
+                f"需要分离={stats['need_separation']}, "
+                f"已分离={stats['separated']}, "
+                f"分离比例={stats['separation_ratio']:.2%}"
             )
-            progress_tracker.complete_phase(ProcessPhase.VAD)
 
-            # 3. 频谱分诊（Chunk级别）
-            progress_tracker.start_phase(ProcessPhase.BGM_DETECT, 1, "频谱分诊...")
-            spectrum_classifier = get_spectrum_classifier()
-            diagnoses = spectrum_classifier.diagnose_chunks(
-                [(audio_array[int(s['start']*sr):int(s['end']*sr)], s['start'], s['end'])
-                 for s in vad_segments],
-                sr=sr
-            )
-            progress_tracker.complete_phase(ProcessPhase.BGM_DETECT)
+            # 保存音频文件供波形图使用（从第一个chunk获取采样率）
+            if audio_chunks:
+                sr = audio_chunks[0].sample_rate
+                # 重新加载完整音频用于保存（PreprocessingPipeline内部已处理）
+                import librosa
+                audio_array, _ = librosa.load(job.input_path, sr=sr, mono=True)
+                audio_path = Path(job.dir) / "audio.wav"
+                sf.write(str(audio_path), audio_array, sr)
+                self.logger.info(f"音频文件已保存: {audio_path}")
 
-            # 4. 初始化 Chunk 状态 + 按需人声分离
-            chunk_states = self._init_chunk_states(vad_segments, audio_array, sr)
+            # 转换 AudioChunk 到 ChunkProcessState（兼容现有转录流程）
+            chunk_states = self._convert_audio_chunks_to_states(audio_chunks)
+
+            # 获取 demucs_service 引用（用于熔断回溯）
             demucs_service = get_demucs_service()
-
-            chunks_to_separate = [(i, chunk_states[i], diagnoses[i])
-                                  for i in range(len(diagnoses))
-                                  if diagnoses[i].need_separation]
-
-            if chunks_to_separate:
-                progress_tracker.start_phase(ProcessPhase.DEMUCS, len(chunks_to_separate), "人声分离...")
-                for sep_idx, (chunk_idx, chunk_state, diag) in enumerate(chunks_to_separate):
-                    # 执行分离，更新 current_audio
-                    separated_audio = demucs_service.separate_chunk(
-                        audio=chunk_state.original_audio,
-                        model=diag.recommended_model,
-                        sr=sr
-                    )
-                    chunk_state.current_audio = separated_audio
-                    chunk_state.separation_level = (
-                        SeparationLevel.HTDEMUCS if diag.recommended_model == "htdemucs"
-                        else SeparationLevel.MDX_EXTRA
-                    )
-                    chunk_state.separation_model_used = diag.recommended_model
-                    progress_tracker.update_phase(ProcessPhase.DEMUCS, increment=1)
-                progress_tracker.complete_phase(ProcessPhase.DEMUCS)
-            else:
-                # 没有 Chunk 需要分离，卸载 Demucs 模型释放显存
-                if demucs_service.is_model_loaded():
-                    self.logger.info("所有 Chunk 均为纯净人声，卸载 Demucs 模型释放显存")
-                    demucs_service.unload_model()
 
             # 5. 逐Chunk转录 + 熔断回溯（转录层核心）
             progress_tracker.start_phase(ProcessPhase.SENSEVOICE, len(chunk_states), "SenseVoice 转录...")
