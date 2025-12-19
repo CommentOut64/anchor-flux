@@ -156,7 +156,8 @@ class ProjectConfig:
             # 720p 高清参数（平衡质量和速度）
             "proxy_720p": {
                 "scale": 720,
-                "preset": "fast",
+                "preset": "fast",              # CPU 编码预设
+                "preset_nvenc": "p4",          # NVENC 编码预设 (p1-p7, p4 为质量和速度平衡)
                 "crf": 23,
                 "gop": 30,
                 "keyint_min": 15,
