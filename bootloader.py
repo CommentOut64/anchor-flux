@@ -274,7 +274,7 @@ def start_services(env):
 
 if __name__ == "__main__":
     print("="*40)
-    print("   Video to SRT GPU - 智能启动器")
+    print("   AnchorFlux - 智能启动器")
     print("="*40)
     
     # 1. 智能依赖同步（检测 requirements.txt 变化并自动安装/更新）

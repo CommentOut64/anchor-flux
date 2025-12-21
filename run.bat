@@ -5,7 +5,7 @@ title Video to SRT GPU
 
 echo.
 echo ========================================
-echo   Video to SRT GPU - Starting...
+echo   AnchorFlux - Starting...
 echo ========================================
 echo.
 

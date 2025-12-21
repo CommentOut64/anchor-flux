@@ -34,7 +34,9 @@ const router = createRouter({
 
 // 全局前置守卫 - 设置页面标题
 router.beforeEach((to, from, next) => {
-  document.title = to.meta.title ? `${to.meta.title} - VideoSRT` : 'VideoSRT'
+  document.title = to.meta.title
+    ? `${to.meta.title} - AnchorFlux`
+    : "AnchorFlux";
   next()
 })
 

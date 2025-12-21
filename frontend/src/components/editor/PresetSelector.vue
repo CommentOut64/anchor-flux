@@ -60,7 +60,7 @@
       <div class="module-card">
         <div class="module-header">
           <span class="module-icon">1</span>
-          <span class="module-title">前处理 (Demucs)</span>
+          <span class="module-title">前处理 (人声分离)</span>
         </div>
         <div class="module-options">
           <label
@@ -114,28 +114,23 @@
         </div>
       </div>
 
-      <!-- 模块三: 增强 -->
-      <div class="module-card">
+      <!-- 模块三: 增强 (LLM 暂未集成，整体禁用) -->
+      <div class="module-card module-disabled" title="LLM 功能暂未集成，敬请期待">
         <div class="module-header">
           <span class="module-icon">3</span>
-          <span class="module-title">增强 (LLM)</span>
+          <span class="module-title">增强 (LLM) - 暂未集成</span>
         </div>
         <div class="module-options">
           <label
             v-for="option in llmOptions"
             :key="option.value"
-            class="option-item"
-            :class="{
-              active: getLLMOptionValue() === option.value,
-              disabled: option.disabled
-            }"
+            class="option-item disabled"
           >
             <input
               type="radio"
               :value="option.value"
               :checked="getLLMOptionValue() === option.value"
-              :disabled="option.disabled"
-              @change="setLLMOption(option.value)"
+              disabled
             />
             <span class="option-label">{{ option.label }}</span>
             <span v-if="option.hint" class="option-hint">{{ option.hint }}</span>
@@ -228,7 +223,8 @@ const macroPresets = [
     minVram: 1500,
     requiresGpu: false,
     config: {
-      preprocessing: { demucs_strategy: 'off' },
+      // 直通模式: 完全跳过频谱分诊和人声分离
+      preprocessing: { demucs_strategy: 'off', enable_spectral_triage: false },
       transcription: { transcription_profile: 'sensevoice_only' },
       refinement: { llm_task: 'off', llm_scope: 'sparse' }
     }
@@ -241,7 +237,8 @@ const macroPresets = [
     minVram: 4000,
     requiresGpu: true,
     config: {
-      preprocessing: { demucs_strategy: 'auto' },
+      // 智能模式: 启用频谱分诊，按需分离
+      preprocessing: { demucs_strategy: 'auto', enable_spectral_triage: true },
       transcription: { transcription_profile: 'sv_whisper_patch' },
       refinement: { llm_task: 'proofread', llm_scope: 'sparse' }
     }
@@ -254,7 +251,8 @@ const macroPresets = [
     minVram: 8000,
     requiresGpu: true,
     config: {
-      preprocessing: { demucs_strategy: 'force_on' },
+      // 极致模式: 强制全分离，频谱分诊可跳过（因为会强制分离）
+      preprocessing: { demucs_strategy: 'force_on', enable_spectral_triage: false },
       transcription: { transcription_profile: 'sv_whisper_dual' },
       refinement: { llm_task: 'proofread', llm_scope: 'global' }
     }
@@ -265,20 +263,20 @@ const macroPresets = [
 const demucsOptions = computed(() => [
   {
     value: 'off',
-    label: '直通 (不处理)',
-    hint: '最快速度',
+    label: '直通',
+    hint: '不分离，最快速度',
     disabled: false
   },
   {
     value: 'auto',
-    label: '智能分诊 (Auto)',
-    hint: '按需处理',
+    label: '智能分诊',
+    hint: '智能判断',
     disabled: false
   },
   {
     value: 'force_on',
-    label: '极致分离 (Pro)',
-    hint: '最高质量',
+    label: '极致分离',
+    hint: '全局分离，最高质量',
     disabled: !hasGpu.value || vramMB.value < 6000
   }
 ])
@@ -287,20 +285,20 @@ const demucsOptions = computed(() => [
 const transcriptionOptions = computed(() => [
   {
     value: 'sensevoice_only',
-    label: '极速 (SenseVoice)',
-    hint: '仅主引擎',
+    label: '极速',
+    hint: '仅SenseVoice',
     disabled: false
   },
   {
     value: 'sv_whisper_patch',
-    label: '智能补刀 (SV+Whs)',
-    hint: '平衡方案',
+    label: '智能补刀',
+    hint: 'SenseVoice+Whisper补刀',
     disabled: !hasGpu.value
   },
   {
     value: 'sv_whisper_dual',
-    label: '双流精校 (Hybrid)',
-    hint: '最高精度',
+    label: '双流精校',
+    hint: '最高精度(很慢不推荐)',
     disabled: !hasGpu.value || vramMB.value < 8000
   }
 ])
@@ -471,6 +469,17 @@ function selectMacroPreset(presetId) {
 
 // 模块选项变更时检查是否匹配预设
 function onModuleChange() {
+  // 根据 demucs_strategy 自动推导 enable_spectral_triage
+  // - off: 直通模式，跳过频谱分诊
+  // - auto: 智能模式，启用频谱分诊
+  // - force_on: 强制分离，跳过频谱分诊（因为会强制分离所有chunk）
+  const strategy = localConfig.value.preprocessing.demucs_strategy
+  if (strategy === 'off' || strategy === 'force_on') {
+    localConfig.value.preprocessing.enable_spectral_triage = false
+  } else {
+    localConfig.value.preprocessing.enable_spectral_triage = true
+  }
+
   // 检查当前配置是否匹配某个预设
   const matchedPreset = macroPresets.find(preset => {
     return (
@@ -729,6 +738,17 @@ onMounted(async () => {
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   padding: 10px;
+
+  // 整体禁用状态（LLM 模块暂未集成）
+  &.module-disabled {
+    opacity: 0.5;
+    pointer-events: none;
+    cursor: not-allowed;
+
+    .module-title {
+      color: var(--text-muted);
+    }
+  }
 
   .module-header {
     display: flex;
