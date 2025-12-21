@@ -249,6 +249,10 @@ class JobQueueService:
         """
         取消任务（支持删除已完成的任务）
 
+        V3.6.3 修复：
+        - 删除数据时同步清理内存中的 self.jobs[job_id]
+        - 广播 job_removed 事件，解决幽灵任务问题
+
         Args:
             job_id: 任务ID
             delete_data: 是否删除任务数据
@@ -265,8 +269,8 @@ class JobQueueService:
                 try:
                     result = self.transcription_service.cancel_job(job_id, delete_data=True)
                     if result:
-                        # 推送全局SSE通知（通知前端任务已删除）
-                        self._notify_job_status(job_id, "canceled")
+                        # [V3.6.3] 推送任务删除事件（而非仅状态变更）
+                        self._notify_job_removed(job_id)
                         return True
                 except Exception as e:
                     logger.warning(f"删除任务 {job_id} 失败: {e}")
@@ -286,6 +290,12 @@ class JobQueueService:
         # 如果需要删除数据，调用transcription_service的清理逻辑
         if delete_data:
             result = self.transcription_service.cancel_job(job_id, delete_data=True)
+
+            # [V3.6.3] 从内存中彻底移除任务，防止幽灵任务
+            with self.lock:
+                if job_id in self.jobs:
+                    del self.jobs[job_id]
+                    logger.info(f"[幽灵任务修复] 已从内存移除任务: {job_id}")
         else:
             result = True
             # 不删除数据时，保存任务元信息
@@ -294,12 +304,16 @@ class JobQueueService:
         # 保存队列状态
         self._save_state()
 
-        # 推送全局SSE通知
-        self._notify_queue_change()
-        self._notify_job_status(job_id, job.status)
-
-        # 同时推送到单任务频道，确保 EditorView 能收到
-        self._notify_job_signal(job_id, "job_canceled")
+        # [V3.6.3] 根据是否删除数据，推送不同事件
+        if delete_data:
+            # 推送 job_removed 事件（任务被彻底删除）
+            self._notify_job_removed(job_id)
+        else:
+            # 推送状态变更事件（任务仍存在）
+            self._notify_queue_change()
+            self._notify_job_status(job_id, job.status)
+            # 同时推送到单任务频道，确保 EditorView 能收到
+            self._notify_job_signal(job_id, "job_canceled")
 
         return result
 
@@ -448,6 +462,11 @@ class JobQueueService:
 
                     # 保存队列状态
                     self._save_state()
+
+                    # 6. 任务完成后触发720p转码检查（V3.6.2新增）
+                    # 解决: 360p完成时如果队列繁忙就不触发720p，导致队列空闲后也不再检查
+                    if job.status == "finished":
+                        self._trigger_720p_check_after_job_complete(job.job_id)
 
             except Exception as e:
                 logger.error(f"Worker循环异常: {e}", exc_info=True)
@@ -678,6 +697,82 @@ class JobQueueService:
             # 预触发失败不影响主流程
             logger.warning(f"[Proxy预生成] 预触发失败，忽略: {e}")
 
+    def _trigger_720p_check_after_job_complete(self, completed_job_id: str):
+        """
+        任务完成后触发720p转码检查（V3.6.2新增）
+
+        解决问题:
+        - 360p完成时如果队列繁忙（有转录任务正在执行），就不会安排720p检查
+        - 之后队列变空闲，但没有任何机制重新触发720p检查
+        - 此方法在每个任务完成后检查是否有待处理的720p转码
+
+        策略:
+        1. 扫描所有已完成任务的目录
+        2. 找到有360p但没有720p的任务
+        3. 触发720p转码
+        """
+        try:
+            from app.services.media_prep_service import get_media_prep_service
+            from app.core.config import config
+            from pathlib import Path
+
+            media_prep = get_media_prep_service()
+            jobs_root = config.JOBS_DIR
+
+            if not jobs_root.exists():
+                return
+
+            triggered_count = 0
+
+            # 扫描所有任务目录
+            for job_dir in jobs_root.iterdir():
+                if not job_dir.is_dir():
+                    continue
+
+                job_id = job_dir.name
+                preview_360p = job_dir / "preview_360p.mp4"
+                proxy_720p = job_dir / "proxy_720p.mp4"
+
+                # 条件: 有360p但没有720p
+                if not preview_360p.exists():
+                    continue
+                if proxy_720p.exists():
+                    continue
+
+                # 检查720p是否已在队列中
+                proxy_status = media_prep.get_proxy_status(job_id)
+                if proxy_status and proxy_status.get("status") in ["queued", "processing"]:
+                    continue
+
+                # 找到视频文件
+                video_file = None
+                video_exts = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm', '.flv', '.m4v']
+                for file in job_dir.iterdir():
+                    if file.is_file() and file.suffix.lower() in video_exts:
+                        # 跳过preview和proxy文件
+                        if file.name.startswith(('preview_', 'proxy_')):
+                            continue
+                        video_file = file
+                        break
+
+                if not video_file:
+                    continue
+
+                # 触发720p转码（低优先级，让新任务优先）
+                logger.info(f"[720p触发] 任务完成后发现待处理的720p: {job_id}")
+                media_prep.enqueue_proxy(job_id, video_file, proxy_720p, priority=15)
+                triggered_count += 1
+
+                # 一次只触发一个，避免阻塞
+                break
+
+            if triggered_count > 0:
+                logger.info(f"[720p触发] 已触发 {triggered_count} 个720p转码任务")
+
+        except Exception as e:
+            # 720p触发失败不影响主流程
+            logger.debug(f"[720p触发] 检查失败（非致命）: {e}")
+
     def _cleanup_resources(self):
         """
         资源大清洗（增强版）
@@ -835,6 +930,29 @@ class JobQueueService:
 
         self.sse_manager.broadcast_sync(f"job:{job_id}", f"signal.{signal}", data)
         logger.debug(f"[单任务SSE] 推送信号: {job_id[:8]}... -> signal.{signal}")
+
+    def _notify_job_removed(self, job_id: str):
+        """
+        通知前端任务已被彻底删除（V3.6.3 新增）
+
+        解决幽灵任务问题：当任务被删除时，广播此事件让前端移除任务卡片，
+        避免 syncTasksFromBackend 时因缓存数据不一致导致任务"复活"。
+
+        Args:
+            job_id: 被删除的任务ID
+        """
+        data = {
+            "job_id": job_id,
+            "timestamp": time.time()
+        }
+
+        # 广播到全局频道
+        self.sse_manager.broadcast_sync("global", "job_removed", data)
+
+        # 同时推送队列变化
+        self._notify_queue_change()
+
+        logger.info(f"[幽灵任务修复] 已广播任务删除事件: {job_id}")
 
     def _load_settings(self):
         """加载队列设置"""

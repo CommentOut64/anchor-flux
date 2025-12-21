@@ -67,6 +67,11 @@ class SSEChannelManager extends EventEmitter {
         // 使用 data.id 而非 data.job_id，兼容全局频道的字段名
         handlers.onJobProgress?.(data.id || data.job_id, percent, { ...data, percent })
       },
+      // [V3.6.3] 新增：任务删除事件，解决幽灵任务问题
+      job_removed: (data) => {
+        console.log('[SSE Global] 任务删除:', data.job_id)
+        handlers.onJobRemoved?.(data.job_id)
+      },
       connected: (data) => {
         console.log('[SSE Global] 连接成功:', data)
         handlers.onConnected?.(data)

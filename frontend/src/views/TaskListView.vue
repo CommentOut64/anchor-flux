@@ -727,11 +727,15 @@ async function deleteTask(jobId) {
       // 这有助于修复幽灵任务问题
     }
 
-    // 从本地 store 中删除
+    // [V3.6.3] 优化：立即从本地删除，不再立即调用 syncTasksFromBackend
+    // 依赖 SSE job_removed 事件确保一致性
     await taskStore.deleteTask(jobId);
 
-    // 修复：删除完成后立即从后端同步任务列表（确保 UI 及时更新）
-    await taskStore.syncTasksFromBackend();
+    // [V3.6.3] 延迟同步作为兜底机制
+    // 如果 SSE 事件丢失，1秒后的同步可以保证最终一致性
+    setTimeout(() => {
+      taskStore.syncTasksFromBackend();
+    }, 1000);
 
     ElMessage.success("任务已删除");
   } catch (error) {

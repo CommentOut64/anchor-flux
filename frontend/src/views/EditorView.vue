@@ -284,34 +284,51 @@ watch(() => proxyVideo.state.value, (newState, oldState) => {
 // 【修复】过滤掉看起来像 UUID/16进制 的名称
 const projectName = computed(() => {
   // 检查是否看起来像 UUID（16进制字符串）
+  // 匹配: 纯16进制字符串（8-36位），或带连字符的UUID格式
   const isUuidLike = (str) => {
     if (!str) return true
-    // 匹配纯16进制字符串（8-36位）
-    return /^[0-9a-f]{8,36}$/i.test(str.replace(/-/g, ''))
+    const cleaned = str.replace(/-/g, '')
+    // 必须是纯16进制字符，且长度在8-36位之间
+    return /^[0-9a-f]{8,36}$/i.test(cleaned)
   }
 
-  // 优先使用用户自定义的 title
-  if (projectStore.meta.title && !isUuidLike(projectStore.meta.title)) {
-    return projectStore.meta.title
-  }
-
-  // 使用 filename（去除扩展名）
-  const filename = projectStore.meta.filename
-  if (filename && !isUuidLike(filename)) {
+  // 从 filename 提取不带扩展名的名称
+  const getDisplayName = (filename) => {
+    if (!filename) return null
     const lastDotIndex = filename.lastIndexOf('.')
     return lastDotIndex > 0 ? filename.substring(0, lastDotIndex) : filename
   }
 
-  // 尝试从 taskStore 获取
+  // 1. 优先使用用户自定义的 title（非UUID）
+  if (projectStore.meta.title && !isUuidLike(projectStore.meta.title)) {
+    return projectStore.meta.title
+  }
+
+  // 2. 使用 filename（去除扩展名，非UUID）
+  const filename = projectStore.meta.filename
+  const displayName = getDisplayName(filename)
+  if (displayName && !isUuidLike(displayName)) {
+    return displayName
+  }
+
+  // 3. 尝试从 taskStore 获取（优先 title，其次 filename）
   const task = taskStore.tasks.find(t => t.job_id === props.jobId)
   if (task) {
+    // 优先使用 task.title
     if (task.title && !isUuidLike(task.title)) {
       return task.title
     }
-    if (task.filename && !isUuidLike(task.filename)) {
-      const lastDotIndex = task.filename.lastIndexOf('.')
-      return lastDotIndex > 0 ? task.filename.substring(0, lastDotIndex) : task.filename
+    // 其次使用 task.filename
+    const taskDisplayName = getDisplayName(task.filename)
+    if (taskDisplayName && !isUuidLike(taskDisplayName)) {
+      return taskDisplayName
     }
+  }
+
+  // 4. 最后尝试使用 filename 本身（即使看起来像UUID，也比"未命名项目"好）
+  // 但如果 filename 就是 job_id（完全匹配），则显示"未命名项目"
+  if (displayName && displayName !== props.jobId && displayName !== props.jobId.replace(/-/g, '')) {
+    return displayName
   }
 
   return '未命名项目'

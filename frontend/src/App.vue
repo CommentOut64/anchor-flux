@@ -153,6 +153,23 @@ onMounted(async () => {
       })
     },
 
+    // [V3.6.3] 新增：任务删除事件处理，解决幽灵任务问题
+    onJobRemoved(jobId) {
+      console.log(`[App] 收到任务删除事件: ${jobId}`)
+
+      // 更新心跳
+      taskStore.updateSSEHeartbeat()
+
+      // 从 store 中彻底移除任务
+      taskStore.deleteTask(jobId)
+
+      // 如果当前在该任务的编辑器页面，跳转回任务列表
+      if (route.path === `/editor/${jobId}`) {
+        console.log(`[App] 当前任务已删除，跳转回任务列表`)
+        router.push('/tasks')
+      }
+    },
+
     onConnected(data) {
       console.log('[App] 全局 SSE 连接成功:', data)
 

@@ -801,8 +801,16 @@ def create_transcription_router(
         all_tasks = {}  # 使用 dict 避免重复，key 为 job_id
 
         # 1. 队列中的任务（处理中或等待中）- 优先级最高
+        # [V3.6.3] 过滤幽灵任务：检测目录是否存在，不存在则从内存移除
+        ghost_job_ids = []
         with queue_service.lock:
-            for job_id, job in queue_service.jobs.items():
+            for job_id, job in list(queue_service.jobs.items()):
+                job_dir = jobs_root / job_id
+                if not job_dir.exists():
+                    # 检测到幽灵任务
+                    ghost_job_ids.append(job_id)
+                    continue
+
                 all_tasks[job_id] = {
                     "id": job.job_id,
                     "filename": job.filename,
@@ -813,6 +821,17 @@ def create_transcription_router(
                     "created_time": job.createdAt if hasattr(job, 'createdAt') else None,
                     "phase": job.phase if hasattr(job, 'phase') else 'unknown'
                 }
+
+        # [V3.6.3] 清理检测到的幽灵任务
+        if ghost_job_ids:
+            logger = logging.getLogger(__name__)
+            with queue_service.lock:
+                for ghost_id in ghost_job_ids:
+                    if ghost_id in queue_service.jobs:
+                        del queue_service.jobs[ghost_id]
+                    if ghost_id in queue_service.queue:
+                        queue_service.queue.remove(ghost_id)
+            logger.warning(f"[sync_tasks] 清理了 {len(ghost_job_ids)} 个幽灵任务: {ghost_job_ids}")
 
         # 2. 扫描 jobs 目录中的所有任务（包括已完成的）
         try:
