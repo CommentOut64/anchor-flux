@@ -1,6 +1,10 @@
 """
 任务队列管理服务 - V2.4
 核心功能: 串行执行，防止并发OOM，队列持久化，插队功能
+
+V3.7 更新:
+- 集成 CancellationToken 机制，支持协作式取消/暂停
+- 在原子区域内的暂停/取消请求会被延迟执行
 """
 import threading
 import time
@@ -18,6 +22,12 @@ import torch
 from app.models.job_models import JobState
 from app.services.sse_service import get_sse_manager
 from app.services.config_adapter import ConfigAdapter
+from app.utils.cancellation_token import (
+    CancellationToken,
+    CancelledException,
+    PausedException,
+    create_cancellation_token
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +114,9 @@ class JobQueueService:
         # 插队设置
         self._default_prioritize_mode: PrioritizeMode = "gentle"  # 默认插队模式
 
+        # [V3.7] 取消令牌注册表
+        self.cancellation_tokens: Dict[str, CancellationToken] = {}
+
         # 依赖服务
         self.transcription_service = transcription_service
         self.sse_manager = get_sse_manager()
@@ -163,6 +176,8 @@ class JobQueueService:
         """
         暂停任务
 
+        V3.7 更新: 集成 CancellationToken，触发协作式暂停
+
         Args:
             job_id: 任务ID
 
@@ -179,7 +194,14 @@ class JobQueueService:
                 job.paused = True
                 job.status = "paused"  # 立即更新状态，确保SSE推送正确的状态
                 job.message = "暂停中..."
-                logger.info(f"设置暂停标志: {job_id}")
+
+                # [V3.7] 触发取消令牌的暂停
+                token = self.cancellation_tokens.get(job_id)
+                if token:
+                    token.pause()
+                    logger.info(f"[V3.7] 已触发取消令牌暂停: {job_id}")
+                else:
+                    logger.info(f"设置暂停标志: {job_id}")
             elif job_id in self.queue:
                 # 还在排队的任务：直接从队列移除
                 self.queue.remove(job_id)
@@ -203,6 +225,8 @@ class JobQueueService:
     def resume_job(self, job_id: str) -> bool:
         """
         恢复暂停的任务（重新加入队列）
+
+        V3.7 更新: 清除取消令牌的暂停状态
 
         与 restore_job 不同：
         - resume_job: 恢复暂停的任务，重新加入队列尾部
@@ -230,7 +254,14 @@ class JobQueueService:
             job.status = "queued"
             job.paused = False
             job.message = f"已恢复，排队中 (位置: {len(self.queue)})"
-            logger.info(f"恢复暂停任务: {job_id}")
+
+            # [V3.7] 清除取消令牌的暂停状态
+            token = self.cancellation_tokens.get(job_id)
+            if token:
+                token.resume()
+                logger.info(f"[V3.7] 已恢复取消令牌: {job_id}")
+            else:
+                logger.info(f"恢复暂停任务: {job_id}")
 
         # 保存队列状态和任务元信息
         self._save_state()
@@ -253,6 +284,9 @@ class JobQueueService:
         - 删除数据时同步清理内存中的 self.jobs[job_id]
         - 广播 job_removed 事件，解决幽灵任务问题
 
+        V3.7 更新:
+        - 集成 CancellationToken，触发协作式取消
+
         Args:
             job_id: 任务ID
             delete_data: 是否删除任务数据
@@ -271,6 +305,8 @@ class JobQueueService:
                     if result:
                         # [V3.6.3] 推送任务删除事件（而非仅状态变更）
                         self._notify_job_removed(job_id)
+                        # [V3.7] 清理取消令牌
+                        self._remove_cancellation_token(job_id)
                         return True
                 except Exception as e:
                     logger.warning(f"删除任务 {job_id} 失败: {e}")
@@ -280,6 +316,12 @@ class JobQueueService:
             # 设置取消标志
             job.canceled = True
             job.message = "取消中..."
+
+            # [V3.7] 触发取消令牌的取消
+            token = self.cancellation_tokens.get(job_id)
+            if token:
+                token.cancel()
+                logger.info(f"[V3.7] 已触发取消令牌取消: {job_id}")
 
             # 如果在队列中，移除
             if job_id in self.queue:
@@ -296,6 +338,9 @@ class JobQueueService:
                 if job_id in self.jobs:
                     del self.jobs[job_id]
                     logger.info(f"[幽灵任务修复] 已从内存移除任务: {job_id}")
+
+            # [V3.7] 清理取消令牌
+            self._remove_cancellation_token(job_id)
         else:
             result = True
             # 不删除数据时，保存任务元信息
@@ -372,6 +417,10 @@ class JobQueueService:
                     if job:
                         self.transcription_service.save_job_meta(job)
 
+                    # [V3.7] 创建取消令牌
+                    token = self._create_cancellation_token(self.running_job_id)
+                    logger.debug(f"[V3.7] 已创建取消令牌: {self.running_job_id}")
+
                 # 2. 如果没有任务，休眠后继续
                 if self.running_job_id is None:
                     time.sleep(1)
@@ -420,17 +469,32 @@ class JobQueueService:
                         job.message = "完成"
                         logger.info(f"任务完成: {self.running_job_id}")
 
+                except CancelledException as e:
+                    # [V3.7] 捕获取消异常
+                    job.status = "canceled"
+                    job.message = "已取消"
+                    logger.info(f"[V3.7] 任务被取消: {e.job_id}")
+
+                except PausedException as e:
+                    # [V3.7] 捕获暂停异常
+                    job.status = "paused"
+                    job.message = "已暂停"
+                    logger.info(f"[V3.7] 任务已暂停: {e.job_id}")
+
                 except Exception as e:
                     job.status = "failed"
                     job.message = f"失败: {e}"
                     job.error = str(e)
-                    logger.error(f"❌ 任务执行失败: {self.running_job_id} - {e}", exc_info=True)
+                    logger.error(f"任务执行失败: {self.running_job_id} - {e}", exc_info=True)
 
                 finally:
                     # 4. 清理资源（关键！）
                     finished_job_id = self.running_job_id
                     with self.lock:
                         self.running_job_id = None
+
+                    # [V3.7] 清理取消令牌
+                    self._remove_cancellation_token(finished_job_id)
 
                     # 资源大清洗
                     self._cleanup_resources()
@@ -953,6 +1017,51 @@ class JobQueueService:
         self._notify_queue_change()
 
         logger.info(f"[幽灵任务修复] 已广播任务删除事件: {job_id}")
+
+    # ==================== V3.7 取消令牌管理 ====================
+
+    def _create_cancellation_token(self, job_id: str) -> CancellationToken:
+        """
+        创建任务的取消令牌
+
+        Args:
+            job_id: 任务ID
+
+        Returns:
+            CancellationToken: 新创建的取消令牌
+        """
+        # 如果已存在，先清理
+        if job_id in self.cancellation_tokens:
+            logger.warning(f"[V3.7] 取消令牌已存在，覆盖: {job_id}")
+
+        token = create_cancellation_token(job_id)
+        self.cancellation_tokens[job_id] = token
+        return token
+
+    def _remove_cancellation_token(self, job_id: str):
+        """
+        移除任务的取消令牌
+
+        Args:
+            job_id: 任务ID
+        """
+        if job_id and job_id in self.cancellation_tokens:
+            del self.cancellation_tokens[job_id]
+            logger.debug(f"[V3.7] 已移除取消令牌: {job_id}")
+
+    def get_cancellation_token(self, job_id: str) -> Optional[CancellationToken]:
+        """
+        获取任务的取消令牌
+
+        供流水线等组件使用。
+
+        Args:
+            job_id: 任务ID
+
+        Returns:
+            Optional[CancellationToken]: 取消令牌，不存在则返回 None
+        """
+        return self.cancellation_tokens.get(job_id)
 
     def _load_settings(self):
         """加载队列设置"""
