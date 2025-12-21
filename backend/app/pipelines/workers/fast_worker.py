@@ -13,6 +13,9 @@ FastWorker - 快流推理 Worker（CPU）
 - 分句策略：主要依赖 VAD 停顿，不依赖标点
 - 语义分组：依赖物理约束（时间间隔、句子长度）
 - 熔断回溯：低置信度+BGM标签时自动升级分离
+
+V3.5 更新：
+- 支持 is_final_output 参数，极速模式下直接输出定稿
 """
 import logging
 from typing import Dict, List, Optional, Any
@@ -47,12 +50,14 @@ class FastWorker:
         draft_group_config: Optional[GroupConfig] = None,
         enable_semantic_grouping: bool = True,
         sensevoice_executor: Optional[SenseVoiceExecutor] = None,
-        # 熔断回溯相关参数（新增）
+        # 熔断回溯相关参数
         enable_fuse_breaker: bool = False,
         fuse_max_retry: int = 2,
         fuse_confidence_threshold: float = 0.5,
         fuse_auto_upgrade: bool = True,
         demucs_service: Optional[DemucsService] = None,
+        # V3.5: 极速模式参数
+        is_final_output: bool = False,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -70,12 +75,17 @@ class FastWorker:
             fuse_confidence_threshold: 熔断置信度阈值
             fuse_auto_upgrade: 第二次重试是否自动升级到最强模型
             demucs_service: Demucs服务实例
+            is_final_output: 是否为最终输出（极速模式下为True，输出定稿而非草稿）
             logger: 日志记录器
         """
         self.job_id = job_id
         self.sensevoice_language = sensevoice_language
         self.enable_semantic_grouping = enable_semantic_grouping
+        self.is_final_output = is_final_output
         self.logger = logger or logging.getLogger(__name__)
+
+        if is_final_output:
+            self.logger.info("FastWorker 运行在极速模式：输出为定稿")
 
         # 初始化执行器
         self.sensevoice_executor = sensevoice_executor or SenseVoiceExecutor()
@@ -149,7 +159,7 @@ class FastWorker:
 
     async def _process_without_fuse(self, ctx: ProcessingContext):
         """
-        不带熔断回溯的处理流程（原有逻辑）
+        不带熔断回溯的处理流程
 
         Args:
             ctx: 处理上下文
@@ -162,14 +172,23 @@ class FastWorker:
         ctx.sv_result = sv_result
 
         # 阶段 2: 分句（Layer 1 + Layer 2）
-        draft_sentences = self._split_sentences(sv_result, chunk, is_draft=True)
+        # 极速模式下 is_draft=False，表示这是定稿
+        is_draft = not self.is_final_output
+        sentences = self._split_sentences(sv_result, chunk, is_draft=is_draft)
 
-        # 阶段 3: 立即推送草稿（关键：不等待 Whisper）
-        self.subtitle_manager.add_draft_sentences(ctx.chunk_index, draft_sentences)
-
-        self.logger.info(
-            f"Chunk {ctx.chunk_index}: 草稿已推送 ({len(draft_sentences)} 个句子)"
-        )
+        # 阶段 3: 推送
+        if self.is_final_output:
+            # 极速模式：推送定稿
+            self.subtitle_manager.add_finalized_sentences(ctx.chunk_index, sentences)
+            self.logger.info(
+                f"Chunk {ctx.chunk_index}: 定稿已推送 ({len(sentences)} 个句子) [极速模式]"
+            )
+        else:
+            # 补刀模式：推送草稿
+            self.subtitle_manager.add_draft_sentences(ctx.chunk_index, sentences)
+            self.logger.info(
+                f"Chunk {ctx.chunk_index}: 草稿已推送 ({len(sentences)} 个句子)"
+            )
 
     async def _process_with_fuse(self, ctx: ProcessingContext):
         """

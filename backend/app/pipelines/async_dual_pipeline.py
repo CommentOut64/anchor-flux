@@ -35,6 +35,10 @@ class AsyncDualPipeline:
     2. 管理队列和背压
     3. 处理异常传播
     4. 推送 SSE 事件
+
+    V3.5 更新：
+    - 支持 transcription_profile 参数
+    - sensevoice_only 模式下跳过 SlowWorker，FastWorker 直接输出定稿
     """
 
     def __init__(
@@ -47,6 +51,7 @@ class AsyncDualPipeline:
         enable_semantic_grouping: bool = True,
         alignment_score_threshold: float = 0.3,
         enable_fallback: bool = True,
+        transcription_profile: str = "sv_whisper_patch",
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -61,36 +66,52 @@ class AsyncDualPipeline:
             enable_semantic_grouping: 是否启用语义分组
             alignment_score_threshold: 对齐质量阈值
             enable_fallback: 是否启用降级策略
+            transcription_profile: 转录模式 (sensevoice_only/sv_whisper_patch/sv_whisper_dual)
             logger: 日志记录器
         """
         self.job_id = job_id
         self.logger = logger or logging.getLogger(__name__)
+        self.transcription_profile = transcription_profile
+
+        # 判断是否为纯 SenseVoice 模式
+        self.is_sensevoice_only = (transcription_profile == "sensevoice_only")
+
+        if self.is_sensevoice_only:
+            self.logger.info("极速模式: 纯 SenseVoice 流水线，跳过 Whisper")
+        else:
+            self.logger.info(f"转录模式: {transcription_profile}")
 
         # 创建队列（带背压）
-        self.queue_inter = asyncio.Queue(maxsize=queue_maxsize)  # FastWorker → SlowWorker
-        self.queue_final = asyncio.Queue(maxsize=queue_maxsize)  # SlowWorker → AlignmentWorker
+        self.queue_inter = asyncio.Queue(maxsize=queue_maxsize)  # FastWorker -> SlowWorker
+        self.queue_final = asyncio.Queue(maxsize=queue_maxsize)  # SlowWorker -> AlignmentWorker
 
-        # 实例化三个 Worker
+        # 实例化 FastWorker（总是需要）
         self.fast_worker = FastWorker(
             job_id=job_id,
             sensevoice_language=sensevoice_language,
             enable_semantic_grouping=enable_semantic_grouping,
+            is_final_output=self.is_sensevoice_only,  # 极速模式下 FastWorker 输出为定稿
             logger=self.logger
         )
 
-        self.slow_worker = SlowWorker(
-            whisper_language=whisper_language,
-            user_glossary=user_glossary,
-            logger=self.logger
-        )
+        # SlowWorker 和 AlignmentWorker 仅在非极速模式下创建
+        if self.is_sensevoice_only:
+            self.slow_worker = None
+            self.alignment_worker = None
+        else:
+            self.slow_worker = SlowWorker(
+                whisper_language=whisper_language,
+                user_glossary=user_glossary,
+                logger=self.logger
+            )
 
-        self.alignment_worker = AlignmentWorker(
-            job_id=job_id,
-            enable_semantic_grouping=enable_semantic_grouping,
-            alignment_score_threshold=alignment_score_threshold,
-            enable_fallback=enable_fallback,
-            logger=self.logger
-        )
+            self.alignment_worker = AlignmentWorker(
+                job_id=job_id,
+                enable_semantic_grouping=enable_semantic_grouping,
+                alignment_score_threshold=alignment_score_threshold,
+                enable_fallback=enable_fallback,
+                logger=self.logger
+            )
 
         # 获取 SSE 管理器
         self.sse_manager = get_sse_manager()
@@ -105,7 +126,72 @@ class AsyncDualPipeline:
         full_audio_sr: int = 16000
     ) -> List[ProcessingContext]:
         """
-        运行三级流水线
+        运行流水线
+
+        流程：
+        - 极速模式 (sensevoice_only): 仅运行 FastWorker，直接输出定稿
+        - 补刀/双流模式: 运行完整三级流水线
+
+        Args:
+            audio_chunks: AudioChunk 列表
+            full_audio_array: 完整音频数组（用于 Audio Overlap）
+            full_audio_sr: 完整音频采样率
+
+        Returns:
+            List[ProcessingContext]: 处理结果列表
+        """
+        if self.is_sensevoice_only:
+            return await self._run_sensevoice_only(audio_chunks, full_audio_array, full_audio_sr)
+        else:
+            return await self._run_full_pipeline(audio_chunks, full_audio_array, full_audio_sr)
+
+    async def _run_sensevoice_only(
+        self,
+        audio_chunks: List[AudioChunk],
+        full_audio_array: Optional[Any] = None,
+        full_audio_sr: int = 16000
+    ) -> List[ProcessingContext]:
+        """
+        极速模式: 仅运行 FastWorker
+
+        FastWorker 输出直接作为定稿推送，跳过 Whisper 和对齐。
+        """
+        self.logger.info(f"极速模式开始: {len(audio_chunks)} 个 Chunk")
+
+        results: List[ProcessingContext] = []
+
+        for i, chunk in enumerate(audio_chunks):
+            ctx = ProcessingContext(
+                job_id=self.job_id,
+                chunk_index=i,
+                audio_chunk=chunk,
+                full_audio_array=full_audio_array,
+                full_audio_sr=full_audio_sr
+            )
+
+            try:
+                # FastWorker 处理（SenseVoice 推理 + 分句 + 推送定稿）
+                await self.fast_worker.process(ctx)
+                results.append(ctx)
+            except Exception as e:
+                self.logger.error(f"Chunk {i} 处理失败: {e}", exc_info=True)
+                self.errors.append(e)
+
+        if self.errors:
+            self.logger.error(f"极速模式执行中发生 {len(self.errors)} 个错误")
+            raise self.errors[0]
+
+        self.logger.info(f"极速模式完成: {len(results)} 个 Chunk 已处理")
+        return results
+
+    async def _run_full_pipeline(
+        self,
+        audio_chunks: List[AudioChunk],
+        full_audio_array: Optional[Any] = None,
+        full_audio_sr: int = 16000
+    ) -> List[ProcessingContext]:
+        """
+        运行完整三级流水线（补刀/双流模式）
 
         流程：
         1. 启动三个并行任务（FastWorker, SlowWorker, AlignmentWorker）

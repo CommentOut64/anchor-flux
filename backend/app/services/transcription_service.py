@@ -436,12 +436,9 @@ class TranscriptionService:
                 logger=self.logger
             )
 
-            # 初始化转录流水线
-            self.transcription_pipeline = AsyncDualPipeline(
-                job_id="",  # 每次处理时动态设置
-                sse_manager=self.sse_manager,
-                logger=self.logger
-            )
+            # V3.5: 转录流水线在每次任务执行时动态创建（根据 transcription_profile 配置）
+            # 不再在这里初始化 self.transcription_pipeline
+            self.transcription_pipeline = None
 
             self.logger.info("Pipeline 初始化完成")
         except Exception as e:
@@ -468,9 +465,8 @@ class TranscriptionService:
             job: 任务状态对象
         """
         try:
-            # 检查 Pipeline 是否初始化
-            if not self.transcription_pipeline:
-                raise RuntimeError("Pipeline 未初始化")
+            from app.pipelines.async_dual_pipeline import AsyncDualPipeline
+            from app.services.config_adapter import ConfigAdapter
 
             job_dir = Path(job.dir)
             input_path = job_dir / job.filename
@@ -506,17 +502,37 @@ class TranscriptionService:
 
             # ==========================================
             # 阶段 2: 异步双流转录（AsyncDualPipeline）
+            # V3.5: 根据 transcription_profile 动态创建流水线
             # ==========================================
             self._update_progress(job, 'transcription', 0, '转录中...')
 
-            # 更新 Pipeline 的 job_id
-            self.transcription_pipeline.job_id = job.job_id
+            # 获取转录模式配置
+            transcription_profile = ConfigAdapter.get_transcription_profile(job.settings)
+            self.logger.info(f"转录模式: {transcription_profile}")
+
+            # 动态创建转录流水线
+            self.transcription_pipeline = AsyncDualPipeline(
+                job_id=job.job_id,
+                transcription_profile=transcription_profile,
+                logger=self.logger
+            )
 
             # 调用转录流水线
-            final_sentences = await self.transcription_pipeline.run(
-                chunks=chunks,
-                job_settings=job.settings
+            results = await self.transcription_pipeline.run(
+                audio_chunks=chunks
             )
+
+            # 从 ProcessingContext 中提取句子
+            final_sentences = []
+            for ctx in results:
+                if hasattr(ctx, 'sv_result') and ctx.sv_result:
+                    # 从 streaming_subtitle 获取句子
+                    from app.services.streaming_subtitle import get_streaming_subtitle_manager
+                    subtitle_manager = get_streaming_subtitle_manager(job.job_id)
+                    chunk_indices = subtitle_manager.chunk_sentences.get(ctx.chunk_index, [])
+                    for idx in chunk_indices:
+                        if idx in subtitle_manager.sentences:
+                            final_sentences.append(subtitle_manager.sentences[idx])
 
             self.logger.info(f"转录完成: {len(final_sentences)} 个句子")
 
@@ -4204,6 +4220,17 @@ class TranscriptionService:
 
         # 调试日志：确认方法被调用
         self.logger.debug(f"开始后处理增强: {len(sentences)} 句, enhancement={solution_config.enhancement.value}")
+
+        # V3.5.2: 极速模式（sensevoice_only）完全跳过 Whisper 补刀
+        # 极速模式的设计目标是纯 SenseVoice 输出，不加载 Whisper 模型
+        if solution_config.enhancement == EnhancementMode.OFF:
+            self.logger.info("极速模式: 跳过所有 Whisper 补刀和仲裁")
+            # 仍然执行 LLM 校对/翻译（如果配置了）
+            if solution_config.proofread != ProofreadMode.OFF:
+                self.logger.info("LLM 校对功能待实现")
+            if solution_config.translate != TranslateMode.OFF:
+                self.logger.info("LLM 翻译功能待实现")
+            return sentences
 
         # 1. 收集需要 Whisper 补刀的句子（含强制补刀、常规补刀、垃圾核查）
         patch_queue = []

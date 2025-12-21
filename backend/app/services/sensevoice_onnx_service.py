@@ -361,17 +361,18 @@ class SenseVoiceONNXService:
 
                 # CPU 线程限制（防止卡顿）
                 # 原理：ONNX Runtime 默认会占满所有 CPU 核心，导致 Whisper 的 CUDA 调度线程无核可用
-                # 解决：保留 2 个核心给操作系统和 Whisper 调度
+                # 解决：保留 4 个核心给操作系统和其他任务（V3.5: 用户要求至少保留4核）
                 import multiprocessing
                 total_cores = multiprocessing.cpu_count()
-                intra_op_threads = max(1, total_cores - 2)  # 保留 2 个核心
+                reserved_cores = 4  # V3.5: 保留 4 个核心
+                intra_op_threads = max(1, total_cores - reserved_cores)
 
                 sess_options.intra_op_num_threads = intra_op_threads  # 算子内部并行度（最关键）
                 sess_options.inter_op_num_threads = 1  # 算子间并行度（通常设为 1）
 
                 self.logger.info(
                     f"CPU 线程配置: 总核心={total_cores}, "
-                    f"SenseVoice 使用={intra_op_threads}, 预留={total_cores - intra_op_threads}"
+                    f"SenseVoice 使用={intra_op_threads}, 预留={reserved_cores}"
                 )
 
                 # 选择执行提供者
@@ -459,15 +460,41 @@ class SenseVoiceONNXService:
         return {}
 
     def _get_execution_providers(self) -> List[str]:
-        """获取执行提供者"""
+        """
+        获取执行提供者
+
+        V3.5 更新: 支持 auto 设备选择
+        - auto: GPU优先，无GPU时自动降级到CPU
+        - cuda: 强制使用GPU
+        - cpu: 强制使用CPU
+        """
         import onnxruntime as ort
 
         available_providers = ort.get_available_providers()
         self.logger.info(f"可用的执行提供者: {available_providers}")
 
-        if self.config.device == "cuda" and "CUDAExecutionProvider" in available_providers:
-            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        device = self.config.device.lower()
+
+        if device == "auto":
+            # 自动选择：GPU优先，降级CPU
+            if "CUDAExecutionProvider" in available_providers:
+                self.logger.info("设备选择: auto -> CUDA (GPU可用)")
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            else:
+                self.logger.info("设备选择: auto -> CPU (无可用GPU)")
+                return ["CPUExecutionProvider"]
+
+        elif device == "cuda":
+            # 强制GPU
+            if "CUDAExecutionProvider" in available_providers:
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            else:
+                self.logger.warning("请求CUDA但不可用，降级到CPU")
+                return ["CPUExecutionProvider"]
+
         else:
+            # CPU模式
+            self.logger.info("设备选择: CPU (用户指定)")
             return ["CPUExecutionProvider"]
 
     def _print_model_info(self):

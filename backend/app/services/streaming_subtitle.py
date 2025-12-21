@@ -388,6 +388,71 @@ class StreamingSubtitleManager:
 
         return new_indices
 
+    def add_finalized_sentences(
+        self,
+        chunk_index: int,
+        sentences: List[SentenceSegment]
+    ) -> List[int]:
+        """
+        添加定稿句子（极速模式专用）
+
+        V3.5 新增: 极速模式下 FastWorker 直接输出定稿，不经过 SlowWorker。
+        与 add_draft_sentences 不同，这里直接推送定稿事件。
+
+        Args:
+            chunk_index: Chunk 索引
+            sentences: 定稿句子列表
+
+        Returns:
+            List[int]: 句子索引列表
+        """
+        sentence_indices = []
+
+        for sentence in sentences:
+            # 确保句子标记为定稿
+            sentence.is_draft = False
+            sentence.is_finalized = True
+
+            index = self.sentence_count
+            self.sentences[index] = sentence
+            self.sentence_count += 1
+            sentence_indices.append(index)
+
+            # 推送 SSE 事件（定稿）
+            sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
+                "index": index,
+                "text": sentence.text_clean or sentence.text,
+                "start": sentence.start,
+                "end": sentence.end,
+                "confidence": sentence.confidence,
+                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
+                "is_draft": False,
+                "is_finalized": True,
+                "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]
+            }
+
+            push_subtitle_event(
+                self.sse_manager,
+                self.job_id,
+                "finalized",  # 定稿事件类型
+                {
+                    "index": index,
+                    "chunk_index": chunk_index,
+                    "sentence": sentence_dict,
+                    "mode": "sensevoice_only"  # 标记为极速模式
+                }
+            )
+
+        # 记录 Chunk 级别的索引映射
+        self.chunk_sentences[chunk_index] = sentence_indices
+
+        logger.info(
+            f"添加定稿句子 [极速模式]: Chunk {chunk_index}, "
+            f"{len(sentences)} 个句子, 索引 {sentence_indices}"
+        )
+
+        return sentence_indices
+
 
 # ========== 单例工厂 ==========
 
