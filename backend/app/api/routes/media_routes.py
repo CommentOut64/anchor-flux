@@ -15,12 +15,15 @@ import struct
 import asyncio
 import subprocess
 import time
+import logging
 from pathlib import Path
 from typing import Optional, Tuple
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.core.config import config
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/media", tags=["media"])
 
@@ -552,7 +555,7 @@ async def get_video(job_id: str, request: Request):
     对于不兼容的格式或编码（如HEVC/H.265），会触发异步生成Proxy
     """
     job_dir = config.JOBS_DIR / job_id
-    print(f"[media] 收到视频请求: {job_id}")
+    logger.debug(f"[media] 收到视频请求: {job_id}")
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -564,7 +567,7 @@ async def get_video(job_id: str, request: Request):
     preview_360p = job_dir / "preview_360p.mp4"
 
     if proxy_720p.exists():
-        print(f"[media] 返回720p高清视频")
+        logger.debug(f"[media] 返回720p高清视频")
         return _serve_file_with_range(proxy_720p, request, 'video/mp4')
 
     if remux_video.exists():

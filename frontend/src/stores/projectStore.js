@@ -37,14 +37,24 @@ export const useProjectStore = defineStore("project", () => {
 
   // 双流进度状态
   const dualStreamProgress = ref({
-    fastStream: 0,     // 快流(SenseVoice)进度 0-100
-    slowStream: 0,     // 慢流(Whisper)进度 0-100
-    totalChunks: 0,    // 总 Chunk 数
-    draftChunks: 0,    // 草稿 Chunk 数
-    finalizedChunks: 0 // 定稿 Chunk 数
+    fastStream: 0, // 快流(SenseVoice)进度 0-100
+    slowStream: 0, // 慢流(Whisper)进度 0-100
+    totalChunks: 0, // 总 Chunk 数
+    draftChunks: 0, // 草稿 Chunk 数
+    finalizedChunks: 0, // 定稿 Chunk 数
   });
 
   // ========== 3. Undo/Redo 历史记录 ==========
+  // 【重要】撤销/重做策略：
+  // - 历史记录只追踪用户编辑操作
+  // - 转录过程中 SSE 推送的字幕变更不应被撤销
+  // - 使用 pause/resume 控制历史记录：
+  //   - SSE 推送字幕时暂停记录（appendOrUpdateDraft, replaceChunk）
+  //   - 用户编辑时正常记录（updateSubtitle, addSubtitle, removeSubtitle）
+  // - 以下情况会清除历史记录以建立"基线"：
+  //   1. importSRT() - 导入转录结果时
+  //   2. restoreProject() - 从缓存/存储恢复项目时
+  //   3. resetProject() - 重置项目时
   const {
     history,
     undo,
@@ -52,6 +62,9 @@ export const useProjectStore = defineStore("project", () => {
     canUndo,
     canRedo,
     clear: clearHistory,
+    pause: pauseHistory,
+    resume: resumeHistory,
+    isTracking: isHistoryTracking,
   } = useRefHistory(subtitles, {
     deep: true,
     capacity: 50, // 限制历史记录步数
@@ -160,12 +173,12 @@ export const useProjectStore = defineStore("project", () => {
       text: item.text,
       isDirty: false,
       // Phase 5: 双模态架构新增字段
-      chunk_id: null,          // 物理切片ID
-      isDraft: false,          // 已导入的SRT都是定稿
-      words: [],               // 字级置信度数据
-      confidence: 1.0,         // 句子置信度
-      warning_type: 'none',    // 警告类型: none/low_confidence/high_perplexity/both
-      source: 'imported'       // 来源: sensevoice/whisper/imported
+      chunk_id: null, // 物理切片ID
+      isDraft: false, // 已导入的SRT都是定稿
+      words: [], // 字级置信度数据
+      confidence: 1.0, // 句子置信度
+      warning_type: "none", // 警告类型: none/low_confidence/high_perplexity/both
+      source: "imported", // 来源: sensevoice/whisper/imported
     }));
 
     meta.value = {
@@ -191,6 +204,8 @@ export const useProjectStore = defineStore("project", () => {
         const cached = memoryCache.get(jobId);
         subtitles.value = cached.subtitles;
         meta.value = cached.meta;
+        // 恢复后清除历史记录，防止撤回到转录期间的状态
+        clearHistory();
         console.log("[ProjectStore] 项目已从内存缓存恢复");
         return true;
       }
@@ -200,6 +215,8 @@ export const useProjectStore = defineStore("project", () => {
       if (saved) {
         subtitles.value = saved.subtitles;
         meta.value = saved.meta;
+        // 恢复后清除历史记录，防止撤回到转录期间的状态
+        clearHistory();
         console.log("[ProjectStore] 项目已从存储恢复");
         return true;
       }
@@ -240,8 +257,8 @@ export const useProjectStore = defineStore("project", () => {
       isDraft: payload.isDraft ?? false,
       words: payload.words || [],
       confidence: payload.confidence ?? 1.0,
-      warning_type: payload.warning_type || 'none',
-      source: payload.source || 'manual'
+      warning_type: payload.warning_type || "none",
+      source: payload.source || "manual",
     };
     subtitles.value.splice(insertIndex, 0, newSubtitle);
     meta.value.isDirty = true;
@@ -265,11 +282,15 @@ export const useProjectStore = defineStore("project", () => {
    *
    * 当收到 subtitle.draft 事件时调用
    * 按时间顺序插入，保持字幕列表有序
+   * 【注意】此操作不记录到历史，用户无法撤销 SSE 推送的内容
    *
    * @param {string} chunk_id - Chunk ID
    * @param {object} sentenceData - 句子数据
    */
   function appendOrUpdateDraft(chunk_id, sentenceData) {
+    // 暂停历史记录，SSE 推送的内容不应被撤销
+    pauseHistory();
+
     const {
       index: sentenceIndex,
       text,
@@ -277,14 +298,14 @@ export const useProjectStore = defineStore("project", () => {
       end,
       confidence = 0.8,
       words = [],
-      warning_type = 'none'
+      warning_type = "none",
     } = sentenceData;
 
     // 生成唯一ID
     const subtitleId = `draft-${chunk_id}-${sentenceIndex}`;
 
     // 查找是否已存在
-    const existingIndex = subtitles.value.findIndex(s => s.id === subtitleId);
+    const existingIndex = subtitles.value.findIndex((s) => s.id === subtitleId);
 
     const subtitleData = {
       id: subtitleId,
@@ -293,12 +314,12 @@ export const useProjectStore = defineStore("project", () => {
       text,
       isDirty: false,
       chunk_id,
-      isDraft: true,       // 标记为草稿
+      isDraft: true, // 标记为草稿
       words,
       confidence,
       warning_type,
-      source: 'sensevoice',
-      sentenceIndex       // 保留原始句子索引
+      source: "sensevoice",
+      sentenceIndex, // 保留原始句子索引
     };
 
     if (existingIndex >= 0) {
@@ -316,11 +337,16 @@ export const useProjectStore = defineStore("project", () => {
       }
       chunkSubtitleMap.value.get(chunk_id).push(subtitleId);
 
-      console.log(`[ProjectStore] 添加草稿字幕: ${subtitleId}, 位置: ${insertIndex}`);
+      console.log(
+        `[ProjectStore] 添加草稿字幕: ${subtitleId}, 位置: ${insertIndex}`
+      );
     }
 
     // 更新双流进度
     updateDualStreamProgress();
+
+    // 恢复历史记录
+    resumeHistory();
   }
 
   /**
@@ -333,11 +359,18 @@ export const useProjectStore = defineStore("project", () => {
    * @param {Array} sentences - 定稿句子列表
    */
   function replaceChunk(chunk_id, sentences) {
+    // 暂停历史记录，SSE 推送的内容不应被撤销
+    pauseHistory();
+
     // 1. 删除该 Chunk 的所有旧字幕
     const oldSubtitleIds = chunkSubtitleMap.value.get(chunk_id) || [];
-    subtitles.value = subtitles.value.filter(s => !oldSubtitleIds.includes(s.id));
+    subtitles.value = subtitles.value.filter(
+      (s) => !oldSubtitleIds.includes(s.id)
+    );
 
-    console.log(`[ProjectStore] 删除 Chunk ${chunk_id} 的 ${oldSubtitleIds.length} 个旧字幕`);
+    console.log(
+      `[ProjectStore] 删除 Chunk ${chunk_id} 的 ${oldSubtitleIds.length} 个旧字幕`
+    );
 
     // 2. 添加新的定稿字幕
     const newSubtitleIds = [];
@@ -350,11 +383,11 @@ export const useProjectStore = defineStore("project", () => {
         text: sentence.text,
         isDirty: false,
         chunk_id,
-        isDraft: false,      // 定稿
+        isDraft: false, // 定稿
         words: sentence.words || [],
         confidence: sentence.confidence ?? 1.0,
-        warning_type: sentence.warning_type || 'none',
-        source: 'whisper'
+        warning_type: sentence.warning_type || "none",
+        source: "whisper",
       };
 
       // 按时间顺序插入
@@ -366,10 +399,15 @@ export const useProjectStore = defineStore("project", () => {
     // 3. 更新 Chunk 映射
     chunkSubtitleMap.value.set(chunk_id, newSubtitleIds);
 
-    console.log(`[ProjectStore] 替换 Chunk ${chunk_id}: 添加 ${sentences.length} 个定稿字幕`);
+    console.log(
+      `[ProjectStore] 替换 Chunk ${chunk_id}: 添加 ${sentences.length} 个定稿字幕`
+    );
 
     // 更新双流进度
     updateDualStreamProgress();
+
+    // 恢复历史记录
+    resumeHistory();
   }
 
   /**
@@ -398,7 +436,7 @@ export const useProjectStore = defineStore("project", () => {
     let draftCount = 0;
     let finalCount = 0;
 
-    subtitles.value.forEach(s => {
+    subtitles.value.forEach((s) => {
       if (s.chunk_id) {
         chunks.add(s.chunk_id);
         if (s.isDraft) {
@@ -414,8 +452,10 @@ export const useProjectStore = defineStore("project", () => {
     let finalizedChunks = 0;
 
     chunkSubtitleMap.value.forEach((ids, chunk_id) => {
-      const chunkSubtitles = subtitles.value.filter(s => s.chunk_id === chunk_id);
-      const hasDraft = chunkSubtitles.some(s => s.isDraft);
+      const chunkSubtitles = subtitles.value.filter(
+        (s) => s.chunk_id === chunk_id
+      );
+      const hasDraft = chunkSubtitles.some((s) => s.isDraft);
       if (hasDraft) {
         draftChunks++;
       } else if (chunkSubtitles.length > 0) {
@@ -424,26 +464,30 @@ export const useProjectStore = defineStore("project", () => {
     });
 
     dualStreamProgress.value = {
-      fastStream: chunks.size > 0 ? Math.round((draftCount + finalCount) / chunks.size * 10) : 0,
-      slowStream: chunks.size > 0 ? Math.round(finalizedChunks / chunks.size * 100) : 0,
+      fastStream:
+        chunks.size > 0
+          ? Math.round(((draftCount + finalCount) / chunks.size) * 10)
+          : 0,
+      slowStream:
+        chunks.size > 0 ? Math.round((finalizedChunks / chunks.size) * 100) : 0,
       totalChunks: chunks.size,
       draftChunks,
-      finalizedChunks
+      finalizedChunks,
     };
   }
 
   /**
    * 获取草稿字幕数量
    */
-  const draftSubtitleCount = computed(() =>
-    subtitles.value.filter(s => s.isDraft).length
+  const draftSubtitleCount = computed(
+    () => subtitles.value.filter((s) => s.isDraft).length
   );
 
   /**
    * 获取定稿字幕数量
    */
-  const finalizedSubtitleCount = computed(() =>
-    subtitles.value.filter(s => !s.isDraft && s.chunk_id).length
+  const finalizedSubtitleCount = computed(
+    () => subtitles.value.filter((s) => !s.isDraft && s.chunk_id).length
   );
 
   /**
@@ -524,7 +568,7 @@ export const useProjectStore = defineStore("project", () => {
       slowStream: 0,
       totalChunks: 0,
       draftChunks: 0,
-      finalizedChunks: 0
+      finalizedChunks: 0,
     };
     console.log("[ProjectStore] 项目已重置");
   }
@@ -605,6 +649,8 @@ export const useProjectStore = defineStore("project", () => {
     undo,
     redo,
     clearHistory,
+    pauseHistory, // 暂停历史记录（用于 SSE 推送等系统操作）
+    resumeHistory, // 恢复历史记录
 
     // 操作方法
     importSRT,

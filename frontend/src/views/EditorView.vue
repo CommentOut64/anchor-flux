@@ -704,6 +704,9 @@ function handleStreamingSubtitle(data) {
     return
   }
 
+  // 暂停历史记录，SSE 推送的内容不应被撤销
+  projectStore.pauseHistory()
+
   // 更新或添加字幕到 store
   const existingIndex = projectStore.subtitles.findIndex(
     s => s.sentenceIndex === sentenceIndex
@@ -726,6 +729,9 @@ function handleStreamingSubtitle(data) {
     // 添加新字幕
     projectStore.addSubtitle(subtitleData)
   }
+
+  // 恢复历史记录
+  projectStore.resumeHistory()
 
   console.log(`[EditorView] 字幕 #${sentenceIndex} 已更新，来源: ${source}`)
 }
