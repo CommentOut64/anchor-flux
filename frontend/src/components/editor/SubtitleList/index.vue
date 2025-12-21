@@ -69,6 +69,7 @@
 <script setup>
 import { ref, computed, watch, nextTick } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import { usePlaybackManager } from '@/services/PlaybackManager'
 // Phase 5: 导入 SubtitleItem 组件
 import SubtitleItem from './SubtitleItem.vue'
 
@@ -82,6 +83,9 @@ const emit = defineEmits(['subtitle-click', 'subtitle-edit', 'subtitle-delete', 
 
 // Store
 const projectStore = useProjectStore()
+
+// 全局播放管理器
+const playbackManager = usePlaybackManager()
 
 // Refs
 const listRef = ref(null)
@@ -106,7 +110,8 @@ const filteredSubtitles = computed(() => {
 // Methods
 function onSubtitleClick(subtitle) {
   projectStore.view.selectedSubtitleId = subtitle.id
-  projectStore.seekTo(subtitle.start)
+  // 使用 PlaybackManager 进行跳转，确保视频和波形同步
+  playbackManager.seekTo(subtitle.start)
   emit('subtitle-click', subtitle)
 }
 

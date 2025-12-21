@@ -281,7 +281,7 @@ function handleClickOutside(e) {
 // 循环播放逻辑
 watch(currentTime, (time) => {
   if (isLooping.value && duration.value && time >= duration.value - 0.1) {
-    projectStore.seekTo(0)
+    playbackManager.seekTo(0)
     if (!isPlaying.value) togglePlay()
   }
 })

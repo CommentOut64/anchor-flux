@@ -300,7 +300,8 @@ async function initWavesurfer() {
       minPxPerSec: basePxPerSec, // 使用固定基准50
       scrollParent: true,
       fillParent: false, // 改为 false，允许滚动
-      dragToSeek: false, // 【关键修改】禁用内置拖拽，自己实现分离交互
+      dragToSeek: false, // 禁用内置拖拽
+      interact: false,   // 【关键】禁用波形点击跳转，光标操作仅限上半区域
       autoScroll: false, // 禁用内置自动滚动，自己实现
       autoCenter: false, // 禁用内置居中，自己实现
       hideScrollbar: true, // 【修改】隐藏wavesurfer自带滚动条，使用自定义滚动条
@@ -397,8 +398,9 @@ function setupWavesurferEvents() {
   // 不要监听 timeupdate 来更新 Store，保持单向数据流：Store → WaveSurfer
   // WaveSurfer 的时间由外部 watch 同步（见第588-614行）
 
-  // 【关键修改】移除 interaction 事件监听（因为已禁用 dragToSeek）
-  // 自定义交互逻辑见下方 handleWaveformMouseDown
+  // 【上下分离设计】波形下半部分已禁用所有光标交互（interact: false）
+  // 光标操作仅限上半区域（waveform-upper-zone），避免用户误操作
+  // Regions 插件有独立的事件系统，字幕块拖拽/调整不受影响
 
   wavesurfer.on("zoom", (minPxPerSec) => {
     const newZoom = Math.round((minPxPerSec / ZOOM_BASE_PX_PER_SEC) * 100);
@@ -455,7 +457,8 @@ function setupRegionEvents() {
   regionsPlugin.on("region-clicked", (region, e) => {
     e.stopPropagation();
     projectStore.view.selectedSubtitleId = region.id;
-    projectStore.seekTo(region.start);
+    // 使用 PlaybackManager 进行跳转，确保视频和波形同步
+    playbackManager.seekTo(region.start);
     if (wavesurfer) wavesurfer.play();
     emit("region-click", region);
   });
@@ -520,15 +523,150 @@ function renderSubtitleRegions() {
   }, 100);
 }
 
-// 缩放控制
-function handleZoomInput(e) {
-  const value = parseInt(e.target.value);
-  setZoom(value);
+// ============ 智能锚点缩放策略（性能优化版）============
+
+// 缓存 DOM 引用，避免重复查询
+let cachedWrapper = null;
+let cachedScrollContainer = null;
+
+/**
+ * 获取缓存的滚动容器（避免频繁 DOM 查询）
+ */
+function getScrollContainer() {
+  if (cachedScrollContainer && cachedScrollContainer.isConnected) {
+    return cachedScrollContainer;
+  }
+  if (!wavesurfer) return null;
+  cachedWrapper = wavesurfer.getWrapper();
+  if (!cachedWrapper) return null;
+  cachedScrollContainer = cachedWrapper.parentElement;
+  return cachedScrollContainer;
 }
 
+/**
+ * 判断播放头当前是否在可视范围内
+ */
+function isPlayheadInViewport() {
+  const scrollContainer = getScrollContainer();
+  if (!scrollContainer) return false;
+
+  const currentPxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC;
+  const playheadX = projectStore.player.currentTime * currentPxPerSec;
+  const { scrollLeft, clientWidth } = scrollContainer;
+
+  // 留一点边距容错 (10px)
+  return playheadX >= scrollLeft - 10 && playheadX <= scrollLeft + clientWidth + 10;
+}
+
+/**
+ * 获取光标相对于视口的坐标
+ */
+function getPlayheadRelativeX() {
+  const scrollContainer = getScrollContainer();
+  if (!scrollContainer) return 0;
+
+  const currentPxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC;
+  const playheadTotalX = projectStore.player.currentTime * currentPxPerSec;
+  return playheadTotalX - scrollContainer.scrollLeft;
+}
+
+// 滚动条更新防抖
+let scrollbarUpdateTimer = null;
+function debouncedUpdateScrollbar() {
+  if (scrollbarUpdateTimer) return;
+  scrollbarUpdateTimer = setTimeout(() => {
+    scrollbarUpdateTimer = null;
+    updateScrollbarThumb();
+  }, 16); // ~1帧
+}
+
+/**
+ * 锚点缩放核心算法（性能优化版）
+ * @param {number} targetZoom - 目标缩放比例 (ZOOM_MIN - ZOOM_MAX)
+ * @param {number} anchorPx - 锚点相对于视口左侧的像素位置
+ */
+function setZoomWithAnchor(targetZoom, anchorPx) {
+  if (!wavesurfer || !containerRef.value) return;
+
+  const scrollContainer = getScrollContainer();
+  if (!scrollContainer) return;
+  
+  // 1. 记录缩放前的状态（一次性读取，减少 reflow）
+  const oldPxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC;
+  const oldScroll = scrollContainer.scrollLeft;
+  
+  // 计算锚点对应的"绝对时间点"
+  const anchorTime = (oldScroll + anchorPx) / oldPxPerSec;
+
+  // 2. 应用新的缩放
+  const clampedZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, targetZoom));
+  
+  // 如果缩放值没变，直接返回
+  if (clampedZoom === zoomLevel.value) return;
+  
+  zoomLevel.value = clampedZoom;
+  const newPxPerSec = (clampedZoom / 100) * ZOOM_BASE_PX_PER_SEC;
+  
+  // 调用 wavesurfer 进行缩放
+  wavesurfer.zoom(newPxPerSec);
+  projectStore.view.zoomLevel = clampedZoom;
+
+  // 3. 计算新的滚动位置
+  const newScroll = Math.max(0, (anchorTime * newPxPerSec) - anchorPx);
+
+  // 4. 使用 RAF 确保在下一帧设置滚动位置（避免 nextTick 开销）
+  requestAnimationFrame(() => {
+    scrollContainer.scrollLeft = newScroll;
+    // 延迟更新滚动条，降低优先级
+    debouncedUpdateScrollbar();
+  });
+}
+
+/**
+ * 统一的缩放处理函数 (按钮/滑块通用)
+ * 策略：
+ * - 播放中：始终跟随光标
+ * - 暂停且光标可见：锚定光标
+ * - 暂停且光标不可见：锚定视口中心
+ */
+function handleZoomWithSmartAnchor(targetZoom) {
+  const scrollContainer = getScrollContainer();
+  if (!scrollContainer) return;
+
+  let anchorPx; // 相对于视口左侧的像素位置
+
+  // 策略判断（使用缓存的 scrollContainer）
+  if (projectStore.player.isPlaying) {
+    // A. 播放中：始终跟随光标
+    anchorPx = getPlayheadRelativeX();
+  } else if (isPlayheadInViewport()) {
+    // B. 暂停且光标可见：锚定光标
+    anchorPx = getPlayheadRelativeX();
+  } else {
+    // C. 暂停且光标不可见：锚定视口中心
+    anchorPx = scrollContainer.clientWidth / 2;
+  }
+
+  // 执行锚点缩放
+  setZoomWithAnchor(targetZoom, anchorPx);
+}
+
+// 缩放控制 - 绑定到滑块输入事件（添加节流）
+let lastSliderZoomTime = 0;
+const SLIDER_THROTTLE_MS = 16; // ~60fps
+
+function handleZoomInput(e) {
+  const now = performance.now();
+  if (now - lastSliderZoomTime < SLIDER_THROTTLE_MS) return;
+  lastSliderZoomTime = now;
+  
+  const value = parseInt(e.target.value);
+  handleZoomWithSmartAnchor(value);
+}
+
+// 保留原有的 setZoom 供内部使用（如初始化、fitToScreen等）
 function setZoom(value) {
   if (!wavesurfer) return;
-  // 使用全局常量限制范围
   const clampedValue = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, value));
   zoomLevel.value = clampedValue;
   const minPxPerSec = (clampedValue / 100) * ZOOM_BASE_PX_PER_SEC;
@@ -536,12 +674,16 @@ function setZoom(value) {
   projectStore.view.zoomLevel = clampedValue;
 }
 
+// 绑定到放大按钮
 function zoomIn() {
-  setZoom(zoomLevel.value + ZOOM_BUTTON_STEP);
+  const newValue = Math.min(ZOOM_MAX, zoomLevel.value + ZOOM_BUTTON_STEP);
+  handleZoomWithSmartAnchor(newValue);
 }
 
+// 绑定到缩小按钮
 function zoomOut() {
-  setZoom(zoomLevel.value - ZOOM_BUTTON_STEP);
+  const newValue = Math.max(ZOOM_MIN, zoomLevel.value - ZOOM_BUTTON_STEP);
+  handleZoomWithSmartAnchor(newValue);
 }
 
 function fitToScreen() {
@@ -556,6 +698,7 @@ function fitToScreen() {
     // 限制在全局范围内
     const fitZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, idealZoom));
 
+    // fitToScreen 使用原始 setZoom（不需要锚点，因为是全局适配）
     setZoom(fitZoom);
 
     // 【修复】根据时长动态调整柱子配置，始终保持柱形外观
@@ -1091,6 +1234,7 @@ let pendingZoomDelta = 0;
 
 /**
  * 平滑缩放 - 使用 RAF 批量处理缩放请求
+ * 【优化】使用智能锚点策略
  */
 function smoothZoom() {
   if (pendingZoomDelta === 0) {
@@ -1101,19 +1245,8 @@ function smoothZoom() {
   const newZoom = zoomLevel.value + pendingZoomDelta;
   pendingZoomDelta = 0; // 清空待处理的增量
 
-  // 实际执行缩放
-  if (wavesurfer) {
-    const clampedValue = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZoom));
-    zoomLevel.value = clampedValue;
-    const minPxPerSec = (clampedValue / 100) * ZOOM_BASE_PX_PER_SEC;
-    wavesurfer.zoom(minPxPerSec);
-    projectStore.view.zoomLevel = clampedValue;
-
-    // 更新滚动条
-    nextTick(() => {
-      updateScrollbarThumb();
-    });
-  }
+  // 使用智能锚点缩放
+  handleZoomWithSmartAnchor(newZoom);
 
   zoomRafId = null;
 }
@@ -1179,8 +1312,15 @@ onUnmounted(() => {
   // 清理滚动条拖拽RAF
   if (scrollbarRafId) cancelAnimationFrame(scrollbarRafId);
 
+  // 清理滚动条更新定时器
+  if (scrollbarUpdateTimer) clearTimeout(scrollbarUpdateTimer);
+
   clearTimeout(regionUpdateTimer);
   stopSmartFollow(); // 清理智能跟随RAF循环
+
+  // 清理 DOM 缓存
+  cachedWrapper = null;
+  cachedScrollContainer = null;
 
   // 【关键】注销 WaveSurfer
   playbackManager.unregisterWaveSurfer();

@@ -196,6 +196,7 @@ import { mediaApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
 import { useProxyVideo } from '@/composables/useProxyVideo'
+import { usePlaybackManager } from '@/services/PlaybackManager'
 
 // 组件导入
 import EditorHeader from '@/components/editor/EditorHeader.vue'
@@ -213,6 +214,9 @@ const props = defineProps({
 const router = useRouter()
 const projectStore = useProjectStore()
 const taskStore = useUnifiedTaskStore()
+
+// 全局播放管理器
+const playbackManager = usePlaybackManager()
 
 // Proxy 视频加载状态（新重构版本）
 const proxyVideo = useProxyVideo(props.jobId)
@@ -1063,31 +1067,31 @@ function togglePlay() {
 function stepBackward() {
   const frameTime = 1 / 30
   const newTime = Math.max(0, projectStore.player.currentTime - frameTime)
-  projectStore.seekTo(newTime)
+  playbackManager.seekTo(newTime)
 }
 
 function stepForward() {
   const frameTime = 1 / 30
   const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + frameTime)
-  projectStore.seekTo(newTime)
+  playbackManager.seekTo(newTime)
 }
 
 function seekBackward() {
   const newTime = Math.max(0, projectStore.player.currentTime - 5)
-  projectStore.seekTo(newTime)
+  playbackManager.seekTo(newTime)
 }
 
 function seekForward() {
   const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + 5)
-  projectStore.seekTo(newTime)
+  playbackManager.seekTo(newTime)
 }
 
 function seekToStart() {
-  projectStore.seekTo(0)
+  playbackManager.seekTo(0)
 }
 
 function seekToEnd() {
-  projectStore.seekTo(projectStore.meta.duration)
+  playbackManager.seekTo(projectStore.meta.duration)
 }
 
 function zoomInWave() {
