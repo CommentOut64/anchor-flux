@@ -3,10 +3,10 @@ FuseBreakerV2 - 熔断决策器 V2 增强版
 
 负责在SenseVoice转录过程中监控质量，当检测到低置信度+BGM标签时触发升级分离。
 
-关键改进：
-- max_fuse_retry=2：允许完整的升级路径（NONE → HTDEMUCS → MDX_EXTRA）
-- 自动升级：第二次重试自动升级到更强的模型
-- 事件标签权重：不同标签有不同的触发权重
+关键配置：
+- max_fuse_retry=1：默认只允许一次熔断升级（NONE → HTDEMUCS）
+- auto_upgrade=False：默认不启用第二次自动升级到 MDX_EXTRA
+- 第二次熔断升级作为可选配置暴露，需显式启用
 """
 
 import logging
@@ -33,18 +33,18 @@ class FuseBreakerV2:
 
     def __init__(
         self,
-        max_retry: int = 2,
+        max_retry: int = 1,
         confidence_threshold: float = 0.5,
-        auto_upgrade: bool = True,
+        auto_upgrade: bool = False,
         logger: Optional[logging.Logger] = None
     ):
         """
         初始化熔断决策器
 
         Args:
-            max_retry: 最大重试次数，默认2次
+            max_retry: 最大重试次数，默认1次（只升级到 HTDEMUCS）
             confidence_threshold: 置信度阈值，默认0.5
-            auto_upgrade: 第二次重试是否自动升级到最强模型，默认True
+            auto_upgrade: 是否启用第二次自动升级到 MDX_EXTRA，默认False
             logger: 日志记录器，如果为None则创建新的
         """
         self.max_retry = max_retry

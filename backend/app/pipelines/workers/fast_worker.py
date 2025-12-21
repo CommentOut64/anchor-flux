@@ -52,9 +52,9 @@ class FastWorker:
         sensevoice_executor: Optional[SenseVoiceExecutor] = None,
         # 熔断回溯相关参数
         enable_fuse_breaker: bool = False,
-        fuse_max_retry: int = 2,
+        fuse_max_retry: int = 1,
         fuse_confidence_threshold: float = 0.5,
-        fuse_auto_upgrade: bool = True,
+        fuse_auto_upgrade: bool = False,
         demucs_service: Optional[DemucsService] = None,
         # V3.5: 极速模式参数
         is_final_output: bool = False,
@@ -71,9 +71,9 @@ class FastWorker:
             enable_semantic_grouping: 是否启用语义分组
             sensevoice_executor: SenseVoice 执行器
             enable_fuse_breaker: 是否启用熔断回溯（默认False，保持向后兼容）
-            fuse_max_retry: 熔断最大重试次数
+            fuse_max_retry: 熔断最大重试次数（默认1，只升级到 HTDEMUCS）
             fuse_confidence_threshold: 熔断置信度阈值
-            fuse_auto_upgrade: 第二次重试是否自动升级到最强模型
+            fuse_auto_upgrade: 是否启用第二次自动升级到 MDX_EXTRA（默认False）
             demucs_service: Demucs服务实例
             is_final_output: 是否为最终输出（极速模式下为True，输出定稿而非草稿）
             logger: 日志记录器
