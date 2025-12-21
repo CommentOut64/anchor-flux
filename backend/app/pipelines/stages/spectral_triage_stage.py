@@ -2,13 +2,22 @@
 SpectralTriageStage - 频谱分诊阶段
 
 负责为每个AudioChunk进行频谱分析，判断是否需要人声分离，并推荐合适的模型。
+
+V3.7 更新：
+- 集成 CancellationToken 支持暂停/取消
+- 支持逐 Chunk 中断和检查点保存
 """
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
+from pathlib import Path
 
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.audio_spectrum_classifier import AudioSpectrumClassifier, get_spectrum_classifier
+
+# V3.7: 导入取消令牌
+if TYPE_CHECKING:
+    from app.utils.cancellation_token import CancellationToken
 
 
 class SpectralTriageStage:
@@ -19,13 +28,17 @@ class SpectralTriageStage:
     - 为每个AudioChunk进行频谱分析
     - 判断是否需要人声分离
     - 推荐合适的分离模型（htdemucs/mdx_extra）
+
+    V3.7: 支持 CancellationToken 实现暂停/取消/断点续传
+    原子单位：单个 Chunk 分诊，可在每个 Chunk 之间中断
     """
 
     def __init__(
         self,
         classifier: Optional[AudioSpectrumClassifier] = None,
         threshold: float = 0.35,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        cancellation_token: Optional["CancellationToken"] = None  # V3.7: 新增
     ):
         """
         初始化频谱分诊阶段
@@ -34,17 +47,26 @@ class SpectralTriageStage:
             classifier: 频谱分类器实例，如果为None则使用全局单例
             threshold: 分诊阈值，默认0.35
             logger: 日志记录器，如果为None则创建新的
+            cancellation_token: 取消令牌（可选，V3.7）
         """
         self.classifier = classifier or get_spectrum_classifier()
         self.threshold = threshold
         self.logger = logger or logging.getLogger(__name__)
+        self.cancellation_token = cancellation_token  # V3.7
 
-    async def process(self, chunks: List[AudioChunk]) -> List[AudioChunk]:
+    async def process(
+        self,
+        chunks: List[AudioChunk],
+        job_dir: Optional[Path] = None,  # V3.7: 用于保存检查点
+        diagnosed_indices: Optional[set] = None  # V3.7: 已诊断的索引（用于恢复）
+    ) -> List[AudioChunk]:
         """
         批量分诊所有chunk
 
         Args:
             chunks: 待分诊的AudioChunk列表
+            job_dir: 任务目录（可选，V3.7 用于保存检查点）
+            diagnosed_indices: 已诊断的chunk索引集合（可选，V3.7 用于恢复）
 
         Returns:
             带有分诊结果标记的AudioChunk列表
@@ -55,22 +77,43 @@ class SpectralTriageStage:
 
         self.logger.info(f"开始频谱分诊，共 {len(chunks)} 个chunk")
 
-        # 提取音频数据和采样率
-        # diagnose_chunks 期望的格式: List[Tuple[audio, start, end]]
-        chunk_tuples = [(chunk.audio, chunk.start, chunk.end) for chunk in chunks]
+        token = self.cancellation_token  # V3.7: 简化引用
+        diagnosed_indices = diagnosed_indices or set()
         sample_rate = chunks[0].sample_rate if chunks else 16000
 
-        # 批量分诊
-        diagnoses = self.classifier.diagnose_chunks(
-            chunks=chunk_tuples,
-            sr=sample_rate
-        )
+        # V3.7: 逐个处理 chunk，支持中断
+        for i, chunk in enumerate(chunks):
+            # V3.7: 跳过已诊断的 chunk（用于恢复）
+            if i in diagnosed_indices:
+                self.logger.debug(f"跳过已诊断的 chunk {i}")
+                continue
 
-        # 为每个chunk添加分诊结果
-        for chunk, diagnosis in zip(chunks, diagnoses):
+            # V3.7: 单个 chunk 分诊（快速，不需要原子区域）
+            diagnosis = self.classifier.diagnose_chunk(
+                audio=chunk.audio,
+                sr=sample_rate,
+                chunk_start=chunk.start,
+                chunk_end=chunk.end
+            )
+
+            # 设置分诊结果
             chunk.needs_separation = diagnosis.need_separation
             chunk.recommended_model = diagnosis.recommended_model
             chunk.spectrum_diagnosis = diagnosis
+
+            # V3.7: 每个 chunk 之间检查取消/暂停并保存检查点
+            if token and job_dir:
+                # 每 5 个 chunk 保存一次检查点（避免频繁 I/O）
+                if (i + 1) % 5 == 0 or i == len(chunks) - 1:
+                    diagnosed_indices.add(i)
+                    checkpoint_data = {
+                        "spectral_triage": {
+                            "diagnosed_indices": list(diagnosed_indices),
+                            "diagnosed_count": len(diagnosed_indices),
+                            "total_chunks": len(chunks)
+                        }
+                    }
+                    token.check_and_save(checkpoint_data, job_dir)
 
         # 统计
         need_sep_count = sum(1 for c in chunks if c.needs_separation)
