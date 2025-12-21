@@ -81,6 +81,10 @@ class MediaPrepService:
         # 待检查的 720p 任务 { job_id: Timer }
         self.pending_720p_checks: Dict[str, threading.Timer] = {}
 
+        # 活跃的 FFmpeg 子进程追踪 { process_id: subprocess.Popen }
+        self._active_processes: Dict[int, subprocess.Popen] = {}
+        self._process_lock = threading.Lock()
+
         # 启动消费线程
         self.consumer_thread = threading.Thread(
             target=self._consumer_loop,
@@ -485,31 +489,44 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
+            
+            # 注册进程以便在关闭时能够终止
+            self._register_process(process)
 
             # 解析进度
             last_logged_progress = 0  # 记录上次日志输出的进度
-            for line in process.stdout:
-                line_str = line.decode().strip()
-                if line_str.startswith('out_time_ms='):
-                    try:
-                        out_time_ms = int(line_str.split('=')[1])
-                        if duration > 0:
-                            progress = min(100, (out_time_ms / 1000000) / duration * 100)
-                            progress = round(progress, 1)
+            try:
+                for line in process.stdout:
+                    # 检查是否需要停止
+                    if self.stop_event.is_set():
+                        process.terminate()
+                        logger.info(f"[MediaPrep] 360p 转码被中断: {job_id}")
+                        break
+                    
+                    line_str = line.decode().strip()
+                    if line_str.startswith('out_time_ms='):
+                        try:
+                            out_time_ms = int(line_str.split('=')[1])
+                            if duration > 0:
+                                progress = min(100, (out_time_ms / 1000000) / duration * 100)
+                                progress = round(progress, 1)
 
-                            # 更新状态
-                            with self.lock:
-                                self.task_status[job_id]["preview_360p"]["progress"] = progress
+                                # 更新状态
+                                with self.lock:
+                                    self.task_status[job_id]["preview_360p"]["progress"] = progress
 
-                            # 推送 SSE 进度
-                            self._push_preview_progress(job_id, progress)
+                                # 推送 SSE 进度
+                                self._push_preview_progress(job_id, progress)
 
-                            # 每10%输出一次日志
-                            if progress >= last_logged_progress + 10:
-                                logger.info(f"[MediaPrep] 360p 转码进度: {job_id} - {progress:.1f}%")
-                                last_logged_progress = int(progress / 10) * 10
-                    except:
-                        pass
+                                # 每10%输出一次日志
+                                if progress >= last_logged_progress + 10:
+                                    logger.info(f"[MediaPrep] 360p 转码进度: {job_id} - {progress:.1f}%")
+                                    last_logged_progress = int(progress / 10) * 10
+                        except:
+                            pass
+            finally:
+                # 注销进程
+                self._unregister_process(process)
 
             process.wait()
 
@@ -644,6 +661,9 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
+            
+            # 注册进程以便在关闭时能够终止
+            self._register_process(process)
 
             # 如果队列繁忙，降低 FFmpeg 进程优先级
             if queue_busy:
@@ -651,28 +671,38 @@ class MediaPrepService:
 
             # 解析进度
             last_logged_progress = 0  # 记录上次日志输出的进度
-            for line in process.stdout:
-                line_str = line.decode().strip()
-                if line_str.startswith('out_time_ms='):
-                    try:
-                        out_time_ms = int(line_str.split('=')[1])
-                        if duration > 0:
-                            progress = min(100, (out_time_ms / 1000000) / duration * 100)
-                            progress = round(progress, 1)
+            try:
+                for line in process.stdout:
+                    # 检查是否需要停止
+                    if self.stop_event.is_set():
+                        process.terminate()
+                        logger.info(f"[MediaPrep] 720p 转码被中断: {job_id}")
+                        break
+                    
+                    line_str = line.decode().strip()
+                    if line_str.startswith('out_time_ms='):
+                        try:
+                            out_time_ms = int(line_str.split('=')[1])
+                            if duration > 0:
+                                progress = min(100, (out_time_ms / 1000000) / duration * 100)
+                                progress = round(progress, 1)
 
-                            # 更新状态
-                            with self.lock:
-                                self.task_status[job_id]["proxy_720p"]["progress"] = progress
+                                # 更新状态
+                                with self.lock:
+                                    self.task_status[job_id]["proxy_720p"]["progress"] = progress
 
-                            # 推送 SSE 进度
-                            self._push_proxy_progress(job_id, progress)
+                                # 推送 SSE 进度
+                                self._push_proxy_progress(job_id, progress)
 
-                            # 每10%输出一次日志
-                            if progress >= last_logged_progress + 10:
-                                logger.info(f"[MediaPrep] 720p 转码进度: {job_id} - {progress:.1f}%")
-                                last_logged_progress = int(progress / 10) * 10
-                    except:
-                        pass
+                                # 每10%输出一次日志
+                                if progress >= last_logged_progress + 10:
+                                    logger.info(f"[MediaPrep] 720p 转码进度: {job_id} - {progress:.1f}%")
+                                    last_logged_progress = int(progress / 10) * 10
+                        except:
+                            pass
+            finally:
+                # 注销进程
+                self._unregister_process(process)
 
             process.wait()
 
@@ -1094,24 +1124,37 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
+            
+            # 注册进程以便在关闭时能够终止
+            self._register_process(process)
 
             # 解析进度
-            for line in process.stdout:
-                line_str = line.decode().strip()
-                if line_str.startswith('out_time_ms='):
-                    try:
-                        out_time_ms = int(line_str.split('=')[1])
-                        if duration > 0:
-                            progress = min(100, (out_time_ms / 1000000) / duration * 100)
-                            progress = round(progress, 1)
+            try:
+                for line in process.stdout:
+                    # 检查是否需要停止
+                    if self.stop_event.is_set():
+                        process.terminate()
+                        logger.info(f"[MediaPrep] 重封装被中断: {job_id}")
+                        break
+                    
+                    line_str = line.decode().strip()
+                    if line_str.startswith('out_time_ms='):
+                        try:
+                            out_time_ms = int(line_str.split('=')[1])
+                            if duration > 0:
+                                progress = min(100, (out_time_ms / 1000000) / duration * 100)
+                                progress = round(progress, 1)
 
-                            with self.lock:
-                                self.task_status[job_id]["remux"]["progress"] = progress
+                                with self.lock:
+                                    self.task_status[job_id]["remux"]["progress"] = progress
 
-                            # 推送进度
-                            self._push_remux_progress(job_id, progress)
-                    except:
-                        pass
+                                # 推送进度
+                                self._push_remux_progress(job_id, progress)
+                        except:
+                            pass
+            finally:
+                # 注销进程
+                self._unregister_process(process)
 
             process.wait()
 
@@ -1151,9 +1194,58 @@ class MediaPrepService:
                 "type": "remux"
             })
 
+    def _register_process(self, process: subprocess.Popen):
+        """注册活跃的子进程"""
+        with self._process_lock:
+            self._active_processes[process.pid] = process
+            logger.debug(f"[MediaPrep] 注册进程: PID={process.pid}")
+
+    def _unregister_process(self, process: subprocess.Popen):
+        """注销子进程"""
+        with self._process_lock:
+            if process.pid in self._active_processes:
+                del self._active_processes[process.pid]
+                logger.debug(f"[MediaPrep] 注销进程: PID={process.pid}")
+
+    def kill_all_subprocesses(self) -> int:
+        """
+        终止所有活跃的 FFmpeg 子进程
+        
+        Returns:
+            int: 被终止的进程数
+        """
+        killed_count = 0
+        with self._process_lock:
+            for pid, process in list(self._active_processes.items()):
+                try:
+                    if process.poll() is None:  # 进程仍在运行
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()  # 强制终止
+                        killed_count += 1
+                        logger.info(f"[MediaPrep] 已终止进程: PID={pid}")
+                except Exception as e:
+                    logger.warning(f"[MediaPrep] 终止进程失败 PID={pid}: {e}")
+            self._active_processes.clear()
+        return killed_count
+
     def shutdown(self):
         """关闭服务"""
         logger.info("[MediaPrep] 正在关闭...")
+        
+        # 1. 终止所有活跃的子进程
+        killed = self.kill_all_subprocesses()
+        if killed > 0:
+            logger.info(f"[MediaPrep] 已终止 {killed} 个子进程")
+        
+        # 2. 取消所有待检查的 720p 任务定时器
+        for job_id, timer in list(self.pending_720p_checks.items()):
+            timer.cancel()
+        self.pending_720p_checks.clear()
+        
+        # 3. 停止消费线程
         self.stop_event.set()
         self.consumer_thread.join(timeout=5)
         self.executor.shutdown(wait=False)

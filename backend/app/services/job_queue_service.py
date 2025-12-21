@@ -1215,9 +1215,42 @@ class JobQueueService:
             }
 
     def shutdown(self):
-        """停止Worker线程"""
+        """
+        停止Worker线程并保存所有任务状态
+        
+        执行顺序:
+        1. 设置停止信号
+        2. 保存当前运行任务的状态
+        3. 保存队列状态
+        4. 等待Worker线程结束
+        """
         logger.info("停止队列服务...")
+        
+        # 1. 设置停止信号
         self.stop_event.set()
+        
+        # 2. 保存当前运行任务的状态
+        with self.lock:
+            if self.running_job_id:
+                job = self.jobs.get(self.running_job_id)
+                if job:
+                    # 标记为暂停，这样流水线会保存 checkpoint
+                    job.paused = True
+                    job.message = "系统关闭，进度已保存"
+                    try:
+                        self.transcription_service.save_job_meta(job)
+                        logger.info(f"已保存运行中任务状态: {self.running_job_id}")
+                    except Exception as e:
+                        logger.warning(f"保存任务状态失败: {e}")
+        
+        # 3. 保存队列状态
+        try:
+            self._save_state()
+            logger.info("队列状态已保存")
+        except Exception as e:
+            logger.warning(f"保存队列状态失败: {e}")
+        
+        # 4. 等待Worker线程结束
         self.worker_thread.join(timeout=5)
         logger.info("队列服务已停止")
 

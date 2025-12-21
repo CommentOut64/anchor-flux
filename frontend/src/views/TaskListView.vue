@@ -973,7 +973,7 @@ async function getThumbnailUrl(jobId, forceReload = false) {
 async function handleExit() {
   try {
     await ElMessageBox.confirm(
-      '确定要退出系统吗？\n\n运行中的任务会自动保存进度，下次启动时继续执行。',
+      '确定要退出系统吗？所有更改都会自动保存',
       '确认退出',
       {
         confirmButtonText: '确定退出',
@@ -984,26 +984,61 @@ async function handleExit() {
 
     // 显示关闭进度
     const loading = ElLoading.service({
-      text: '正在安全关闭系统...',
+      text: '正在保存断点并关闭系统...',
       background: 'rgba(0, 0, 0, 0.7)'
     })
 
+    let shutdownSuccess = false
+    let cleanupReport = null
+
     try {
-      // 调用后端 shutdown API
-      await systemApi.shutdownSystem()
+      // 调用后端 shutdown API，设置超时
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 10000) // 10秒超时
+      
+      try {
+        const response = await systemApi.shutdownSystem({
+          cleanup_temp: false,  // 不清理临时文件，保留断点数据
+          force: false
+        })
+        
+        clearTimeout(timeoutId)
+        shutdownSuccess = response?.success || false
+        cleanupReport = response?.cleanup_report || null
+        
+        if (cleanupReport) {
+          console.log('[Exit] 清理报告:', cleanupReport)
+        }
+      } catch (e) {
+        clearTimeout(timeoutId)
+        // 请求可能因后端关闭而失败，这是预期行为
+        console.log('[Exit] 后端已关闭或请求超时:', e.message || e)
+        shutdownSuccess = true  // 如果后端已关闭，认为成功
+      }
     } catch (e) {
-      // 请求可能因后端关闭而失败，这是预期行为
-      console.log('[Exit] 后端已关闭:', e)
+      console.log('[Exit] 关闭请求异常:', e)
+      shutdownSuccess = true  // 即使异常也认为成功（后端可能已关闭）
     }
 
     loading.close()
 
     // 显示关闭完成提示
+    const message = shutdownSuccess 
+      ? '系统已安全关闭，请手动关闭此浏览器标签页。'
+      : '系统关闭可能未完全成功，请手动检查后台进程。'
+    
     await ElMessageBox.alert(
-      '系统已安全关闭。\n\n请手动关闭此浏览器标签页。\n下次启动时，运行中的任务将自动恢复。',
+      message,
       '关闭完成',
-      { type: 'success' }
+      { type: shutdownSuccess ? 'success' : 'warning' }
     )
+    
+    // 尝试关闭当前窗口（部分浏览器可能阻止）
+    try {
+      window.close()
+    } catch (e) {
+      // 忽略关闭窗口失败
+    }
   } catch (error) {
     // 用户取消退出
     if (error !== 'cancel') {
