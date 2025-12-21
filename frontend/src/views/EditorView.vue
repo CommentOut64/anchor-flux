@@ -276,14 +276,41 @@ watch(() => proxyVideo.state.value, (newState, oldState) => {
 
 // ========== 计算属性 ==========
 
-// 项目名称
+// 项目名称 - 优先显示 title，否则显示 filename（去除扩展名）
+// 【修复】过滤掉看起来像 UUID/16进制 的名称
 const projectName = computed(() => {
-  if (projectStore.meta.title) {
+  // 检查是否看起来像 UUID（16进制字符串）
+  const isUuidLike = (str) => {
+    if (!str) return true
+    // 匹配纯16进制字符串（8-36位）
+    return /^[0-9a-f]{8,36}$/i.test(str.replace(/-/g, ''))
+  }
+
+  // 优先使用用户自定义的 title
+  if (projectStore.meta.title && !isUuidLike(projectStore.meta.title)) {
     return projectStore.meta.title
   }
-  const filename = projectStore.meta.filename || '未命名项目'
-  const lastDotIndex = filename.lastIndexOf('.')
-  return lastDotIndex > 0 ? filename.substring(0, lastDotIndex) : filename
+
+  // 使用 filename（去除扩展名）
+  const filename = projectStore.meta.filename
+  if (filename && !isUuidLike(filename)) {
+    const lastDotIndex = filename.lastIndexOf('.')
+    return lastDotIndex > 0 ? filename.substring(0, lastDotIndex) : filename
+  }
+
+  // 尝试从 taskStore 获取
+  const task = taskStore.tasks.find(t => t.job_id === props.jobId)
+  if (task) {
+    if (task.title && !isUuidLike(task.title)) {
+      return task.title
+    }
+    if (task.filename && !isUuidLike(task.filename)) {
+      const lastDotIndex = task.filename.lastIndexOf('.')
+      return lastDotIndex > 0 ? task.filename.substring(0, lastDotIndex) : task.filename
+    }
+  }
+
+  return '未命名项目'
 })
 
 // 基础状态

@@ -11,7 +11,24 @@
       <div class="divider-vertical"></div>
 
       <div class="task-info-stack">
-        <h1 class="task-name" :title="taskName">{{ taskName }}</h1>
+        <!-- 任务名称：双击可编辑 -->
+        <div class="task-name-wrapper">
+          <input
+            v-if="isEditingTitle"
+            ref="titleInputRef"
+            v-model="editingTitleValue"
+            class="task-name-input"
+            @blur="finishEditTitle"
+            @keydown.enter="finishEditTitle"
+            @keydown.escape="cancelEditTitle"
+          />
+          <h1
+            v-else
+            class="task-name"
+            :title="taskName + ' (双击重命名)'"
+            @dblclick="startEditTitle"
+          >{{ taskName }}</h1>
+        </div>
         <div class="task-meta">
           <span class="status-dot" :class="statusClass"></span>
           <span class="meta-text">{{ metaText }}</span>
@@ -177,10 +194,18 @@
  * - 任务信息展示（名称、状态）
  * - 动态进度显示（当前任务 / 队列总进度）
  * - 全局操作入口（任务监控、撤销/重做、导出）
+ * - 双击重命名任务
  */
-import { computed } from 'vue'
+import { computed, ref, nextTick } from 'vue'
+import { ElMessage } from 'element-plus'
 import TaskMonitor from './TaskMonitor/index.vue'
 import { PHASE_CONFIG, STATUS_CONFIG, formatProgress } from '@/constants/taskPhases'
+import transcriptionApi from '@/services/api/transcriptionApi'
+import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { useProjectStore } from '@/stores/projectStore'
+
+const taskStore = useUnifiedTaskStore()
+const projectStore = useProjectStore()
 
 const props = defineProps({
   jobId: { type: String, required: true },
@@ -201,7 +226,72 @@ const props = defineProps({
   }
 })
 
-defineEmits(['undo', 'redo', 'export', 'pause', 'resume', 'cancel'])
+const emit = defineEmits(['undo', 'redo', 'export', 'pause', 'resume', 'cancel', 'rename'])
+
+// ========== 任务名称编辑 ==========
+const isEditingTitle = ref(false)
+const editingTitleValue = ref('')
+const titleInputRef = ref(null)
+
+// 开始编辑任务名称
+function startEditTitle() {
+  isEditingTitle.value = true
+  editingTitleValue.value = props.taskName
+  
+  nextTick(() => {
+    if (titleInputRef.value) {
+      titleInputRef.value.focus()
+      titleInputRef.value.select()
+    }
+  })
+}
+
+// 完成编辑任务名称
+async function finishEditTitle() {
+  if (!isEditingTitle.value) return
+  
+  const newTitle = editingTitleValue.value.trim()
+  
+  // 如果标题为空，提示并恢复原名称
+  if (!newTitle) {
+    ElMessage.warning('任务名称不能为空')
+    isEditingTitle.value = false
+    return
+  }
+  
+  // 如果没有变化，直接关闭编辑
+  if (newTitle === props.taskName) {
+    isEditingTitle.value = false
+    return
+  }
+  
+  try {
+    // 调用 API 重命名任务
+    await transcriptionApi.renameJob(props.jobId, newTitle)
+    
+    // 更新 unifiedTaskStore
+    taskStore.updateTask(props.jobId, { title: newTitle })
+    
+    // 更新 projectStore.meta.title
+    projectStore.meta.title = newTitle
+    
+    // 通知父组件
+    emit('rename', newTitle)
+    
+    ElMessage.success('重命名成功')
+  } catch (error) {
+    console.error('重命名任务失败:', error)
+    ElMessage.error(`重命名失败: ${error.message || '未知错误'}`)
+  } finally {
+    isEditingTitle.value = false
+  }
+}
+
+// 取消编辑
+function cancelEditTitle() {
+  isEditingTitle.value = false
+  editingTitleValue.value = props.taskName
+}
 
 // 是否暂停状态
 const isPaused = computed(() => props.currentTaskStatus === 'paused')
@@ -332,6 +422,12 @@ $header-h: 56px;
     flex-direction: column;
     gap: 2px;
 
+    .task-name-wrapper {
+      display: flex;
+      align-items: center;
+      max-width: 300px;
+    }
+
     .task-name {
       margin: 0;
       font-size: 14px;
@@ -341,6 +437,31 @@ $header-h: 56px;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      cursor: pointer;
+      padding: 2px 4px;
+      border-radius: var(--radius-sm);
+      transition: background 0.2s;
+
+      &:hover {
+        background: var(--bg-tertiary);
+      }
+    }
+
+    .task-name-input {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-primary);
+      background: var(--bg-tertiary);
+      border: 1px solid var(--primary);
+      border-radius: var(--radius-sm);
+      padding: 2px 6px;
+      width: 200px;
+      max-width: 300px;
+      outline: none;
+
+      &:focus {
+        box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.3);
+      }
     }
 
     .task-meta {

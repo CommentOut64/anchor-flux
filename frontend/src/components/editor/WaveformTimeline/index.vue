@@ -221,19 +221,23 @@ function calculateWaveformConfig(videoDuration, containerWidth) {
   );
   const suggestedZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, idealFitZoom));
 
-  // 根据视频时长选择柱子配置
+  // 【修复】根据视频时长选择柱子配置，始终保持柱形外观
+  // 之前超过30分钟会使用线条模式，导致波形偶尔变成锯齿状
   let barConfig = {};
   if (videoDuration < 60) {
-    // 短视频（<1分钟）：细柱子
+    // 短视频（<1分钟）：粗柱子
     barConfig = { barWidth: 2, barGap: 1, barRadius: 2 };
   } else if (videoDuration < 300) {
-    // 中等视频（1-5分钟）：更细的柱子
+    // 中等视频（1-5分钟）：中等柱子
     barConfig = { barWidth: 1.5, barGap: 0.5, barRadius: 1 };
   } else if (videoDuration < 1800) {
-    // 较长视频（5-30分钟）：最细柱子
+    // 较长视频（5-30分钟）：细柱子
     barConfig = { barWidth: 1, barGap: 0.5, barRadius: 1 };
+  } else {
+    // 【修复】超过30分钟的视频也使用最细柱子，保持柱形外观
+    // 之前不设置 barWidth 会导致波形变成锯齿状线条
+    barConfig = { barWidth: 1, barGap: 0.3, barRadius: 0.5 };
   }
-  // 超过30分钟的视频使用线条模式（不设置 barWidth）
 
   return {
     basePxPerSec, // 固定基准（50px/s）
@@ -360,10 +364,8 @@ function setupWavesurferEvents() {
       const initialPxPerSec = basePxPerSec * (suggestedZoom / 100);
       wavesurfer.zoom(initialPxPerSec);
 
-      // 应用柱子配置
-      if (Object.keys(barConfig).length > 0) {
-        wavesurfer.setOptions(barConfig);
-      }
+      // 【修复】始终应用柱子配置，确保波形保持柱形外观
+      wavesurfer.setOptions(barConfig);
     }
 
     renderSubtitleRegions();
@@ -556,17 +558,13 @@ function fitToScreen() {
 
     setZoom(fitZoom);
 
-    // 根据时长动态调整柱子配置
+    // 【修复】根据时长动态调整柱子配置，始终保持柱形外观
     const { barConfig } = calculateWaveformConfig(
       audioDuration,
       containerWidth
     );
-    if (Object.keys(barConfig).length > 0) {
-      wavesurfer.setOptions(barConfig);
-    } else {
-      // 长视频使用线条模式
-      wavesurfer.setOptions({ barWidth: 0, barGap: 0 });
-    }
+    // barConfig 现在始终非空，直接应用
+    wavesurfer.setOptions(barConfig);
   }
 }
 

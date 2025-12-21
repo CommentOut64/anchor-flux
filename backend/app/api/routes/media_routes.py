@@ -223,6 +223,8 @@ def _generate_peaks_with_ffmpeg(audio_path: Path, samples: int = 2000) -> Tuple[
     """
     使用FFmpeg生成波形峰值数据（比Python wave更高效）
     适用于大文件（>100MB）
+    
+    【关键修复】基于时间位置计算峰值，确保波形与时间轴严格对齐
     """
     ffmpeg_cmd = config.get_ffmpeg_command()
     ffprobe_cmd = config.get_ffprobe_command()
@@ -248,11 +250,12 @@ def _generate_peaks_with_ffmpeg(audio_path: Path, samples: int = 2000) -> Tuple[
         return [], 0
 
     # 使用FFmpeg提取原始PCM数据（降采样到8kHz单声道以减少数据量）
+    SAMPLE_RATE = 8000  # 采样率常量
     cmd = [
         ffmpeg_cmd,
         '-i', str(audio_path),
         '-ac', '1',           # 单声道
-        '-ar', '8000',        # 8kHz采样率
+        '-ar', str(SAMPLE_RATE),  # 8kHz采样率
         '-f', 's16le',        # 16-bit PCM
         '-acodec', 'pcm_s16le',
         '-'
@@ -269,17 +272,40 @@ def _generate_peaks_with_ffmpeg(audio_path: Path, samples: int = 2000) -> Tuple[
 
         # 解析PCM数据
         pcm_data = result.stdout
-        sample_count = len(pcm_data) // 2  # 16-bit = 2 bytes
+        actual_sample_count = len(pcm_data) // 2  # 16-bit = 2 bytes
 
-        if sample_count < samples:
-            samples = sample_count
+        if actual_sample_count == 0:
+            return [], duration
 
-        chunk_size = sample_count // samples
+        # 限制峰值数量不超过实际采样数
+        if actual_sample_count < samples:
+            samples = actual_sample_count
+
+        # 【关键修复】基于时间位置计算每个峰值对应的采样范围
+        # 这样确保第 i 个峰值严格对应时间轴上的 [i/samples * duration, (i+1)/samples * duration]
+        # 而不是依赖 PCM 数据量（可能与 duration 不精确匹配）
         peaks = []
+        time_per_peak = duration / samples  # 每个峰值代表的时间长度
 
         for i in range(samples):
-            start_idx = i * chunk_size * 2
-            end_idx = min(start_idx + chunk_size * 2, len(pcm_data))
+            # 基于时间计算采样范围
+            start_time = i * time_per_peak
+            end_time = (i + 1) * time_per_peak
+            
+            # 转换为采样点索引（基于实际采样率）
+            start_sample = int(start_time * SAMPLE_RATE)
+            end_sample = int(end_time * SAMPLE_RATE)
+            
+            # 确保不越界（PCM 数据可能比理论值稍短或稍长）
+            start_sample = min(start_sample, actual_sample_count - 1)
+            end_sample = min(end_sample, actual_sample_count)
+            
+            if start_sample >= end_sample:
+                peaks.extend([0.0, 0.0])
+                continue
+            
+            start_idx = start_sample * 2  # 16-bit = 2 bytes
+            end_idx = end_sample * 2
             chunk_bytes = pcm_data[start_idx:end_idx]
 
             if len(chunk_bytes) < 2:
@@ -306,6 +332,8 @@ def _generate_peaks_with_ffmpeg(audio_path: Path, samples: int = 2000) -> Tuple[
 def _generate_peaks_with_wave(audio_path: Path, samples: int = 2000) -> Tuple[list, float]:
     """
     使用Python wave模块生成波形峰值数据（流式读取，低内存占用）
+    
+    【关键修复】基于时间位置计算峰值，确保波形与时间轴严格对齐
     """
     try:
         with wave.open(str(audio_path), 'rb') as wav:
@@ -315,12 +343,37 @@ def _generate_peaks_with_wave(audio_path: Path, samples: int = 2000) -> Tuple[li
             sample_width = wav.getsampwidth()
             duration = n_frames / frame_rate
 
+            if duration <= 0:
+                return [], 0
+
             if n_frames < samples:
                 samples = n_frames
-            chunk_frames = n_frames // samples
+            
+            # 【关键修复】基于时间位置计算每个峰值的帧范围
+            # 确保第 i 个峰值严格对应时间轴上的 [i/samples * duration, (i+1)/samples * duration]
+            time_per_peak = duration / samples
             peaks = []
 
             for i in range(samples):
+                # 基于时间计算帧范围
+                start_time = i * time_per_peak
+                end_time = (i + 1) * time_per_peak
+                
+                # 转换为帧索引
+                start_frame = int(start_time * frame_rate)
+                end_frame = int(end_time * frame_rate)
+                
+                # 确保不越界
+                start_frame = min(start_frame, n_frames - 1)
+                end_frame = min(end_frame, n_frames)
+                chunk_frames = end_frame - start_frame
+                
+                if chunk_frames <= 0:
+                    peaks.extend([0.0, 0.0])
+                    continue
+                
+                # 定位到精确位置
+                wav.setpos(start_frame)
                 frames_data = wav.readframes(chunk_frames)
 
                 if not frames_data:
@@ -677,13 +730,20 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
         samples = max(4000, min(target_samples, 100000))
         print(f"[media] 动态采样：时长{duration:.1f}s → {samples}个采样点")
 
-    peaks_cache_file = job_dir / f"peaks_{samples}.json"
+    # 【修复】使用版本号标识缓存，算法更新后自动使旧缓存失效
+    # v2: 修复了采样位置计算的累积误差问题
+    # v3: 改用基于时间位置的精确计算，确保波形与时间轴严格对齐
+    PEAKS_CACHE_VERSION = 3
+    peaks_cache_file = job_dir / f"peaks_{samples}_v{PEAKS_CACHE_VERSION}.json"
 
     # 检查缓存
     if peaks_cache_file.exists():
         try:
             with open(peaks_cache_file, 'r') as f:
-                return JSONResponse(json.load(f))
+                cached_data = json.load(f)
+                # 验证缓存版本
+                if cached_data.get("cache_version") == PEAKS_CACHE_VERSION:
+                    return JSONResponse(cached_data)
         except:
             pass
 
@@ -718,7 +778,8 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
             "peaks": peaks,
             "duration": duration,
             "method": used_method,
-            "samples": len(peaks) // 2
+            "samples": len(peaks) // 2,
+            "cache_version": PEAKS_CACHE_VERSION  # 添加版本号到缓存
         }
 
         # 缓存结果
