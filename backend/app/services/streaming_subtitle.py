@@ -327,6 +327,14 @@ class StreamingSubtitleManager:
         Returns:
             List[int]: 新的句子索引列表
         """
+        # 防御性检查：如果新句子列表为空，保留原有草稿，不要删除
+        if not sentences:
+            self.logger.warning(
+                f"replace_chunk: Chunk {chunk_index} 的定稿句子为空，"
+                f"保留原有草稿句子以避免字幕丢失"
+            )
+            return self.chunk_sentences.get(chunk_index, [])
+
         # 删除旧的草稿句子
         old_indices = self.chunk_sentences.get(chunk_index, [])
         for old_index in old_indices:

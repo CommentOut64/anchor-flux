@@ -478,10 +478,16 @@ class SentenceSplitter:
 
             # 执行切分
             if should_split and current_words:
-                sentence = self._create_sentence(current_words)
+                # 硬上限保护或最后一个词时强制保留，跳过 min_chars 检查
+                force_create = (split_reason == "hard_limit_protection" or
+                                split_reason == "end_of_input")
+                sentence = self._create_sentence(current_words, force_create=force_create)
                 if sentence:
                     sentences.append(sentence)
                     logger.debug(f"分句: '{sentence.text[-50:]}' (原因: {split_reason}, 时长: {current_duration:.2f}s)")
+                elif force_create:
+                    # 如果强制创建仍然返回 None（words为空），记录警告
+                    logger.warning(f"强制创建句子失败: split_reason={split_reason}, words数={len(current_words)}")
 
                 # 重置
                 current_words = []
@@ -770,8 +776,21 @@ class SentenceSplitter:
 
         return result
 
-    def _create_sentence(self, words: List['WordTimestamp']) -> Optional['SentenceSegment']:
-        """创建句子对象 (集成边界修剪)"""
+    def _create_sentence(
+        self,
+        words: List['WordTimestamp'],
+        force_create: bool = False
+    ) -> Optional['SentenceSegment']:
+        """
+        创建句子对象 (集成边界修剪)
+
+        Args:
+            words: 词列表
+            force_create: 强制创建句子，跳过 min_chars 检查（用于硬上限后的尾部保留）
+
+        Returns:
+            SentenceSegment 或 None
+        """
         from ..models.sensevoice_models import SentenceSegment
         from ..services.text_normalizer import get_text_normalizer
 
@@ -805,7 +824,8 @@ class SentenceSplitter:
             logger.debug(f"文本清洗: 清洗前={text_raw[:50]}, 清洗后={text_clean[:50]}")
 
         # 过滤过短句子（基于清洗后的文本）
-        if len(text_clean.strip()) < self.config.min_chars:
+        # force_create=True 时跳过此检查（硬上限后的尾部强制保留）
+        if not force_create and len(text_clean.strip()) < self.config.min_chars:
             return None
 
         # 计算平均置信度
@@ -830,11 +850,16 @@ class SentenceSplitter:
         sentences: List['SentenceSegment']
     ) -> List['SentenceSegment']:
         """
-        合并过短句子（增强版：同时检查字符数和时长）
+        合并过短句子（修复版：向前合并）
 
         合并条件：
         1. 字符数 <= short_sentence_threshold（默认8个字符）
         2. 或 时长 < min_duration_threshold（默认0.5秒）
+
+        策略：
+        - 短句优先与前一句合并（更符合语义）
+        - 如果是第一句，则与下一句合并
+        - 极短句子（<0.2s）强制合并
 
         Args:
             sentences: 句子列表
@@ -857,13 +882,56 @@ class SentenceSplitter:
             # 检查是否为短句（字符数或时长）
             is_short_by_chars = len(current.text) <= self.config.short_sentence_threshold
             is_short_by_duration = current_duration < self.config.min_duration_threshold
+            is_very_short = current_duration < 0.2  # 极短句子（如0.10s）
 
-            if is_short_by_chars or is_short_by_duration:
-                # 尝试与下一句合并
+            if is_short_by_chars or is_short_by_duration or is_very_short:
+                # 策略1：优先与前一句合并（更符合语义）
+                if merged:
+                    prev = merged[-1]
+
+                    # 检查合并后是否超限
+                    merged_duration = current.end - prev.start
+                    max_chars = self.config.max_chars if self.config.max_chars > 0 else 1000
+                    merged_text = prev.text.rstrip() + ' ' + current.text.lstrip()
+
+                    # 极短句子强制合并，普通短句检查超限
+                    should_merge = is_very_short or (
+                        merged_duration <= self.config.max_duration and
+                        len(merged_text) <= max_chars
+                    )
+
+                    if should_merge:
+                        # 合并到前一句
+                        merged_text_clean = (prev.text_clean or prev.text).rstrip() + ' ' + (current.text_clean or current.text).lstrip()
+                        merged_words = prev.words + current.words
+
+                        avg_confidence = (
+                            (prev.confidence * len(prev.words) +
+                             current.confidence * len(current.words)) /
+                            len(merged_words)
+                        ) if merged_words else prev.confidence
+
+                        # 更新前一句
+                        prev.text = merged_text
+                        prev.text_clean = merged_text_clean
+                        prev.end = current.end
+                        prev.words = merged_words
+                        prev.confidence = avg_confidence
+
+                        logger.info(
+                            f"向前合并短句: [{current_duration:.2f}s, {len(current.text)}字符] "
+                            f"\"{current.text}\" → 前句 (合并后{merged_duration:.2f}s)"
+                        )
+
+                        i += 1
+                        continue
+
+                # 策略2：如果向前合并失败，尝试与下一句合并
+                # 修复: 移除 "not merged" 条件，允许在向前合并失败时尝试向后合并
                 if i + 1 < len(sentences):
                     next_sent = sentences[i + 1]
-                    merged_text = current.text + next_sent.text
-                    merged_text_clean = (current.text_clean or current.text) + (next_sent.text_clean or next_sent.text)
+                    merged_text = current.text.rstrip() + ' ' + next_sent.text.lstrip()
+                    merged_text_clean = (current.text_clean or current.text).rstrip() + ' ' + (next_sent.text_clean or next_sent.text).lstrip()
                     merged_words = current.words + next_sent.words
 
                     # 检查合并后是否超限
@@ -877,7 +945,7 @@ class SentenceSplitter:
                             (current.confidence * len(current.words) +
                              next_sent.confidence * len(next_sent.words)) /
                             len(merged_words)
-                        )
+                        ) if merged_words else current.confidence
 
                         merged_sentence = SentenceSegment(
                             text=merged_text,
@@ -893,9 +961,9 @@ class SentenceSplitter:
                         merged_sentence.is_finalized = current.is_finalized
                         merged_sentence.source = current.source
 
-                        logger.debug(
-                            f"合并短句: '{current.text[:20]}...' (chars={len(current.text)}, "
-                            f"dur={current_duration:.2f}s) + '{next_sent.text[:20]}...'"
+                        logger.info(
+                            f"向后合并短句: [{current_duration:.2f}s, {len(current.text)}字符] "
+                            f"\"{current.text}\" + 下句 (合并后{merged_duration:.2f}s)"
                         )
 
                         merged.append(merged_sentence)

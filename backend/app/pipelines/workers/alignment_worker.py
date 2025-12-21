@@ -138,6 +138,16 @@ class AlignmentWorker:
         ctx.final_sentences = final_sentences
 
         # 阶段 2: 推送定稿（使用 Chunk 级别的批量替换）
+        # 防御性检查：如果定稿句子为空，记录警告但仍然调用 replace_chunk
+        # replace_chunk 内部会保留原有草稿句子
+        if not final_sentences:
+            self.logger.error(
+                f"Chunk {ctx.chunk_index}: 定稿句子为空！"
+                f"Whisper文本长度={len(whisper_result.get('text', ''))}, "
+                f"SenseVoice文本长度={len(sv_result.get('text_clean', ''))}, "
+                f"对齐级别={alignment_level.value}"
+            )
+
         self.subtitle_manager.replace_chunk(ctx.chunk_index, final_sentences)
 
         self.logger.info(
@@ -171,16 +181,41 @@ class AlignmentWorker:
         self.final_splitter.config.language = detected_language
         self.logger.debug(f"使用 Whisper 检测到的语言: {detected_language}")
 
-        # ========== 早期拦截：长度暴涨检测 ==========
+        # ========== 早期拦截：长度异常检测 ==========
         whisper_text = whisper_result.get('text', '').strip()
         sv_text_clean = sv_result.get('text_clean', '').strip()
 
-        # 检测 Whisper 输出是否异常膨胀
+        # 检测0: Whisper 单词数过少（幻觉检测）
+        # 统计Whisper识别出的单词数，如果少于2个，可能是幻觉
+        if whisper_text:
+            # 简单的单词统计：按空格分割（适用于英文）或按字符统计（适用于中文）
+            word_count = len(whisper_text.split())
+            if word_count < 2 and sv_text_clean:
+                self.logger.warning(
+                    f"Whisper 单词数过少（{word_count} < 2），可能是幻觉，直接降级到 Level 3: "
+                    f"whisper='{whisper_text}', sv='{sv_text_clean[:50]}...'"
+                )
+                # 直接降级到 Level 3（SenseVoice 草稿）
+                sentences = self._split_sentences_from_sv(sv_result, chunk)
+                if sentences:  # 只有当SenseVoice有结果时才返回
+                    for sentence in sentences:
+                        sentence.is_finalized = True
+                        sentence.is_draft = False
+                    return sentences, AlignmentLevel.SENSEVOICE_ONLY
+                else:
+                    # SenseVoice也为空，返回空列表（删除该段字幕）
+                    self.logger.warning(
+                        f"Whisper和SenseVoice都没有有效内容，返回空列表"
+                    )
+                    return [], AlignmentLevel.SENSEVOICE_ONLY
+
+        # 检测 Whisper 输出是否异常
         if sv_text_clean:  # 仅当 SenseVoice 有输出时检查
             len_w = len(whisper_text)
             len_sv = len(sv_text_clean)
 
-            # 长度暴涨公式: len(whisper) > 3 * len(sensevoice) + 10
+            # 检测1: Whisper 长度暴涨（幻觉）
+            # 公式: len(whisper) > 3 * len(sensevoice) + 10
             if len_w > 3 * len_sv + 10:
                 # 检查 Whisper 置信度
                 whisper_confidence = whisper_result.get('confidence', 0.5)
@@ -206,6 +241,24 @@ class AlignmentWorker:
                         f"len(whisper)={len_w} > 3*{len_sv}+10, "
                         f"confidence={whisper_confidence:.2f} >= 0.5"
                     )
+
+            # 检测2: Whisper 过短或为空（识别失败）
+            # 公式: len(whisper) < len(sensevoice) * 0.3
+            # 说明：Whisper 输出明显少于 SenseVoice，可能是识别失败
+            # 修复：移除 len_w > 0 的限制，让 len_w == 0 的情况也能被捕获
+            elif len_w < len_sv * 0.3:
+                self.logger.warning(
+                    f"Whisper 输出过短或为空，直接降级到 Level 3: "
+                    f"len(whisper)={len_w} < {len_sv} * 0.3, "
+                    f"whisper='{whisper_text[:50] if whisper_text else '(空)'}', "
+                    f"sv='{sv_text_clean[:50]}...'"
+                )
+                # 直接降级到 Level 3（SenseVoice 草稿）
+                sentences = self._split_sentences_from_sv(sv_result, chunk)
+                for sentence in sentences:
+                    sentence.is_finalized = True
+                    sentence.is_draft = False
+                return sentences, AlignmentLevel.SENSEVOICE_ONLY
 
         try:
             # Level 1: 尝试双模态对齐
@@ -323,16 +376,49 @@ class AlignmentWorker:
                 self.logger.error(f"Whisper 伪对齐失败: {e2}, 降级到 SenseVoice 草稿")
 
                 # Level 3: SenseVoice 草稿
-                sentences = self._split_sentences_from_sv(sv_result, chunk)
+                try:
+                    sentences = self._split_sentences_from_sv(sv_result, chunk)
 
-                # 设置为定稿状态（虽然是草稿，但作为最终结果）
-                for sentence in sentences:
-                    sentence.is_finalized = True
-                    sentence.is_draft = False
+                    # 设置为定稿状态（虽然是草稿，但作为最终结果）
+                    for sentence in sentences:
+                        sentence.is_finalized = True
+                        sentence.is_draft = False
 
-                self.logger.info(f"使用 SenseVoice 草稿作为最终结果, 分句数={len(sentences)}")
+                    self.logger.info(f"使用 SenseVoice 草稿作为最终结果, 分句数={len(sentences)}")
 
-                return sentences, AlignmentLevel.SENSEVOICE_ONLY
+                    return sentences, AlignmentLevel.SENSEVOICE_ONLY
+
+                except Exception as e3:
+                    # Level 4: 最终兜底方案
+                    self.logger.error(f"SenseVoice 草稿也失败: {e3}, 使用最终兜底方案")
+
+                    # 尝试使用任何可用的文本
+                    fallback_text = whisper_text or sv_text_clean
+
+                    if not fallback_text:
+                        # 如果两者都为空，返回空列表（删除该段字幕）
+                        self.logger.warning(
+                            f"Whisper 和 SenseVoice 都没有识别出内容，返回空列表"
+                        )
+                        return [], AlignmentLevel.SENSEVOICE_ONLY
+
+                    # 创建覆盖整个Chunk的单句字幕
+                    from app.models.sensevoice_models import SentenceSegment, TextSource
+                    sentence = SentenceSegment(
+                        text=fallback_text,
+                        start=chunk.start,
+                        end=chunk.start + chunk.duration,
+                        source=TextSource.SENSEVOICE_DRAFT,
+                        is_finalized=True,
+                        is_draft=False
+                    )
+
+                    self.logger.warning(
+                        f"兜底字幕: [{chunk.start:.2f}s - {chunk.start + chunk.duration:.2f}s] "
+                        f"text='{fallback_text[:30]}...'"
+                    )
+
+                    return [sentence], AlignmentLevel.SENSEVOICE_ONLY
 
     def _split_sentences_from_sv(
         self,
