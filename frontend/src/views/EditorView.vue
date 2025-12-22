@@ -548,10 +548,20 @@ function subscribeSSE() {
     },
 
     onProgress(data) {
-      console.log('[EditorView] SSE 进度更新:', data.percent, data.phase)
+      console.log('[EditorView] SSE 进度更新:', data.percent, data.phase, data.detail)
       taskProgress.value = data.percent || 0
       taskStatus.value = data.status || taskStatus.value
       taskPhase.value = data.phase || taskPhase.value
+
+      // V3.7.2: 更新双流进度（从后端 SSE 获取，而非前端计算）
+      if (data.detail) {
+        projectStore.updateDualStreamProgressFromSSE({
+          fastStream: Math.round(data.detail.fast || 0),
+          slowStream: Math.round(data.detail.slow || 0),
+          // totalChunks 从 processed/total 推断
+          totalChunks: data.total || projectStore.dualStreamProgress.totalChunks
+        })
+      }
 
       // 同步进度到 store，确保 TaskMonitor 实时更新
       taskStore.updateTaskProgress(props.jobId, data.percent || 0, data.status, {

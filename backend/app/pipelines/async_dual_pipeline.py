@@ -20,6 +20,10 @@ V3.7 更新：
 - 集成 CancellationToken 支持暂停/取消
 - 支持断点续传检查点保存
 - SlowWorker 保存上文状态 (previous_whisper_text)
+
+V3.7.1 更新：
+- 集成 ProgressEventEmitter 统一进度发射器
+- 实时同步 job.progress 并推送 SSE 事件
 """
 import asyncio
 import logging
@@ -34,6 +38,7 @@ from app.pipelines.workers import FastWorker, SlowWorker, AlignmentWorker
 # V3.7: 导入取消令牌和异常
 if TYPE_CHECKING:
     from app.utils.cancellation_token import CancellationToken
+    from app.services.progress_emitter import ProgressEventEmitter  # V3.7.1
 
 
 class AsyncDualPipeline:
@@ -63,7 +68,8 @@ class AsyncDualPipeline:
         enable_fallback: bool = True,
         transcription_profile: str = "sv_whisper_patch",
         logger: Optional[logging.Logger] = None,
-        cancellation_token: Optional["CancellationToken"] = None  # V3.7: 新增
+        cancellation_token: Optional["CancellationToken"] = None,  # V3.7: 新增
+        progress_emitter: Optional["ProgressEventEmitter"] = None  # V3.7.1: 新增
     ):
         """
         初始化流水线
@@ -80,11 +86,13 @@ class AsyncDualPipeline:
             transcription_profile: 转录模式 (sensevoice_only/sv_whisper_patch/sv_whisper_dual)
             logger: 日志记录器
             cancellation_token: 取消令牌（可选，V3.7）
+            progress_emitter: 进度发射器（可选，V3.7.1）
         """
         self.job_id = job_id
         self.logger = logger or logging.getLogger(__name__)
         self.transcription_profile = transcription_profile
         self.cancellation_token = cancellation_token  # V3.7
+        self.progress_emitter = progress_emitter  # V3.7.1
 
         # 判断是否为纯 SenseVoice 模式
         self.is_sensevoice_only = (transcription_profile == "sensevoice_only")
@@ -182,12 +190,14 @@ class AsyncDualPipeline:
         FastWorker 输出直接作为定稿推送，跳过 Whisper 和对齐。
 
         V3.7: 支持逐 Chunk 中断和检查点保存
+        V3.7.1: 集成进度发射器，实时推送 SSE 进度
         """
         self.logger.info(f"极速模式开始: {len(audio_chunks)} 个 Chunk")
 
         results: List[ProcessingContext] = []
         token = self.cancellation_token  # V3.7
         processed_indices = processed_indices or set()
+        total_chunks = len(audio_chunks)
 
         for i, chunk in enumerate(audio_chunks):
             # V3.7: 跳过已处理的 chunk（用于恢复）
@@ -211,6 +221,14 @@ class AsyncDualPipeline:
                 # FastWorker 处理（SenseVoice 推理 + 分句 + 推送定稿）
                 await self.fast_worker.process(ctx)
                 results.append(ctx)
+
+                # V3.7.1: 更新进度（极速模式只有 fast 阶段）
+                if self.progress_emitter:
+                    processed_count = len(results)
+                    self.progress_emitter.update_fast(
+                        processed_count, total_chunks,
+                        message=f"SenseVoice: {processed_count}/{total_chunks}"
+                    )
             except Exception as e:
                 self.logger.error(f"Chunk {i} 处理失败: {e}", exc_info=True)
                 self.errors.append(e)
@@ -260,6 +278,7 @@ class AsyncDualPipeline:
         5. 检查异常
 
         V3.7: 支持检查点保存和恢复
+        V3.7.1: 集成进度发射器
 
         Args:
             audio_chunks: AudioChunk 列表
@@ -271,7 +290,8 @@ class AsyncDualPipeline:
         Returns:
             List[ProcessingContext]: 处理结果列表
         """
-        self.logger.info(f"开始三级流水线: {len(audio_chunks)} 个 Chunk")
+        total_chunks = len(audio_chunks)  # V3.7.1: 保存总数用于进度计算
+        self.logger.info(f"开始三级流水线: {total_chunks} 个 Chunk")
 
         # 存储结果
         results: List[ProcessingContext] = []
@@ -279,12 +299,12 @@ class AsyncDualPipeline:
         # V3.7: 初始化已处理索引集合
         processed_indices = processed_indices or set()
 
-        # 启动三个并行任务
+        # 启动三个并行任务（V3.7.1: 传递 total_chunks）
         task_fast = asyncio.create_task(
-            self._fast_loop(audio_chunks, full_audio_array, full_audio_sr, job_dir, processed_indices)
+            self._fast_loop(audio_chunks, full_audio_array, full_audio_sr, job_dir, processed_indices, total_chunks)
         )
-        task_slow = asyncio.create_task(self._slow_loop(job_dir))
-        task_align = asyncio.create_task(self._align_loop(results, job_dir))
+        task_slow = asyncio.create_task(self._slow_loop(job_dir, total_chunks))
+        task_align = asyncio.create_task(self._align_loop(results, job_dir, total_chunks))
 
         # 等待所有任务结束（return_exceptions=True 确保一个挂了不会立刻抛出）
         await_results = await asyncio.gather(
@@ -313,7 +333,8 @@ class AsyncDualPipeline:
         full_audio_array: Optional[Any] = None,
         full_audio_sr: int = 16000,
         job_dir: Optional[Path] = None,  # V3.7
-        processed_indices: Optional[Set[int]] = None  # V3.7
+        processed_indices: Optional[Set[int]] = None,  # V3.7
+        total_chunks: int = 0  # V3.7.1
     ):
         """
         FastWorker 循环（生产者）
@@ -326,6 +347,7 @@ class AsyncDualPipeline:
         5. 发送结束信号
 
         V3.7: 支持原子区域和检查点保存
+        V3.7.1: 集成进度发射器
 
         Args:
             chunks: AudioChunk 列表
@@ -333,9 +355,12 @@ class AsyncDualPipeline:
             full_audio_sr: 完整音频采样率
             job_dir: 任务目录（可选，V3.7）
             processed_indices: 已处理的chunk索引集合（可选，V3.7）
+            total_chunks: 总 Chunk 数（V3.7.1）
         """
         token = self.cancellation_token  # V3.7
         processed_indices = processed_indices or set()
+        total_chunks = total_chunks or len(chunks)
+        fast_processed_count = 0  # V3.7.1: 追踪已处理数量
 
         try:
             for i, chunk in enumerate(chunks):
@@ -363,6 +388,14 @@ class AsyncDualPipeline:
 
                     # 放入队列（如果队列满了，会自动阻塞，实现背压）
                     await self.queue_inter.put(ctx)
+                    fast_processed_count += 1  # V3.7.1
+
+                    # V3.7.1: 更新 FastWorker 进度
+                    if self.progress_emitter:
+                        self.progress_emitter.update_fast(
+                            fast_processed_count, total_chunks,
+                            message=f"SenseVoice: {fast_processed_count}/{total_chunks}"
+                        )
                 finally:
                     # V3.7: 退出原子区域
                     if token:
@@ -407,7 +440,7 @@ class AsyncDualPipeline:
             )
             await self.queue_inter.put(error_ctx)
 
-    async def _slow_loop(self, job_dir: Optional[Path] = None):  # V3.7: 新增 job_dir
+    async def _slow_loop(self, job_dir: Optional[Path] = None, total_chunks: int = 0):  # V3.7.1: 新增 total_chunks
         """
         SlowWorker 循环（中间消费者-生产者）
 
@@ -418,6 +451,7 @@ class AsyncDualPipeline:
         4. 透传结束/错误信号
 
         V3.7: 支持原子区域和检查点保存（包括关键的 previous_whisper_text）
+        V3.7.1: 集成进度发射器
         """
         token = self.cancellation_token  # V3.7
         slow_processed_count = 0  # V3.7: 追踪已处理数量
@@ -450,6 +484,13 @@ class AsyncDualPipeline:
                     # 放入队列
                     await self.queue_final.put(ctx)
                     slow_processed_count += 1
+
+                    # V3.7.1: 更新 SlowWorker 进度
+                    if self.progress_emitter and total_chunks > 0:
+                        self.progress_emitter.update_slow(
+                            slow_processed_count, total_chunks,
+                            message=f"Whisper: {slow_processed_count}/{total_chunks}"
+                        )
                 finally:
                     # V3.7: 退出原子区域
                     if token:
@@ -486,7 +527,7 @@ class AsyncDualPipeline:
             )
             await self.queue_final.put(error_ctx)
 
-    async def _align_loop(self, results: List[ProcessingContext], job_dir: Optional[Path] = None):  # V3.7
+    async def _align_loop(self, results: List[ProcessingContext], job_dir: Optional[Path] = None, total_chunks: int = 0):  # V3.7.1
         """
         AlignmentWorker 循环（最终消费者）
 
@@ -497,10 +538,12 @@ class AsyncDualPipeline:
         4. 检测结束信号
 
         V3.7: 支持原子区域和检查点保存
+        V3.7.1: 集成进度发射器
 
         Args:
             results: 结果列表（用于收集 context）
             job_dir: 任务目录（可选，V3.7）
+            total_chunks: 总 Chunk 数（V3.7.1）
         """
         token = self.cancellation_token  # V3.7
         align_processed_count = 0  # V3.7: 追踪已处理数量
@@ -530,6 +573,13 @@ class AsyncDualPipeline:
                     # 收集结果
                     results.append(ctx)
                     align_processed_count += 1
+
+                    # V3.7.1: 更新 AlignmentWorker 进度
+                    if self.progress_emitter and total_chunks > 0:
+                        self.progress_emitter.update_align(
+                            align_processed_count, total_chunks,
+                            message=f"对齐: {align_processed_count}/{total_chunks}"
+                        )
                 finally:
                     # V3.7: 退出原子区域
                     if token:

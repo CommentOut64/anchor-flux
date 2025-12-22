@@ -579,6 +579,9 @@ class JobQueueService:
         from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
         from app.services.sse_service import get_sse_manager
         from app.services.job.checkpoint_manager import CheckpointManagerV37
+        from app.services.progress_emitter import (
+            get_progress_emitter, remove_progress_emitter, ProgressMode
+        )
         from pathlib import Path
 
         def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
@@ -593,6 +596,13 @@ class JobQueueService:
         subtitle_manager = get_streaming_subtitle_manager(job.job_id)
         progress_tracker = get_progress_tracker(job.job_id, preset_id)
         sse_manager = get_sse_manager()
+
+        # V3.7.1: 初始化进度发射器
+        transcription_profile = ConfigAdapter.get_transcription_profile(job.settings)
+        progress_emitter = get_progress_emitter(
+            job, sse_manager,
+            transcription_profile=transcription_profile
+        )
 
         # V3.7: 获取取消令牌
         cancellation_token = self.get_cancellation_token(job.job_id)
@@ -616,12 +626,17 @@ class JobQueueService:
             is_resuming = checkpoint is not None
             if is_resuming:
                 logger.info(f"[V3.7] 检测到检查点，准备断点续传: phase={checkpoint.phase}")
+                # V3.7.1: 从检查点恢复进度并立即推送 SSE
+                if hasattr(checkpoint, 'to_dict'):
+                    progress_emitter.restore_from_checkpoint(checkpoint.to_dict())
+                    logger.info(f"[V3.7.1] 已恢复进度: {job.progress:.1f}%")
 
             # === 预触发 Proxy 生成（不阻塞主流程）===
             await self._maybe_trigger_proxy_generation(job)
 
             # 阶段 1: 音频前处理（使用新架构 PreprocessingPipeline）
             progress_tracker.start_phase(ProcessPhase.EXTRACT, 1, "音频前处理...")
+            progress_emitter.update_preprocess(0, "extract", "音频前处理...")
 
             from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
             import soundfile as sf
@@ -644,6 +659,7 @@ class JobQueueService:
                 if preprocessing_state.separation_completed:
                     skip_preprocessing = True
                     logger.info("[V3.7] 预处理阶段已完成，跳过")
+                    progress_emitter.update_preprocess(100, "completed", "预处理已完成")
 
             if not skip_preprocessing:
                 # 执行预处理（包含：音频提取、VAD、频谱分诊、按需分离）
@@ -686,6 +702,8 @@ class JobQueueService:
                 raise RuntimeError("PreprocessingPipeline 未返回任何 AudioChunk")
 
             progress_tracker.complete_phase(ProcessPhase.EXTRACT)
+            # V3.7.1: 预处理完成
+            progress_emitter.update_preprocess(100, "completed", "预处理完成")
 
             # 阶段 2: 双流对齐处理
             total_chunks = len(audio_chunks)
@@ -706,6 +724,8 @@ class JobQueueService:
                     processed_indices = set(transcription_state.fast_processed_indices)
                 previous_whisper_text = transcription_state.previous_whisper_text
                 logger.info(f"[V3.7] 恢复转录状态: 已处理 {len(processed_indices)} 个 chunk")
+                # V3.7.1: 更新进度发射器的已处理数
+                progress_emitter.update_fast(len(processed_indices), total_chunks, force_push=True)
 
             if use_async_pipeline:
                 # V3.1.0: 异步流水线（三级流水线，错位并行）
@@ -718,7 +738,8 @@ class JobQueueService:
                     user_glossary=getattr(job.settings, 'user_glossary', None),
                     transcription_profile=ConfigAdapter.get_transcription_profile(job.settings),
                     logger=logger,
-                    cancellation_token=cancellation_token  # V3.7
+                    cancellation_token=cancellation_token,  # V3.7
+                    progress_emitter=progress_emitter  # V3.7.1: 传递进度发射器
                 )
 
                 # V3.7: 如果有历史上下文，恢复 SlowWorker 状态
@@ -759,6 +780,10 @@ class JobQueueService:
                     all_sentences.extend(result.sentences)
 
             progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
+            # V3.7.1: 双流对齐完成
+            progress_emitter.update_fast(total_chunks, total_chunks, force_push=True)
+            progress_emitter.update_slow(total_chunks, total_chunks, force_push=True)
+            progress_emitter.update_align(total_chunks, total_chunks, force_push=True)
 
             # 阶段 3: 生成字幕文件
             progress_tracker.start_phase(ProcessPhase.SRT, 1, "生成字幕...")
@@ -780,9 +805,12 @@ class JobQueueService:
             checkpoint_manager.delete_checkpoint()
             logger.info("[V3.7] 任务完成，检查点已清理")
 
+            # V3.7.1: 使用 progress_emitter 标记完成
+            progress_emitter.complete("处理完成")
+
             # 完成
             job.status = 'completed'
-            push_signal_event(sse_manager, job.job_id, "job_complete", "处理完成")
+            # push_signal_event 已在 progress_emitter.complete() 中调用
 
             logger.info(f"[双流对齐] 任务完成: {job.job_id}")
 
@@ -797,6 +825,7 @@ class JobQueueService:
             # 清理资源
             remove_streaming_subtitle_manager(job.job_id)
             remove_progress_tracker(job.job_id)
+            remove_progress_emitter(job.job_id)  # V3.7.1: 清理进度发射器
 
     async def _maybe_trigger_proxy_generation(self, job: 'JobState'):
         """

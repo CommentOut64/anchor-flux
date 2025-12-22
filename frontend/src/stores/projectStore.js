@@ -477,6 +477,28 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   /**
+   * V3.7.2: 从 SSE 后端推送更新双流进度
+   * 这是更准确的进度来源，因为后端知道真实的 Chunk 处理进度
+   *
+   * @param {Object} progress - 从 SSE progress.overall 事件获取的进度数据
+   *   - fastStream: SenseVoice 进度 (0-100)
+   *   - slowStream: Whisper 进度 (0-100)
+   *   - totalChunks: 总 Chunk 数
+   */
+  function updateDualStreamProgressFromSSE(progress) {
+    if (!progress) return;
+
+    dualStreamProgress.value = {
+      ...dualStreamProgress.value,
+      fastStream: progress.fastStream ?? dualStreamProgress.value.fastStream,
+      slowStream: progress.slowStream ?? dualStreamProgress.value.slowStream,
+      totalChunks: progress.totalChunks ?? dualStreamProgress.value.totalChunks,
+    };
+
+    console.log('[ProjectStore] 双流进度从 SSE 更新:', dualStreamProgress.value);
+  }
+
+  /**
    * 获取草稿字幕数量
    */
   const draftSubtitleCount = computed(
@@ -667,6 +689,7 @@ export const useProjectStore = defineStore("project", () => {
     appendOrUpdateDraft,
     replaceChunk,
     updateDualStreamProgress,
+    updateDualStreamProgressFromSSE,  // V3.7.2: 从 SSE 更新双流进度
 
     // 辅助方法
     formatTimestamp,
