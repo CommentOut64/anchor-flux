@@ -264,3 +264,24 @@ class SlowWorker:
         """
         self.previous_whisper_text = whisper_text
         self.logger.debug(f"更新 Prompt 缓存: {len(whisper_text)} 个字符")
+
+    def restore_prompt_cache(self, previous_text: Optional[str]):
+        """
+        V3.7: 从检查点恢复 Prompt 缓存
+
+        用于断点续传恢复时，恢复 SlowWorker 的上下文状态。
+
+        Args:
+            previous_text: 之前保存的定稿文本
+        """
+        self.previous_whisper_text = previous_text
+        if previous_text:
+            self.logger.info(f"[V3.7] 从检查点恢复 Prompt 缓存: {len(previous_text)} 个字符")
+        else:
+            self.logger.info("[V3.7] Prompt 缓存已清空（无历史文本）")
+
+    # V3.7: 为兼容检查点保存提供 prompt_cache 属性别名
+    @property
+    def prompt_cache(self) -> Optional[str]:
+        """返回当前的 Prompt 缓存（previous_whisper_text 的别名）"""
+        return self.previous_whisper_text

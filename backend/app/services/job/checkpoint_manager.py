@@ -927,3 +927,215 @@ def create_checkpoint_v37(job_id: str) -> CheckpointV37:
     checkpoint.job_id = job_id
     checkpoint.created_at = now
     return checkpoint
+
+
+class CheckpointManagerV37:
+    """
+    V3.7 检查点管理器（简化包装）
+
+    提供更便捷的 API 用于流水线中的检查点保存和加载。
+    与 CancellationToken 的 check_and_save 方法配合使用。
+    """
+
+    def __init__(self, job_dir: Path, logger: Optional[logging.Logger] = None):
+        """
+        初始化 V3.7 检查点管理器
+
+        Args:
+            job_dir: 任务目录
+            logger: 日志记录器
+        """
+        self.job_dir = Path(job_dir) if isinstance(job_dir, str) else job_dir
+        self.logger = logger or logging.getLogger(__name__)
+        self._manager = CheckpointManager(logger=self.logger)
+        self._checkpoint: Optional[CheckpointV37] = None
+
+    def load_checkpoint(self) -> Optional[CheckpointV37]:
+        """
+        加载检查点
+
+        Returns:
+            Optional[CheckpointV37]: 检查点对象，不存在则返回 None
+        """
+        self._checkpoint = self._manager.load_checkpoint_v37(self.job_dir)
+        return self._checkpoint
+
+    def save_checkpoint(self, checkpoint_data: Dict[str, Any]) -> bool:
+        """
+        保存检查点数据（增量更新）
+
+        支持以下字段结构：
+        - preprocessing: 预处理状态
+        - transcription: 转录状态
+        - output: 输出状态
+        - control: 控制状态
+
+        Args:
+            checkpoint_data: 要保存的检查点数据
+
+        Returns:
+            bool: 保存是否成功
+        """
+        # 加载现有检查点或创建新的
+        if self._checkpoint is None:
+            self._checkpoint = self._manager.load_checkpoint_v37(self.job_dir)
+            if self._checkpoint is None:
+                self._checkpoint = create_checkpoint_v37("")
+                # 尝试从 job_dir 推断 job_id
+                self._checkpoint.job_id = self.job_dir.name
+
+        # 更新预处理状态
+        if "preprocessing" in checkpoint_data:
+            prep_data = checkpoint_data["preprocessing"]
+            prep = self._checkpoint.preprocessing
+
+            # 音频提取
+            if "audio_extracted" in prep_data:
+                prep.audio_extracted = prep_data["audio_extracted"]
+            if "audio_path" in prep_data:
+                prep.audio_path = prep_data["audio_path"]
+            if "vad_completed" in prep_data:
+                prep.vad_completed = prep_data["vad_completed"]
+            if "total_chunks" in prep_data:
+                prep.total_chunks = prep_data["total_chunks"]
+
+        # 更新频谱分诊状态
+        if "spectral_triage" in checkpoint_data:
+            triage_data = checkpoint_data["spectral_triage"]
+            prep = self._checkpoint.preprocessing
+
+            if "completed" in triage_data:
+                prep.spectral_triage_completed = triage_data["completed"]
+            if "diagnosed_indices" in triage_data:
+                prep.diagnosed_indices = triage_data["diagnosed_indices"]
+            if "need_separation_count" in triage_data:
+                prep.need_separation_count = triage_data["need_separation_count"]
+
+        # 更新分离状态
+        if "separation" in checkpoint_data:
+            sep_data = checkpoint_data["separation"]
+            prep = self._checkpoint.preprocessing
+
+            if "mode" in sep_data:
+                prep.separation_mode = sep_data["mode"]
+            if "completed" in sep_data:
+                prep.separation_completed = sep_data["completed"]
+            if "separated_indices" in sep_data:
+                prep.separated_indices = sep_data["separated_indices"]
+            if "global_separation_done" in sep_data:
+                prep.global_separation_done = sep_data["global_separation_done"]
+
+        # 更新转录状态
+        if "transcription" in checkpoint_data:
+            trans_data = checkpoint_data["transcription"]
+            trans = self._checkpoint.transcription
+            prep = self._checkpoint.preprocessing
+
+            # 如果有转录数据，意味着预处理已完成
+            # 确保预处理状态被正确设置（用于恢复时的阶段判断）
+            if not prep.audio_extracted:
+                prep.audio_extracted = True
+            if not prep.vad_completed:
+                prep.vad_completed = True
+            if not prep.spectral_triage_completed:
+                prep.spectral_triage_completed = True
+            if not prep.separation_completed:
+                prep.separation_completed = True
+
+            # 从转录数据推断 total_chunks
+            if prep.total_chunks == 0:
+                if "total_chunks" in trans_data:
+                    prep.total_chunks = trans_data["total_chunks"]
+
+            # 通用字段
+            if "mode" in trans_data:
+                pass  # 仅记录模式，不影响状态
+            if "processed_indices" in trans_data:
+                trans.fast_processed_indices = trans_data["processed_indices"]
+                trans.fast_completed_count = len(trans_data["processed_indices"])
+            if "processed_count" in trans_data:
+                trans.fast_completed_count = trans_data["processed_count"]
+            if "total_chunks" in trans_data:
+                pass  # 已在预处理中记录
+
+            # FastWorker 字段
+            if "fast_processed_indices" in trans_data:
+                trans.fast_processed_indices = trans_data["fast_processed_indices"]
+                trans.fast_completed_count = len(trans_data["fast_processed_indices"])
+            if "fast_processed_count" in trans_data:
+                trans.fast_completed_count = trans_data["fast_processed_count"]
+
+            # SlowWorker 字段（关键：previous_whisper_text）
+            if "slow_processed_count" in trans_data:
+                trans.slow_completed_count = trans_data["slow_processed_count"]
+            if "previous_whisper_text" in trans_data:
+                trans.previous_whisper_text = trans_data["previous_whisper_text"]
+            if "last_slow_chunk_index" in trans_data:
+                trans.last_processed_index = trans_data["last_slow_chunk_index"]
+
+            # AlignmentWorker 字段
+            if "align_processed_count" in trans_data:
+                trans.alignment_completed_count = trans_data["align_processed_count"]
+            if "last_align_chunk_index" in trans_data:
+                pass  # 可选记录
+            if "completed_chunks" in trans_data:
+                trans.alignment_completed_count = trans_data["completed_chunks"]
+
+        # 更新控制状态
+        if "control" in checkpoint_data:
+            ctrl_data = checkpoint_data["control"]
+            ctrl = self._checkpoint.control
+
+            if "paused" in ctrl_data:
+                ctrl.paused = ctrl_data["paused"]
+            if "canceled" in ctrl_data:
+                ctrl.canceled = ctrl_data["canceled"]
+
+        # 更新阶段
+        self._checkpoint.phase = self._determine_current_phase()
+        self._checkpoint.phase_status = "in_progress"
+
+        # 保存
+        return self._manager.save_checkpoint_v37(self.job_dir, self._checkpoint)
+
+    def _determine_current_phase(self) -> str:
+        """根据当前状态确定阶段"""
+        if self._checkpoint is None:
+            return "pending"
+
+        prep = self._checkpoint.preprocessing
+        trans = self._checkpoint.transcription
+
+        if not prep.audio_extracted:
+            return "extract"
+        if not prep.vad_completed:
+            return "vad"
+        if not prep.spectral_triage_completed:
+            return "spectral_triage"
+        if not prep.separation_completed:
+            return "separation"
+        if trans.fast_completed_count < prep.total_chunks:
+            return "fast_worker"
+        if trans.slow_completed_count < prep.total_chunks:
+            return "slow_worker"
+        if trans.alignment_completed_count < prep.total_chunks:
+            return "alignment"
+        if not self._checkpoint.srt_generated:
+            return "srt"
+        return "complete"
+
+    def delete_checkpoint(self) -> bool:
+        """删除检查点"""
+        self._checkpoint = None
+        return self._manager.delete_checkpoint(self.job_dir)
+
+    def get_current_phase(self) -> str:
+        """获取当前阶段"""
+        if self._checkpoint:
+            return self._checkpoint.phase
+        return "pending"
+
+    @property
+    def current_phase(self) -> str:
+        """当前阶段属性"""
+        return self.get_current_phase()

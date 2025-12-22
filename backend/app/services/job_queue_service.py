@@ -224,13 +224,11 @@ class JobQueueService:
 
     def resume_job(self, job_id: str) -> bool:
         """
-        恢复暂停的任务（重新加入队列）
+        恢复暂停的任务
 
-        V3.7 更新: 清除取消令牌的暂停状态
-
-        与 restore_job 不同：
-        - resume_job: 恢复暂停的任务，重新加入队列尾部
-        - restore_job: 从 checkpoint 断点续传
+        V3.7 更新: 智能恢复逻辑
+        - 如果任务仍在运行中（暂停被延迟），只需清除暂停标志
+        - 如果任务已完全停止，重新加入队列等待执行
 
         Args:
             job_id: 任务ID
@@ -247,21 +245,34 @@ class JobQueueService:
             return False
 
         with self.lock:
-            # 重新加入队列
-            if job_id not in self.queue:
-                self.queue.append(job_id)
-
-            job.status = "queued"
-            job.paused = False
-            job.message = f"已恢复，排队中 (位置: {len(self.queue)})"
-
-            # [V3.7] 清除取消令牌的暂停状态
+            # [V3.7] 检查任务是否仍在运行中
+            # 场景: 用户在原子区域内暂停后立即恢复
+            is_still_running = (job_id == self.running_job_id)
             token = self.cancellation_tokens.get(job_id)
-            if token:
+
+            if is_still_running and token:
+                # 任务仍在运行，只需清除暂停标志
+                # 任务会在原子区域结束后继续正常执行（不会抛出 PausedException）
                 token.resume()
-                logger.info(f"[V3.7] 已恢复取消令牌: {job_id}")
+                job.paused = False
+                job.status = "processing"
+                job.message = "已恢复，继续执行中..."
+                logger.info(f"[V3.7] 任务仍在运行，清除暂停标志: {job_id}")
             else:
-                logger.info(f"恢复暂停任务: {job_id}")
+                # 任务已完全停止，需要重新加入队列
+                if job_id not in self.queue:
+                    self.queue.append(job_id)
+
+                job.status = "queued"
+                job.paused = False
+                job.message = f"已恢复，排队中 (位置: {len(self.queue)})"
+
+                if token:
+                    # Token 还存在但任务不在运行（理论上不应该发生）
+                    token.resume()
+                    logger.warning(f"[V3.7] Token存在但任务未运行，可能是竞态条件: {job_id}")
+                else:
+                    logger.info(f"[V3.7] 任务已停止，重新加入队列: {job_id}")
 
         # 保存队列状态和任务元信息
         self._save_state()
@@ -546,6 +557,10 @@ class JobQueueService:
         - async: 三级异步流水线（错位并行，性能提升 30-50%）
         - sync: 串行流水线（稳定版，V3.0 兼容）
 
+        V3.7 新特性：支持断点续传
+        - 集成 CancellationToken 机制
+        - 支持从 CheckpointV37 恢复
+
         Args:
             job: 任务状态对象
             preset_id: 预设 ID
@@ -563,6 +578,7 @@ class JobQueueService:
         from app.services.streaming_subtitle import get_streaming_subtitle_manager, remove_streaming_subtitle_manager
         from app.services.progress_tracker import get_progress_tracker, remove_progress_tracker, ProcessPhase
         from app.services.sse_service import get_sse_manager
+        from app.services.job.checkpoint_manager import CheckpointManagerV37
         from pathlib import Path
 
         def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
@@ -578,6 +594,13 @@ class JobQueueService:
         progress_tracker = get_progress_tracker(job.job_id, preset_id)
         sse_manager = get_sse_manager()
 
+        # V3.7: 获取取消令牌
+        cancellation_token = self.get_cancellation_token(job.job_id)
+
+        # V3.7: 初始化检查点管理器
+        job_dir = Path(job.dir)
+        checkpoint_manager = CheckpointManagerV37(job_dir, logger)
+
         # 流水线模式选择（V3.1.0 新增）
         # 从配置中读取，支持环境变量 USE_ASYNC_PIPELINE 控制
         from app.core.config import config as project_config
@@ -587,6 +610,12 @@ class JobQueueService:
         try:
             pipeline_mode = "异步流水线 (V3.1.0)" if use_async_pipeline else "串行流水线 (V3.0)"
             logger.info(f"[双流对齐] 开始处理任务: {job.job_id}, preset={preset_id}, 模式={pipeline_mode}")
+
+            # V3.7: 检查是否有检查点需要恢复
+            checkpoint = checkpoint_manager.load_checkpoint()
+            is_resuming = checkpoint is not None
+            if is_resuming:
+                logger.info(f"[V3.7] 检测到检查点，准备断点续传: phase={checkpoint.phase}")
 
             # === 预触发 Proxy 生成（不阻塞主流程）===
             await self._maybe_trigger_proxy_generation(job)
@@ -600,27 +629,49 @@ class JobQueueService:
 
             logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
 
-            # 创建预处理流水线
+            # 创建预处理流水线（V3.7: 传递取消令牌）
             preprocessing_pipeline = PreprocessingPipeline(
                 config=job.settings.preprocessing,
-                logger=logger
+                logger=logger,
+                cancellation_token=cancellation_token  # V3.7
             )
 
-            # 执行预处理（包含：音频提取、VAD、频谱分诊、按需分离）
-            audio_chunks = await preprocessing_pipeline.process(
-                video_path=job.input_path,
-                job_state=job
-            )
+            # V3.7: 检查是否需要跳过预处理阶段
+            skip_preprocessing = False
+            preprocessing_state = None
+            if is_resuming and checkpoint.preprocessing:
+                preprocessing_state = checkpoint.preprocessing
+                if preprocessing_state.separation_completed:
+                    skip_preprocessing = True
+                    logger.info("[V3.7] 预处理阶段已完成，跳过")
 
-            # 获取预处理统计信息
-            stats = preprocessing_pipeline.get_statistics(audio_chunks)
-            logger.info(
-                f"PreprocessingPipeline 完成: "
-                f"总chunk数={stats['total_chunks']}, "
-                f"需要分离={stats['need_separation']}, "
-                f"已分离={stats['separated']}, "
-                f"分离比例={stats['separation_ratio']:.2%}"
-            )
+            if not skip_preprocessing:
+                # 执行预处理（包含：音频提取、VAD、频谱分诊、按需分离）
+                audio_chunks = await preprocessing_pipeline.process(
+                    video_path=job.input_path,
+                    job_state=job,
+                    job_dir=job_dir  # V3.7: 传递 job_dir 用于检查点保存
+                )
+
+                # 获取预处理统计信息
+                stats = preprocessing_pipeline.get_statistics(audio_chunks)
+                logger.info(
+                    f"PreprocessingPipeline 完成: "
+                    f"总chunk数={stats['total_chunks']}, "
+                    f"需要分离={stats['need_separation']}, "
+                    f"已分离={stats['separated']}, "
+                    f"分离比例={stats['separation_ratio']:.2%}"
+                )
+            else:
+                # V3.7: 从检查点恢复 AudioChunk（需要重新加载音频）
+                # 由于 AudioChunk 包含音频数据，无法直接序列化，需要重新执行预处理
+                # 但可以跳过已完成的步骤
+                logger.info("[V3.7] 从检查点恢复预处理状态...")
+                audio_chunks = await preprocessing_pipeline.process(
+                    video_path=job.input_path,
+                    job_state=job,
+                    job_dir=job_dir
+                )
 
             # 加载完整音频（用于双流对齐的 Audio Overlap 功能）
             if audio_chunks:
@@ -640,20 +691,48 @@ class JobQueueService:
             total_chunks = len(audio_chunks)
             progress_tracker.start_phase(ProcessPhase.SENSEVOICE, total_chunks, "双流对齐...")
 
+            # V3.7: 检查是否需要恢复转录状态
+            processed_indices = set()
+            previous_whisper_text = None
+            if is_resuming and checkpoint.transcription:
+                transcription_state = checkpoint.transcription
+                # 使用 finalized_indices（已完成对齐的 chunk）作为恢复点
+                # 如果没有，则使用 slow_processed_indices（已完成 Whisper 推理的 chunk）
+                if transcription_state.finalized_indices:
+                    processed_indices = set(transcription_state.finalized_indices)
+                elif transcription_state.slow_processed_indices:
+                    processed_indices = set(transcription_state.slow_processed_indices)
+                elif transcription_state.fast_processed_indices:
+                    processed_indices = set(transcription_state.fast_processed_indices)
+                previous_whisper_text = transcription_state.previous_whisper_text
+                logger.info(f"[V3.7] 恢复转录状态: 已处理 {len(processed_indices)} 个 chunk")
+
             if use_async_pipeline:
                 # V3.1.0: 异步流水线（三级流水线，错位并行）
                 logger.info(f"[双流对齐] 使用异步流水线处理 {total_chunks} 个 Chunk (queue_maxsize={queue_maxsize})")
-                async_pipeline = get_async_dual_pipeline(
+                async_pipeline = AsyncDualPipeline(
                     job_id=job.job_id,
                     queue_maxsize=queue_maxsize,
-                    logger=logger
+                    sensevoice_language=getattr(job.settings, 'sensevoice_language', 'auto'),
+                    whisper_language=getattr(job.settings, 'whisper_language', 'auto'),
+                    user_glossary=getattr(job.settings, 'user_glossary', None),
+                    transcription_profile=ConfigAdapter.get_transcription_profile(job.settings),
+                    logger=logger,
+                    cancellation_token=cancellation_token  # V3.7
                 )
+
+                # V3.7: 如果有历史上下文，恢复 SlowWorker 状态
+                if previous_whisper_text and async_pipeline.slow_worker:
+                    async_pipeline.slow_worker.restore_prompt_cache(previous_whisper_text)
+                    logger.info(f"[V3.7] 已恢复 SlowWorker 上下文: {len(previous_whisper_text)} 字符")
 
                 # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
                 contexts = await async_pipeline.run(
                     audio_chunks=audio_chunks,
                     full_audio_array=full_audio,
-                    full_audio_sr=sr
+                    full_audio_sr=sr,
+                    job_dir=job_dir,  # V3.7
+                    processed_indices=processed_indices  # V3.7
                 )
 
                 # 提取结果
@@ -696,6 +775,10 @@ class JobQueueService:
             )
 
             progress_tracker.complete_phase(ProcessPhase.SRT)
+
+            # V3.7: 任务完成，清理检查点
+            checkpoint_manager.delete_checkpoint()
+            logger.info("[V3.7] 任务完成，检查点已清理")
 
             # 完成
             job.status = 'completed'

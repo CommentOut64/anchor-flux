@@ -338,9 +338,11 @@ class CancellationToken:
 
         在每个原子操作完成后调用此方法。
 
+        V3.7 更新：支持直接传递 job_dir，自动创建 CheckpointManagerV37
+
         Args:
             checkpoint_data: 要保存的检查点数据
-            job_dir: 任务目录（如果 checkpoint_manager 需要）
+            job_dir: 任务目录（Path 或 str）
 
         Returns:
             bool: False 表示正常继续
@@ -349,8 +351,17 @@ class CancellationToken:
             CancelledException: 如果已取消
             PausedException: 如果已暂停
         """
-        # 保存检查点
-        if self.checkpoint_manager and job_dir:
+        # V3.7: 直接使用 CheckpointManagerV37 保存
+        if job_dir is not None:
+            from app.services.job.checkpoint_manager import CheckpointManagerV37
+            from pathlib import Path
+
+            checkpoint_mgr = CheckpointManagerV37(Path(job_dir), logger)
+            checkpoint_mgr.save_checkpoint(checkpoint_data)
+            with self._lock:
+                self._stats["checkpoints_saved"] += 1
+        elif self.checkpoint_manager:
+            # 兼容旧版本
             self.checkpoint_manager.save_checkpoint(job_dir, checkpoint_data)
             with self._lock:
                 self._stats["checkpoints_saved"] += 1

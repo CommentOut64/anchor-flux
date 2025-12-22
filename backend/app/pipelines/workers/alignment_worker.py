@@ -403,7 +403,7 @@ class AlignmentWorker:
                         return [], AlignmentLevel.SENSEVOICE_ONLY
 
                     # 创建覆盖整个Chunk的单句字幕
-                    from app.models.sensevoice_models import SentenceSegment, TextSource
+                    # 注：SentenceSegment 和 TextSource 已在文件顶部导入
                     sentence = SentenceSegment(
                         text=fallback_text,
                         start=chunk.start,

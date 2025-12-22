@@ -91,9 +91,8 @@ class SpectralTriageStage:
             # V3.7: 单个 chunk 分诊（快速，不需要原子区域）
             diagnosis = self.classifier.diagnose_chunk(
                 audio=chunk.audio,
-                sr=sample_rate,
-                chunk_start=chunk.start,
-                chunk_end=chunk.end
+                chunk_index=i,
+                sr=sample_rate
             )
 
             # 设置分诊结果

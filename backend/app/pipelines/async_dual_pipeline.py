@@ -15,15 +15,25 @@ AsyncDualPipeline - 三级异步流水线控制器
 - 错位并行：当 SlowWorker 处理 Chunk N 时，FastWorker 同时处理 Chunk N+1
 - 异常传播：任何 Worker 的异常都会传播到 run() 方法
 - 结束信号：使用 ProcessingContext.is_end 通知下游停止
+
+V3.7 更新：
+- 集成 CancellationToken 支持暂停/取消
+- 支持断点续传检查点保存
+- SlowWorker 保存上文状态 (previous_whisper_text)
 """
 import asyncio
 import logging
-from typing import List, Optional, Any
+from typing import List, Optional, Any, TYPE_CHECKING, Set
+from pathlib import Path
 
 from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.sse_service import get_sse_manager
 from app.pipelines.workers import FastWorker, SlowWorker, AlignmentWorker
+
+# V3.7: 导入取消令牌和异常
+if TYPE_CHECKING:
+    from app.utils.cancellation_token import CancellationToken
 
 
 class AsyncDualPipeline:
@@ -52,7 +62,8 @@ class AsyncDualPipeline:
         alignment_score_threshold: float = 0.3,
         enable_fallback: bool = True,
         transcription_profile: str = "sv_whisper_patch",
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        cancellation_token: Optional["CancellationToken"] = None  # V3.7: 新增
     ):
         """
         初始化流水线
@@ -68,10 +79,12 @@ class AsyncDualPipeline:
             enable_fallback: 是否启用降级策略
             transcription_profile: 转录模式 (sensevoice_only/sv_whisper_patch/sv_whisper_dual)
             logger: 日志记录器
+            cancellation_token: 取消令牌（可选，V3.7）
         """
         self.job_id = job_id
         self.logger = logger or logging.getLogger(__name__)
         self.transcription_profile = transcription_profile
+        self.cancellation_token = cancellation_token  # V3.7
 
         # 判断是否为纯 SenseVoice 模式
         self.is_sensevoice_only = (transcription_profile == "sensevoice_only")
@@ -123,7 +136,9 @@ class AsyncDualPipeline:
         self,
         audio_chunks: List[AudioChunk],
         full_audio_array: Optional[Any] = None,
-        full_audio_sr: int = 16000
+        full_audio_sr: int = 16000,
+        job_dir: Optional[Path] = None,  # V3.7: 用于保存检查点
+        processed_indices: Optional[Set[int]] = None  # V3.7: 已处理的索引（用于恢复）
     ) -> List[ProcessingContext]:
         """
         运行流水线
@@ -136,31 +151,50 @@ class AsyncDualPipeline:
             audio_chunks: AudioChunk 列表
             full_audio_array: 完整音频数组（用于 Audio Overlap）
             full_audio_sr: 完整音频采样率
+            job_dir: 任务目录（可选，V3.7 用于保存检查点）
+            processed_indices: 已处理的chunk索引集合（可选，V3.7 用于恢复）
 
         Returns:
             List[ProcessingContext]: 处理结果列表
         """
         if self.is_sensevoice_only:
-            return await self._run_sensevoice_only(audio_chunks, full_audio_array, full_audio_sr)
+            return await self._run_sensevoice_only(
+                audio_chunks, full_audio_array, full_audio_sr,
+                job_dir, processed_indices
+            )
         else:
-            return await self._run_full_pipeline(audio_chunks, full_audio_array, full_audio_sr)
+            return await self._run_full_pipeline(
+                audio_chunks, full_audio_array, full_audio_sr,
+                job_dir, processed_indices
+            )
 
     async def _run_sensevoice_only(
         self,
         audio_chunks: List[AudioChunk],
         full_audio_array: Optional[Any] = None,
-        full_audio_sr: int = 16000
+        full_audio_sr: int = 16000,
+        job_dir: Optional[Path] = None,  # V3.7
+        processed_indices: Optional[Set[int]] = None  # V3.7
     ) -> List[ProcessingContext]:
         """
         极速模式: 仅运行 FastWorker
 
         FastWorker 输出直接作为定稿推送，跳过 Whisper 和对齐。
+
+        V3.7: 支持逐 Chunk 中断和检查点保存
         """
         self.logger.info(f"极速模式开始: {len(audio_chunks)} 个 Chunk")
 
         results: List[ProcessingContext] = []
+        token = self.cancellation_token  # V3.7
+        processed_indices = processed_indices or set()
 
         for i, chunk in enumerate(audio_chunks):
+            # V3.7: 跳过已处理的 chunk（用于恢复）
+            if i in processed_indices:
+                self.logger.debug(f"跳过已处理的 chunk {i}")
+                continue
+
             ctx = ProcessingContext(
                 job_id=self.job_id,
                 chunk_index=i,
@@ -169,6 +203,10 @@ class AsyncDualPipeline:
                 full_audio_sr=full_audio_sr
             )
 
+            # V3.7: 进入原子区域（单个 Chunk + SSE 推送）
+            if token:
+                token.enter_atomic_region(f"fast_chunk_{i}")
+
             try:
                 # FastWorker 处理（SenseVoice 推理 + 分句 + 推送定稿）
                 await self.fast_worker.process(ctx)
@@ -176,6 +214,25 @@ class AsyncDualPipeline:
             except Exception as e:
                 self.logger.error(f"Chunk {i} 处理失败: {e}", exc_info=True)
                 self.errors.append(e)
+            finally:
+                # V3.7: 退出原子区域
+                if token:
+                    has_pending = token.exit_atomic_region()
+                    if has_pending:
+                        self.logger.info(f"[V3.7] Chunk {i} 处理完成后检测到待处理请求")
+
+            # V3.7: 每个 Chunk 处理完成后检查暂停/取消并保存检查点
+            if token and job_dir:
+                processed_indices.add(i)
+                checkpoint_data = {
+                    "transcription": {
+                        "mode": "sensevoice_only",
+                        "processed_indices": list(processed_indices),
+                        "processed_count": len(processed_indices),
+                        "total_chunks": len(audio_chunks)
+                    }
+                }
+                token.check_and_save(checkpoint_data, job_dir)
 
         if self.errors:
             self.logger.error(f"极速模式执行中发生 {len(self.errors)} 个错误")
@@ -188,7 +245,9 @@ class AsyncDualPipeline:
         self,
         audio_chunks: List[AudioChunk],
         full_audio_array: Optional[Any] = None,
-        full_audio_sr: int = 16000
+        full_audio_sr: int = 16000,
+        job_dir: Optional[Path] = None,  # V3.7
+        processed_indices: Optional[Set[int]] = None  # V3.7
     ) -> List[ProcessingContext]:
         """
         运行完整三级流水线（补刀/双流模式）
@@ -200,10 +259,14 @@ class AsyncDualPipeline:
         4. 等待所有任务完成
         5. 检查异常
 
+        V3.7: 支持检查点保存和恢复
+
         Args:
             audio_chunks: AudioChunk 列表
             full_audio_array: 完整音频数组（用于 Audio Overlap）
             full_audio_sr: 完整音频采样率
+            job_dir: 任务目录（可选，V3.7 用于保存检查点）
+            processed_indices: 已处理的chunk索引集合（可选，V3.7 用于恢复）
 
         Returns:
             List[ProcessingContext]: 处理结果列表
@@ -213,12 +276,15 @@ class AsyncDualPipeline:
         # 存储结果
         results: List[ProcessingContext] = []
 
+        # V3.7: 初始化已处理索引集合
+        processed_indices = processed_indices or set()
+
         # 启动三个并行任务
         task_fast = asyncio.create_task(
-            self._fast_loop(audio_chunks, full_audio_array, full_audio_sr)
+            self._fast_loop(audio_chunks, full_audio_array, full_audio_sr, job_dir, processed_indices)
         )
-        task_slow = asyncio.create_task(self._slow_loop())
-        task_align = asyncio.create_task(self._align_loop(results))
+        task_slow = asyncio.create_task(self._slow_loop(job_dir))
+        task_align = asyncio.create_task(self._align_loop(results, job_dir))
 
         # 等待所有任务结束（return_exceptions=True 确保一个挂了不会立刻抛出）
         await_results = await asyncio.gather(
@@ -245,7 +311,9 @@ class AsyncDualPipeline:
         self,
         chunks: List[AudioChunk],
         full_audio_array: Optional[Any] = None,
-        full_audio_sr: int = 16000
+        full_audio_sr: int = 16000,
+        job_dir: Optional[Path] = None,  # V3.7
+        processed_indices: Optional[Set[int]] = None  # V3.7
     ):
         """
         FastWorker 循环（生产者）
@@ -257,13 +325,25 @@ class AsyncDualPipeline:
         4. 将 context 放入 queue_inter
         5. 发送结束信号
 
+        V3.7: 支持原子区域和检查点保存
+
         Args:
             chunks: AudioChunk 列表
             full_audio_array: 完整音频数组（用于 Audio Overlap）
             full_audio_sr: 完整音频采样率
+            job_dir: 任务目录（可选，V3.7）
+            processed_indices: 已处理的chunk索引集合（可选，V3.7）
         """
+        token = self.cancellation_token  # V3.7
+        processed_indices = processed_indices or set()
+
         try:
             for i, chunk in enumerate(chunks):
+                # V3.7: 跳过已处理的 chunk（用于恢复）
+                if i in processed_indices:
+                    self.logger.debug(f"[FastWorker] 跳过已处理的 chunk {i}")
+                    continue
+
                 # 创建处理上下文（包含完整音频数组）
                 ctx = ProcessingContext(
                     job_id=self.job_id,
@@ -273,11 +353,34 @@ class AsyncDualPipeline:
                     full_audio_sr=full_audio_sr
                 )
 
-                # FastWorker 处理（SenseVoice 推理 + 分句 + 推送草稿）
-                await self.fast_worker.process(ctx)
+                # V3.7: 进入原子区域（单个 Chunk 处理 + SSE 推送）
+                if token:
+                    token.enter_atomic_region(f"fast_worker_chunk_{i}")
 
-                # 放入队列（如果队列满了，会自动阻塞，实现背压）
-                await self.queue_inter.put(ctx)
+                try:
+                    # FastWorker 处理（SenseVoice 推理 + 分句 + 推送草稿）
+                    await self.fast_worker.process(ctx)
+
+                    # 放入队列（如果队列满了，会自动阻塞，实现背压）
+                    await self.queue_inter.put(ctx)
+                finally:
+                    # V3.7: 退出原子区域
+                    if token:
+                        has_pending = token.exit_atomic_region()
+                        if has_pending:
+                            self.logger.info(f"[V3.7] FastWorker chunk {i} 完成后检测到待处理请求")
+
+                # V3.7: 每个 Chunk 处理完成后保存检查点
+                if token and job_dir:
+                    processed_indices.add(i)
+                    checkpoint_data = {
+                        "transcription": {
+                            "fast_processed_indices": list(processed_indices),
+                            "fast_processed_count": len(processed_indices),
+                            "total_chunks": len(chunks)
+                        }
+                    }
+                    token.check_and_save(checkpoint_data, job_dir)
 
             # 发送结束信号
             end_ctx = ProcessingContext(
@@ -304,7 +407,7 @@ class AsyncDualPipeline:
             )
             await self.queue_inter.put(error_ctx)
 
-    async def _slow_loop(self):
+    async def _slow_loop(self, job_dir: Optional[Path] = None):  # V3.7: 新增 job_dir
         """
         SlowWorker 循环（中间消费者-生产者）
 
@@ -314,7 +417,11 @@ class AsyncDualPipeline:
         3. 将 context 放入 queue_final
         4. 透传结束/错误信号
 
+        V3.7: 支持原子区域和检查点保存（包括关键的 previous_whisper_text）
         """
+        token = self.cancellation_token  # V3.7
+        slow_processed_count = 0  # V3.7: 追踪已处理数量
+
         try:
             while True:
                 # 从队列取 context
@@ -325,16 +432,43 @@ class AsyncDualPipeline:
                     await self.queue_final.put(ctx)  # 透传
                     break
 
-                # SlowWorker 处理（Whisper 推理 + 幻觉检测）
-                await self.slow_worker.process(ctx)
+                chunk_index = ctx.chunk_index  # V3.7: 获取 chunk 索引
 
-                # 更新 SlowWorker 的 Prompt 缓存
-                if ctx.whisper_result:
-                    whisper_text = ctx.whisper_result.get('text', '')
-                    self.slow_worker.update_prompt_cache(whisper_text)
+                # V3.7: 进入原子区域（单个 Chunk 处理 + 上下文更新）
+                if token:
+                    token.enter_atomic_region(f"slow_worker_chunk_{chunk_index}")
 
-                # 放入队列
-                await self.queue_final.put(ctx)
+                try:
+                    # SlowWorker 处理（Whisper 推理 + 幻觉检测）
+                    await self.slow_worker.process(ctx)
+
+                    # 更新 SlowWorker 的 Prompt 缓存
+                    if ctx.whisper_result:
+                        whisper_text = ctx.whisper_result.get('text', '')
+                        self.slow_worker.update_prompt_cache(whisper_text)
+
+                    # 放入队列
+                    await self.queue_final.put(ctx)
+                    slow_processed_count += 1
+                finally:
+                    # V3.7: 退出原子区域
+                    if token:
+                        has_pending = token.exit_atomic_region()
+                        if has_pending:
+                            self.logger.info(f"[V3.7] SlowWorker chunk {chunk_index} 完成后检测到待处理请求")
+
+                # V3.7: 每个 Chunk 处理完成后保存检查点（包含关键的 previous_whisper_text）
+                if token and job_dir:
+                    # 获取当前的 prompt_cache 作为 previous_whisper_text
+                    previous_whisper_text = getattr(self.slow_worker, 'prompt_cache', '')
+                    checkpoint_data = {
+                        "transcription": {
+                            "slow_processed_count": slow_processed_count,
+                            "previous_whisper_text": previous_whisper_text,  # 关键：保存上文状态
+                            "last_slow_chunk_index": chunk_index
+                        }
+                    }
+                    token.check_and_save(checkpoint_data, job_dir)
 
             self.logger.info("SlowWorker 循环完成")
 
@@ -352,7 +486,7 @@ class AsyncDualPipeline:
             )
             await self.queue_final.put(error_ctx)
 
-    async def _align_loop(self, results: List[ProcessingContext]):
+    async def _align_loop(self, results: List[ProcessingContext], job_dir: Optional[Path] = None):  # V3.7
         """
         AlignmentWorker 循环（最终消费者）
 
@@ -362,9 +496,15 @@ class AsyncDualPipeline:
         3. 收集结果到 results 列表
         4. 检测结束信号
 
+        V3.7: 支持原子区域和检查点保存
+
         Args:
             results: 结果列表（用于收集 context）
+            job_dir: 任务目录（可选，V3.7）
         """
+        token = self.cancellation_token  # V3.7
+        align_processed_count = 0  # V3.7: 追踪已处理数量
+
         try:
             while True:
                 # 从队列取 context
@@ -377,11 +517,36 @@ class AsyncDualPipeline:
                         raise ctx.error
                     break
 
-                # AlignmentWorker 处理（双流对齐 + 分句 + 推送定稿）
-                await self.alignment_worker.process(ctx)
+                chunk_index = ctx.chunk_index  # V3.7: 获取 chunk 索引
 
-                # 收集结果
-                results.append(ctx)
+                # V3.7: 进入原子区域（单个 Chunk 对齐 + SSE 推送）
+                if token:
+                    token.enter_atomic_region(f"align_worker_chunk_{chunk_index}")
+
+                try:
+                    # AlignmentWorker 处理（双流对齐 + 分句 + 推送定稿）
+                    await self.alignment_worker.process(ctx)
+
+                    # 收集结果
+                    results.append(ctx)
+                    align_processed_count += 1
+                finally:
+                    # V3.7: 退出原子区域
+                    if token:
+                        has_pending = token.exit_atomic_region()
+                        if has_pending:
+                            self.logger.info(f"[V3.7] AlignmentWorker chunk {chunk_index} 完成后检测到待处理请求")
+
+                # V3.7: 每个 Chunk 处理完成后保存检查点
+                if token and job_dir:
+                    checkpoint_data = {
+                        "transcription": {
+                            "align_processed_count": align_processed_count,
+                            "last_align_chunk_index": chunk_index,
+                            "completed_chunks": len(results)
+                        }
+                    }
+                    token.check_and_save(checkpoint_data, job_dir)
 
             self.logger.info("AlignmentWorker 循环完成")
 
@@ -407,7 +572,8 @@ class AsyncDualPipeline:
 def get_async_dual_pipeline(
     job_id: str,
     queue_maxsize: int = 5,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    cancellation_token: Optional["CancellationToken"] = None  # V3.7: 新增
 ) -> AsyncDualPipeline:
     """
     获取异步双流流水线实例
@@ -416,6 +582,7 @@ def get_async_dual_pipeline(
         job_id: 任务 ID
         queue_maxsize: 队列最大长度
         logger: 日志记录器
+        cancellation_token: 取消令牌（可选，V3.7）
 
     Returns:
         AsyncDualPipeline 实例
@@ -423,5 +590,6 @@ def get_async_dual_pipeline(
     return AsyncDualPipeline(
         job_id=job_id,
         queue_maxsize=queue_maxsize,
-        logger=logger
+        logger=logger,
+        cancellation_token=cancellation_token  # V3.7
     )
