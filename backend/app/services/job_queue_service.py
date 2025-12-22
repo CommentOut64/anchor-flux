@@ -177,6 +177,9 @@ class JobQueueService:
         暂停任务
 
         V3.7 更新: 集成 CancellationToken，触发协作式暂停
+        V3.7.2 更新: 区分"正在暂停"和"已暂停"状态
+        - 正在运行的任务：推送 pause_pending，等待流水线响应
+        - 队列中的任务：立即推送 job_paused
 
         Args:
             job_id: 任务ID
@@ -188,12 +191,15 @@ class JobQueueService:
         if not job:
             return False
 
+        is_running = False
         with self.lock:
             if job_id == self.running_job_id:
                 # 正在执行的任务：设置暂停标志（pipeline会自己检测并保存checkpoint）
+                is_running = True
                 job.paused = True
-                job.status = "paused"  # 立即更新状态，确保SSE推送正确的状态
-                job.message = "暂停中..."
+                # V3.7.2: 状态改为 pausing，表示正在等待流水线响应
+                job.status = "pausing"
+                job.message = "正在暂停，等待当前操作完成..."
 
                 # [V3.7] 触发取消令牌的暂停
                 token = self.cancellation_tokens.get(job_id)
@@ -217,8 +223,13 @@ class JobQueueService:
         self._notify_queue_change()
         self._notify_job_status(job_id, job.status)
 
-        # 同时推送到单任务频道，确保 EditorView 能收到
-        self._notify_job_signal(job_id, "job_paused")
+        # V3.7.2: 根据任务状态推送不同的信号
+        if is_running:
+            # 正在运行的任务：推送 pause_pending，前端显示"正在暂停..."
+            self._notify_job_signal(job_id, "pause_pending")
+        else:
+            # 队列中的任务：立即推送 job_paused
+            self._notify_job_signal(job_id, "job_paused")
 
         return True
 
@@ -230,6 +241,8 @@ class JobQueueService:
         - 如果任务仍在运行中（暂停被延迟），只需清除暂停标志
         - 如果任务已完全停止，重新加入队列等待执行
 
+        V3.7.2 更新: 支持 pausing 状态（正在暂停但尚未完全暂停）
+
         Args:
             job_id: 任务ID
 
@@ -240,7 +253,8 @@ class JobQueueService:
         if not job:
             return False
 
-        if job.status != "paused":
+        # V3.7.2: 支持 paused 和 pausing 两种状态
+        if job.status not in ("paused", "pausing"):
             logger.warning(f"任务未暂停，无法恢复: {job_id}, status={job.status}")
             return False
 
@@ -704,6 +718,18 @@ class JobQueueService:
             progress_tracker.complete_phase(ProcessPhase.EXTRACT)
             # V3.7.1: 预处理完成
             progress_emitter.update_preprocess(100, "completed", "预处理完成")
+
+            # V3.7.2: 预处理→转录过渡检查点
+            # 在开始转录前检查是否有待处理的暂停/取消请求
+            if cancellation_token and job_dir:
+                checkpoint_data = {
+                    "preprocessing": {
+                        "completed": True,
+                        "total_chunks": len(audio_chunks)
+                    }
+                }
+                cancellation_token.check_and_save(checkpoint_data, job_dir)
+                logger.debug("[V3.7.2] 预处理→转录过渡检查点已保存")
 
             # 阶段 2: 双流对齐处理
             total_chunks = len(audio_chunks)

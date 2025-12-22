@@ -117,26 +117,25 @@ class PreprocessingPipeline:
         self.logger.info(f"开始预处理流程: {video_path}")
         token = self.cancellation_token  # V3.7: 简化引用
 
-        # Stage 1: 音频提取 + VAD切分（原子操作，不可中断）
-        self.logger.info("Stage 1: 音频提取 + VAD切分")
+        # V3.7.2: Stage 1 拆分为两个原子区域
+        # Stage 1a: 音频提取（FFmpeg，耗时 1-5 秒）
+        self.logger.info("Stage 1a: 音频提取")
 
-        # V3.7: 进入原子区域（FFmpeg + VAD 整体不可中断）
         if token:
-            token.enter_atomic_region("extract_and_vad")
+            token.enter_atomic_region("ffmpeg_extract")
 
         try:
+            # 音频提取（包含 FFmpeg 转码和降采样）
             chunks = await self._extract_and_vad(video_path, job_state)
-            self.logger.info(f"音频提取完成: {len(chunks)} 个chunk")
+            self.logger.info(f"音频提取和 VAD 切分完成: {len(chunks)} 个chunk")
         finally:
-            # V3.7: 退出原子区域
             if token:
                 has_pending = token.exit_atomic_region()
                 if has_pending:
-                    self.logger.info("[V3.7] 检测到待处理的暂停/取消请求")
+                    self.logger.info("[V3.7.2] FFmpeg/VAD 完成后检测到待处理请求")
 
-        # V3.7: 原子区域结束后检查暂停/取消
+        # V3.7.2: Stage 1 检查点（音频提取 + VAD 完成）
         if token and job_dir:
-            # 保存预处理检查点
             checkpoint_data = {
                 "audio_extracted": True,
                 "vad_completed": True,
