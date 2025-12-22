@@ -549,7 +549,29 @@ function subscribeSSE() {
 
     onProgress(data) {
       console.log('[EditorView] SSE 进度更新:', data.percent, data.phase, data.detail)
-      taskProgress.value = data.percent || 0
+
+      // V3.7.2: 防抖动保护 - 检测异常进度跳变
+      const newPercent = data.percent || 0
+      const currentPercent = taskProgress.value
+
+      // 情况1: 进度倒退超过5%，忽略
+      if (newPercent > 0 && newPercent < currentPercent && currentPercent - newPercent > 5) {
+        console.warn('[EditorView] 检测到进度倒退，忽略:', currentPercent, '->', newPercent)
+        // 仍然更新双流进度，因为那是独立的阶段进度
+      }
+      // 情况2: 进度突然跳到100%但当前进度较低（<90%），可能是旧系统的错误推送，忽略
+      else if (newPercent >= 100 && currentPercent < 90 && currentPercent > 0) {
+        console.warn('[EditorView] 检测到异常100%跳变，忽略:', currentPercent, '->', newPercent)
+      }
+      // 情况3: 进度突然跳增超过30%（排除从0开始的情况），可能是系统冲突
+      else if (currentPercent > 10 && newPercent - currentPercent > 30 && newPercent < 100) {
+        console.warn('[EditorView] 检测到异常进度跳增，忽略:', currentPercent, '->', newPercent)
+      }
+      // 正常情况: 更新进度
+      else {
+        taskProgress.value = newPercent
+      }
+
       taskStatus.value = data.status || taskStatus.value
       taskPhase.value = data.phase || taskPhase.value
 
