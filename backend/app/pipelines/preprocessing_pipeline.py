@@ -96,7 +96,8 @@ class PreprocessingPipeline:
         self,
         video_path: str,
         job_state: Optional[JobState] = None,
-        job_dir: Optional[Path] = None  # V3.7: 用于保存检查点
+        job_dir: Optional[Path] = None,  # V3.7: 用于保存检查点
+        checkpoint: Optional[dict] = None  # V3.7.2: 用于跳过已完成的步骤
     ) -> List[AudioChunk]:
         """
         执行完整的预处理流程
@@ -110,6 +111,7 @@ class PreprocessingPipeline:
             video_path: 视频/音频文件路径
             job_state: 任务状态（可选，用于进度回调）
             job_dir: 任务目录（可选，V3.7 用于保存检查点）
+            checkpoint: 检查点数据（可选，V3.7.2 用于跳过已完成的步骤）
 
         Returns:
             List[AudioChunk]: 预处理完成的 Chunk 列表
@@ -117,31 +119,67 @@ class PreprocessingPipeline:
         self.logger.info(f"开始预处理流程: {video_path}")
         token = self.cancellation_token  # V3.7: 简化引用
 
-        # V3.7.2: Stage 1 拆分为两个原子区域
-        # Stage 1a: 音频提取（FFmpeg，耗时 1-5 秒）
-        self.logger.info("Stage 1a: 音频提取")
+        # V3.7.2: 检查是否可以从 checkpoint 恢复 chunks
+        chunks = None
+        skip_vad = False
+        if checkpoint and isinstance(checkpoint, dict):
+            preprocessing = checkpoint.get("preprocessing", {})
+            if isinstance(preprocessing, dict):
+                chunks_metadata = preprocessing.get("chunks_metadata", [])
+                if chunks_metadata and preprocessing.get("vad_completed", False):
+                    # 从 checkpoint 恢复 chunks
+                    chunks = await self._restore_chunks_from_metadata(
+                        video_path, chunks_metadata
+                    )
+                    if chunks:
+                        skip_vad = True
+                        self.logger.info(f"[V3.7.2] 从 checkpoint 恢复 {len(chunks)} 个chunk，跳过 VAD")
 
-        if token:
-            token.enter_atomic_region("ffmpeg_extract")
+        if not skip_vad:
+            # V3.7.2: Stage 1 拆分为两个原子区域
+            # Stage 1a: 音频提取（FFmpeg，耗时 1-5 秒）
+            self.logger.info("Stage 1a: 音频提取")
 
-        try:
-            # 音频提取（包含 FFmpeg 转码和降采样）
-            chunks = await self._extract_and_vad(video_path, job_state)
-            self.logger.info(f"音频提取和 VAD 切分完成: {len(chunks)} 个chunk")
-        finally:
             if token:
-                has_pending = token.exit_atomic_region()
-                if has_pending:
-                    self.logger.info("[V3.7.2] FFmpeg/VAD 完成后检测到待处理请求")
+                token.enter_atomic_region("ffmpeg_extract")
 
-        # V3.7.2: Stage 1 检查点（音频提取 + VAD 完成）
-        if token and job_dir:
-            checkpoint_data = {
-                "audio_extracted": True,
-                "vad_completed": True,
-                "total_chunks": len(chunks)
-            }
-            token.check_and_save(checkpoint_data, job_dir)
+            try:
+                # 音频提取（包含 FFmpeg 转码和降采样）
+                chunks = await self._extract_and_vad(video_path, job_state)
+                self.logger.info(f"音频提取和 VAD 切分完成: {len(chunks)} 个chunk")
+            finally:
+                if token:
+                    has_pending = token.exit_atomic_region()
+                    if has_pending:
+                        self.logger.info("[V3.7.2] FFmpeg/VAD 完成后检测到待处理请求")
+
+            # V3.7.2: Stage 1 检查点（音频提取 + VAD 完成，包含 chunks_metadata）
+            if token and job_dir and chunks:
+                # 保存 chunks 的元数据（不包含音频数据，用于恢复时重建 chunks）
+                # 注意：AudioChunk 使用 start/end 而非 start_time/end_time
+                chunks_metadata = [
+                    {
+                        "index": c.index,
+                        "start_time": c.start,  # AudioChunk.start
+                        "end_time": c.end,      # AudioChunk.end
+                        "duration": c.end - c.start,
+                        "sample_rate": c.sample_rate,
+                    }
+                    for c in chunks
+                ]
+                # V3.7.2: 保存 chunks_metadata 到检查点（用于恢复时跳过 VAD）
+                # 注意：checkpoint_data 需要包装在 "preprocessing" 键下
+                checkpoint_data = {
+                    "preprocessing": {
+                        "audio_extracted": True,
+                        "vad_completed": True,
+                        "total_chunks": len(chunks),
+                        "chunks_metadata": chunks_metadata
+                    }
+                }
+                token.check_and_save(checkpoint_data, job_dir)
+        else:
+            self.logger.info("[V3.7.2] 跳过 Stage 1 (音频提取 + VAD)")
 
         # Stage 2: 频谱分诊（如果启用，逐chunk可中断）
         if self.spectral_triage_stage:
@@ -252,6 +290,80 @@ class PreprocessingPipeline:
         )
 
         return chunks
+
+    async def _restore_chunks_from_metadata(
+        self,
+        video_path: str,
+        chunks_metadata: List[dict]
+    ) -> Optional[List[AudioChunk]]:
+        """
+        V3.7.2: 从 checkpoint 元数据恢复 AudioChunk 列表
+
+        与完整 VAD 不同，这里直接加载音频并根据已知的时间戳切分，
+        避免重新执行 VAD 检测。
+
+        Args:
+            video_path: 视频/音频文件路径
+            chunks_metadata: chunk 元数据列表（从 checkpoint 加载）
+
+        Returns:
+            Optional[List[AudioChunk]]: 恢复的 chunks，失败返回 None
+        """
+        try:
+            import librosa
+            import numpy as np
+
+            if not chunks_metadata:
+                self.logger.warning("[V3.7.2] chunks_metadata 为空，无法恢复")
+                return None
+
+            # 获取目标采样率（从第一个 chunk 的元数据获取）
+            target_sr = chunks_metadata[0].get("sample_rate", 16000)
+
+            # 加载完整音频
+            self.logger.info(f"[V3.7.2] 加载音频用于 chunk 恢复: {video_path}")
+            full_audio, sr = librosa.load(video_path, sr=target_sr, mono=True)
+            self.logger.info(f"[V3.7.2] 音频加载完成: 时长 {len(full_audio) / sr:.2f}s, 采样率 {sr}Hz")
+
+            # 根据元数据切分 chunks
+            chunks = []
+            for meta in chunks_metadata:
+                index = meta.get("index", len(chunks))
+                start_time = meta.get("start_time", 0.0)
+                end_time = meta.get("end_time", 0.0)
+                duration = meta.get("duration", end_time - start_time)
+
+                # 计算采样点范围
+                start_sample = int(start_time * sr)
+                end_sample = int(end_time * sr)
+
+                # 边界检查
+                start_sample = max(0, start_sample)
+                end_sample = min(len(full_audio), end_sample)
+
+                if end_sample <= start_sample:
+                    self.logger.warning(f"[V3.7.2] 跳过无效 chunk {index}: start={start_time:.2f}s, end={end_time:.2f}s")
+                    continue
+
+                # 提取音频片段
+                chunk_audio = full_audio[start_sample:end_sample]
+
+                # 创建 AudioChunk（使用 start/end 而非 start_time/end_time）
+                chunk = AudioChunk(
+                    index=index,
+                    audio=chunk_audio,
+                    start=start_time,   # AudioChunk 使用 start
+                    end=end_time,       # AudioChunk 使用 end
+                    sample_rate=sr
+                )
+                chunks.append(chunk)
+
+            self.logger.info(f"[V3.7.2] 从 checkpoint 恢复了 {len(chunks)} 个 chunk")
+            return chunks
+
+        except Exception as e:
+            self.logger.error(f"[V3.7.2] 从 checkpoint 恢复 chunks 失败: {e}")
+            return None
 
     def get_statistics(self, chunks: List[AudioChunk]) -> dict:
         """

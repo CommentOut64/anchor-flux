@@ -998,6 +998,9 @@ class CheckpointManagerV37:
                 prep.vad_completed = prep_data["vad_completed"]
             if "total_chunks" in prep_data:
                 prep.total_chunks = prep_data["total_chunks"]
+            # V3.7.2: 保存 chunks_metadata（用于跳过 VAD 恢复）
+            if "chunks_metadata" in prep_data:
+                prep.chunks_metadata = prep_data["chunks_metadata"]
 
         # 更新频谱分诊状态
         if "spectral_triage" in checkpoint_data:
@@ -1068,6 +1071,8 @@ class CheckpointManagerV37:
             # SlowWorker 字段（关键：previous_whisper_text）
             if "slow_processed_count" in trans_data:
                 trans.slow_completed_count = trans_data["slow_processed_count"]
+            if "slow_processed_indices" in trans_data:
+                trans.slow_processed_indices = trans_data["slow_processed_indices"]  # V3.7.2
             if "previous_whisper_text" in trans_data:
                 trans.previous_whisper_text = trans_data["previous_whisper_text"]
             if "last_slow_chunk_index" in trans_data:

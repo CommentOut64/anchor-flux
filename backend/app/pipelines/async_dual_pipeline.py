@@ -452,9 +452,11 @@ class AsyncDualPipeline:
 
         V3.7: 支持原子区域和检查点保存（包括关键的 previous_whisper_text）
         V3.7.1: 集成进度发射器
+        V3.7.2: 保存 slow_processed_indices 用于断点续传
         """
         token = self.cancellation_token  # V3.7
         slow_processed_count = 0  # V3.7: 追踪已处理数量
+        slow_processed_indices = []  # V3.7.2: 追踪已处理索引
 
         try:
             while True:
@@ -484,6 +486,7 @@ class AsyncDualPipeline:
                     # 放入队列
                     await self.queue_final.put(ctx)
                     slow_processed_count += 1
+                    slow_processed_indices.append(chunk_index)  # V3.7.2: 记录已处理索引
 
                     # V3.7.1: 更新 SlowWorker 进度
                     if self.progress_emitter and total_chunks > 0:
@@ -505,6 +508,7 @@ class AsyncDualPipeline:
                     checkpoint_data = {
                         "transcription": {
                             "slow_processed_count": slow_processed_count,
+                            "slow_processed_indices": slow_processed_indices,  # V3.7.2: 保存索引列表
                             "previous_whisper_text": previous_whisper_text,  # 关键：保存上文状态
                             "last_slow_chunk_index": chunk_index
                         }

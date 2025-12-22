@@ -693,14 +693,18 @@ class JobQueueService:
                     f"分离比例={stats['separation_ratio']:.2%}"
                 )
             else:
-                # V3.7: 从检查点恢复 AudioChunk（需要重新加载音频）
-                # 由于 AudioChunk 包含音频数据，无法直接序列化，需要重新执行预处理
-                # 但可以跳过已完成的步骤
-                logger.info("[V3.7] 从检查点恢复预处理状态...")
+                # V3.7.2: 从检查点恢复 AudioChunk（传递 checkpoint 数据给预处理流水线）
+                # 预处理流水线会根据 checkpoint 中的 chunks_metadata 跳过 VAD
+                logger.info("[V3.7.2] 从检查点恢复预处理状态...")
+
+                # 将 checkpoint 转换为字典格式供预处理流水线使用
+                checkpoint_dict = checkpoint.to_dict() if hasattr(checkpoint, 'to_dict') else None
+
                 audio_chunks = await preprocessing_pipeline.process(
                     video_path=job.input_path,
                     job_state=job,
-                    job_dir=job_dir
+                    job_dir=job_dir,
+                    checkpoint=checkpoint_dict  # V3.7.2: 传递 checkpoint 用于跳过 VAD
                 )
 
             # 加载完整音频（用于双流对齐的 Audio Overlap 功能）
@@ -736,22 +740,52 @@ class JobQueueService:
             progress_tracker.start_phase(ProcessPhase.SENSEVOICE, total_chunks, "双流对齐...")
 
             # V3.7: 检查是否需要恢复转录状态
-            processed_indices = set()
+            # V3.7.2: 使用 min(fast, slow) 作为安全恢复点
+            # 原因：finalized_indices 在当前实现中未被保存到 checkpoint，始终为空
+            # 使用 min 确保不会跳过任何需要处理的 chunk
+            fast_processed_indices = set()
+            slow_processed_indices = set()
             previous_whisper_text = None
             if is_resuming and checkpoint.transcription:
                 transcription_state = checkpoint.transcription
-                # 使用 finalized_indices（已完成对齐的 chunk）作为恢复点
-                # 如果没有，则使用 slow_processed_indices（已完成 Whisper 推理的 chunk）
-                if transcription_state.finalized_indices:
-                    processed_indices = set(transcription_state.finalized_indices)
-                elif transcription_state.slow_processed_indices:
-                    processed_indices = set(transcription_state.slow_processed_indices)
-                elif transcription_state.fast_processed_indices:
-                    processed_indices = set(transcription_state.fast_processed_indices)
+
+                # 获取各 Worker 的已处理索引
+                fast_indices = set(transcription_state.fast_processed_indices) if transcription_state.fast_processed_indices else set()
+                slow_indices = set(transcription_state.slow_processed_indices) if transcription_state.slow_processed_indices else set()
+                finalized = set(transcription_state.finalized_indices) if transcription_state.finalized_indices else set()
+
+                # V3.7.2: 使用安全恢复策略
+                # 优先使用 finalized_indices（如果有）
+                # 否则使用 fast 和 slow 的交集（两者都已处理的 chunk）
+                if finalized:
+                    # 有 finalized 数据时，使用 finalized 作为恢复点
+                    safe_indices = finalized
+                    logger.info(f"[V3.7.2] 使用 finalized_indices 作为恢复点: {len(finalized)} 个")
+                elif fast_indices and slow_indices:
+                    # 使用交集：只有两个 Worker 都处理过的 chunk 才能跳过
+                    safe_indices = fast_indices & slow_indices
+                    logger.info(f"[V3.7.2] 使用 fast & slow 交集作为恢复点: {len(safe_indices)} 个")
+                elif slow_indices:
+                    # 只有 slow 数据（不太可能，但以防万一）
+                    safe_indices = slow_indices
+                    logger.info(f"[V3.7.2] 使用 slow_indices 作为恢复点: {len(slow_indices)} 个")
+                else:
+                    # 没有可靠的恢复点，从头开始
+                    safe_indices = set()
+                    logger.info("[V3.7.2] 无可靠恢复点，从头开始")
+
+                fast_processed_indices = safe_indices
+                slow_processed_indices = safe_indices
+
                 previous_whisper_text = transcription_state.previous_whisper_text
-                logger.info(f"[V3.7] 恢复转录状态: 已处理 {len(processed_indices)} 个 chunk")
-                # V3.7.1: 更新进度发射器的已处理数
-                progress_emitter.update_fast(len(processed_indices), total_chunks, force_push=True)
+                logger.info(
+                    f"[V3.7.2] 恢复转录状态: safe={len(safe_indices)}, "
+                    f"checkpoint.fast={len(fast_indices)}, "
+                    f"checkpoint.slow={len(slow_indices)}, "
+                    f"finalized={len(finalized)}"
+                )
+                # V3.7.1: 更新进度发射器的已处理数（使用 safe_indices）
+                progress_emitter.update_fast(len(safe_indices), total_chunks, force_push=True)
 
             if use_async_pipeline:
                 # V3.1.0: 异步流水线（三级流水线，错位并行）
@@ -774,12 +808,13 @@ class JobQueueService:
                     logger.info(f"[V3.7] 已恢复 SlowWorker 上下文: {len(previous_whisper_text)} 字符")
 
                 # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
+                # V3.7.2: 使用 finalized_indices 作为恢复点
                 contexts = await async_pipeline.run(
                     audio_chunks=audio_chunks,
                     full_audio_array=full_audio,
                     full_audio_sr=sr,
                     job_dir=job_dir,  # V3.7
-                    processed_indices=processed_indices  # V3.7
+                    processed_indices=fast_processed_indices  # V3.7.2: 使用 finalized 索引
                 )
 
                 # 提取结果
