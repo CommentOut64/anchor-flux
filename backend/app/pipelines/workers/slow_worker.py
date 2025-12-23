@@ -12,6 +12,7 @@ SlowWorker - 慢流推理 Worker（GPU）
 - Prompt 策略：关键词提取，避免完整句子
 - 幻觉防御：内置检测逻辑，自动回退到 SenseVoice
 """
+import copy
 import logging
 from typing import Dict, Optional, Any
 
@@ -89,7 +90,8 @@ class SlowWorker:
             whisper_result['text'] = ctx.sv_result.get('text_clean', '')
             whisper_result['is_hallucination'] = True
 
-        ctx.whisper_result = whisper_result
+        # V3.8 修复竞态条件：深拷贝 whisper_result，避免下游修改影响其他协程
+        ctx.whisper_result = copy.deepcopy(whisper_result)
 
         self.logger.info(
             f"Chunk {ctx.chunk_index}: Whisper 推理完成 "
@@ -184,9 +186,10 @@ class SlowWorker:
 
     def _is_hallucination(self, result: Dict[str, Any], prompt: Optional[str]) -> bool:
         """
-        检测 Whisper 幻觉（四道检测防线）
+        检测 Whisper 幻觉（五道检测防线）
 
         幻觉特征：
+        0. 输出为空（有音频却无文本，视为幻觉）
         1. 输出包含大量下划线（> 30%）
         2. 输出重复了 prompt 内容（相似度 > 80%）
         3. avg_logprob 过低（< -1.0，模型不确信）
@@ -200,8 +203,13 @@ class SlowWorker:
             bool: True 表示检测到幻觉
         """
         text = result.get('text', '')
-        if not text:
-            return False
+
+        # 检测 0: 空输出视为幻觉（V3.8 修复：有音频但无文本是典型的 Whisper 幻觉）
+        if not text or not text.strip():
+            self.logger.warning(
+                f"检测到空输出幻觉: Whisper 返回空文本，回退到 SenseVoice"
+            )
+            return True
 
         # 检测 1：下划线占比 > 30%
         underscore_ratio = text.count('_') / max(len(text), 1)

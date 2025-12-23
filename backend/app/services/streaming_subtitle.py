@@ -6,6 +6,8 @@
 2. 协调 SSE 事件推送（统一 Tag）
 3. 支持多阶段增量更新（SV → Whisper → LLM）
 """
+import copy
+import threading
 from typing import Dict, List, Optional
 from app.models.sensevoice_models import SentenceSegment, TextSource
 from app.services.sse_service import get_sse_manager
@@ -43,6 +45,11 @@ class StreamingSubtitleManager:
         # Phase 4: Chunk 级别的句子索引映射
         # chunk_sentences[chunk_index] = [sentence_index_1, sentence_index_2, ...]
         self.chunk_sentences: Dict[int, List[int]] = {}
+
+        # V3.8: 添加锁保护，防止 remove_marked_sentences 在错误时机执行
+        self._lock = threading.RLock()
+        # V3.8: 标记是否允许删除句子
+        self._deletion_enabled = False
 
     def add_sentence(self, sentence: SentenceSegment) -> int:
         """
@@ -198,21 +205,39 @@ class StreamingSubtitleManager:
         """
         物理删除被标记为垃圾的句子
 
+        V3.8: 添加锁保护和删除开关，防止在流水线运行期间误删
+
         Returns:
             int: 删除的句子数量
         """
-        marked_indices = [
-            idx for idx, s in self.sentences.items()
-            if getattr(s, 'marked_for_deletion', False)
-        ]
+        # V3.8: 检查删除开关
+        if not self._deletion_enabled:
+            logger.warning("remove_marked_sentences: 删除功能未启用，跳过删除操作")
+            return 0
 
-        for idx in marked_indices:
-            del self.sentences[idx]
+        with self._lock:
+            marked_indices = [
+                idx for idx, s in self.sentences.items()
+                if getattr(s, 'marked_for_deletion', False)
+            ]
 
-        if marked_indices:
-            logger.info(f"已删除 {len(marked_indices)} 个垃圾句子: {marked_indices}")
+            for idx in marked_indices:
+                del self.sentences[idx]
 
-        return len(marked_indices)
+            if marked_indices:
+                logger.info(f"已删除 {len(marked_indices)} 个垃圾句子: {marked_indices}")
+
+            return len(marked_indices)
+
+    def enable_deletion(self):
+        """V3.8: 启用删除功能（在任务完成后调用）"""
+        self._deletion_enabled = True
+        logger.info(f"StreamingSubtitleManager: 删除功能已启用 job_id={self.job_id}")
+
+    def disable_deletion(self):
+        """V3.8: 禁用删除功能（在任务开始时调用）"""
+        self._deletion_enabled = False
+        logger.info(f"StreamingSubtitleManager: 删除功能已禁用 job_id={self.job_id}")
 
     def get_all_sentences(self) -> List[SentenceSegment]:
         """获取所有句子（按时间排序，排除已标记删除的）"""
@@ -221,6 +246,13 @@ class StreamingSubtitleManager:
             if not getattr(s, 'marked_for_deletion', False)
         ]
         sentences.sort(key=lambda s: s.start)
+        # V3.8 调试日志：导出时记录句子数量
+        logger.info(
+            f"get_all_sentences: job_id={self.job_id}, "
+            f"total_in_dict={len(self.sentences)}, "
+            f"after_filter={len(sentences)}, "
+            f"chunk_count={len(self.chunk_sentences)}"
+        )
         return sentences
 
     def get_context_window(self, index: int, window_size: int = 3) -> str:
@@ -255,6 +287,8 @@ class StreamingSubtitleManager:
         Phase 4 双流对齐专用方法。
         推送多个草稿句子，并记录 Chunk 级别的索引映射。
 
+        V3.8: 深拷贝句子对象，避免共享引用导致的竞态条件
+
         Args:
             chunk_index: Chunk 索引
             sentences: 句子列表
@@ -263,29 +297,40 @@ class StreamingSubtitleManager:
             List[int]: 句子索引列表
         """
         sentence_indices = []
+        sentences_to_push = []  # V3.8: 收集待推送的句子数据
 
-        for sentence in sentences:
-            index = self.sentence_count
-            self.sentences[index] = sentence
-            self.sentence_count += 1
-            sentence_indices.append(index)
+        with self._lock:
+            for sentence in sentences:
+                # V3.8 修复：深拷贝句子对象，避免共享引用
+                sentence_copy = copy.deepcopy(sentence)
 
-            # 推送 SSE 事件（草稿）
-            sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
-                "index": index,
-                "text": sentence.text_clean or sentence.text,
-                "start": sentence.start,
-                "end": sentence.end,
-                "confidence": sentence.confidence,
-                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
-                "is_draft": True,
-                "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
-            }
+                index = self.sentence_count
+                self.sentences[index] = sentence_copy
+                self.sentence_count += 1
+                sentence_indices.append(index)
 
+                # V3.8: 收集待推送的句子数据（在锁内准备，锁外推送）
+                sentence_dict = sentence_copy.to_dict() if hasattr(sentence_copy, 'to_dict') else {
+                    "index": index,
+                    "text": sentence_copy.text_clean or sentence_copy.text,
+                    "start": sentence_copy.start,
+                    "end": sentence_copy.end,
+                    "confidence": sentence_copy.confidence,
+                    "source": sentence_copy.source.value if hasattr(sentence_copy.source, 'value') else str(sentence_copy.source),
+                    "is_draft": True,
+                    "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence_copy, 'words', [])]
+                }
+                sentences_to_push.append((index, sentence_dict))
+
+            # 记录 Chunk 级别的索引映射
+            self.chunk_sentences[chunk_index] = sentence_indices
+
+        # V3.8: 在锁外推送 SSE 事件，避免长时间持锁
+        for index, sentence_dict in sentences_to_push:
             push_subtitle_event(
                 self.sse_manager,
                 self.job_id,
-                "draft",  # 新事件类型
+                "draft",
                 {
                     "index": index,
                     "chunk_index": chunk_index,
@@ -293,12 +338,10 @@ class StreamingSubtitleManager:
                 }
             )
 
-        # 记录 Chunk 级别的索引映射
-        self.chunk_sentences[chunk_index] = sentence_indices
-
-        logger.debug(
-            f"添加草稿句子: Chunk {chunk_index}, "
-            f"{len(sentences)} 个句子, 索引 {sentence_indices}"
+        # V3.8 调试日志：确认草稿已添加到管理器
+        logger.info(
+            f"add_draft_sentences: Chunk {chunk_index} 添加 {len(sentences)} 个草稿, "
+            f"索引 {sentence_indices}, 当前总句子数={len(self.sentences)}"
         )
 
         return sentence_indices
@@ -313,6 +356,8 @@ class StreamingSubtitleManager:
 
         Phase 4 双流对齐专用方法。
         用定稿句子替换整个 Chunk 的草稿句子。
+
+        V3.8: 添加锁保护，防止竞态条件
 
         流程：
         1. 删除旧的草稿句子
@@ -329,30 +374,33 @@ class StreamingSubtitleManager:
         """
         # 防御性检查：如果新句子列表为空，保留原有草稿，不要删除
         if not sentences:
-            self.logger.warning(
+            existing_indices = self.chunk_sentences.get(chunk_index, [])
+            logger.warning(
                 f"replace_chunk: Chunk {chunk_index} 的定稿句子为空，"
-                f"保留原有草稿句子以避免字幕丢失"
+                f"保留原有 {len(existing_indices)} 个草稿句子以避免字幕丢失"
             )
-            return self.chunk_sentences.get(chunk_index, [])
+            return existing_indices
 
-        # 删除旧的草稿句子
-        old_indices = self.chunk_sentences.get(chunk_index, [])
-        for old_index in old_indices:
-            if old_index in self.sentences:
-                del self.sentences[old_index]
+        # V3.8: 使用锁保护整个替换过程
+        with self._lock:
+            # 删除旧的草稿句子
+            old_indices = self.chunk_sentences.get(chunk_index, [])
+            for old_index in old_indices:
+                if old_index in self.sentences:
+                    del self.sentences[old_index]
 
-        # 添加新的定稿句子
-        new_indices = []
-        for sentence in sentences:
-            index = self.sentence_count
-            self.sentences[index] = sentence
-            self.sentence_count += 1
-            new_indices.append(index)
+            # 添加新的定稿句子
+            new_indices = []
+            for sentence in sentences:
+                index = self.sentence_count
+                self.sentences[index] = sentence
+                self.sentence_count += 1
+                new_indices.append(index)
 
-        # 更新 Chunk 索引映射
-        self.chunk_sentences[chunk_index] = new_indices
+            # 更新 Chunk 索引映射
+            self.chunk_sentences[chunk_index] = new_indices
 
-        # 推送 SSE 事件（批量替换）
+        # 推送 SSE 事件（批量替换）- 在锁外推送，避免死锁
         sentences_data = [
             sentence.to_dict() if hasattr(sentence, 'to_dict') else {
                 "index": new_indices[i],
@@ -363,7 +411,7 @@ class StreamingSubtitleManager:
                 "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
                 "is_draft": False,
                 "is_finalized": True,
-                "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]  # 确保包含 words
+                "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]
             }
             for i, sentence in enumerate(sentences)
         ]
@@ -371,7 +419,7 @@ class StreamingSubtitleManager:
         push_subtitle_event(
             self.sse_manager,
             self.job_id,
-            "replace_chunk",  # 新事件类型
+            "replace_chunk",
             {
                 "chunk_index": chunk_index,
                 "old_indices": old_indices,
@@ -380,10 +428,12 @@ class StreamingSubtitleManager:
             }
         )
 
+        # V3.8 调试日志：确认替换成功
         logger.info(
-            f"替换 Chunk {chunk_index}: "
-            f"删除 {len(old_indices)} 个草稿, "
-            f"添加 {len(new_indices)} 个定稿"
+            f"replace_chunk: Chunk {chunk_index} 替换完成 - "
+            f"删除 {len(old_indices)} 个草稿 {old_indices}, "
+            f"添加 {len(new_indices)} 个定稿 {new_indices}, "
+            f"当前总句子数={len(self.sentences)}"
         )
 
         return new_indices
@@ -399,6 +449,8 @@ class StreamingSubtitleManager:
         V3.5 新增: 极速模式下 FastWorker 直接输出定稿，不经过 SlowWorker。
         与 add_draft_sentences 不同，这里直接推送定稿事件。
 
+        V3.8: 添加锁保护和深拷贝，防止竞态条件
+
         Args:
             chunk_index: Chunk 索引
             sentences: 定稿句子列表
@@ -407,44 +459,52 @@ class StreamingSubtitleManager:
             List[int]: 句子索引列表
         """
         sentence_indices = []
+        sentences_to_push = []  # V3.8: 收集待推送的句子数据
 
-        for sentence in sentences:
-            # 确保句子标记为定稿
-            sentence.is_draft = False
-            sentence.is_finalized = True
+        with self._lock:
+            for sentence in sentences:
+                # V3.8 修复：深拷贝句子对象，避免共享引用
+                sentence_copy = copy.deepcopy(sentence)
 
-            index = self.sentence_count
-            self.sentences[index] = sentence
-            self.sentence_count += 1
-            sentence_indices.append(index)
+                # 确保句子标记为定稿
+                sentence_copy.is_draft = False
+                sentence_copy.is_finalized = True
 
-            # 推送 SSE 事件（定稿）
-            sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
-                "index": index,
-                "text": sentence.text_clean or sentence.text,
-                "start": sentence.start,
-                "end": sentence.end,
-                "confidence": sentence.confidence,
-                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
-                "is_draft": False,
-                "is_finalized": True,
-                "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence, 'words', [])]
-            }
+                index = self.sentence_count
+                self.sentences[index] = sentence_copy
+                self.sentence_count += 1
+                sentence_indices.append(index)
 
+                # V3.8: 收集待推送的句子数据（在锁内准备，锁外推送）
+                sentence_dict = sentence_copy.to_dict() if hasattr(sentence_copy, 'to_dict') else {
+                    "index": index,
+                    "text": sentence_copy.text_clean or sentence_copy.text,
+                    "start": sentence_copy.start,
+                    "end": sentence_copy.end,
+                    "confidence": sentence_copy.confidence,
+                    "source": sentence_copy.source.value if hasattr(sentence_copy.source, 'value') else str(sentence_copy.source),
+                    "is_draft": False,
+                    "is_finalized": True,
+                    "words": [w.to_dict() if hasattr(w, 'to_dict') else w for w in getattr(sentence_copy, 'words', [])]
+                }
+                sentences_to_push.append((index, sentence_dict))
+
+            # 记录 Chunk 级别的索引映射
+            self.chunk_sentences[chunk_index] = sentence_indices
+
+        # V3.8: 在锁外推送 SSE 事件，避免死锁
+        for index, sentence_dict in sentences_to_push:
             push_subtitle_event(
                 self.sse_manager,
                 self.job_id,
-                "finalized",  # 定稿事件类型
+                "finalized",
                 {
                     "index": index,
                     "chunk_index": chunk_index,
                     "sentence": sentence_dict,
-                    "mode": "sensevoice_only"  # 标记为极速模式
+                    "mode": "sensevoice_only"
                 }
             )
-
-        # 记录 Chunk 级别的索引映射
-        self.chunk_sentences[chunk_index] = sentence_indices
 
         logger.info(
             f"添加定稿句子 [极速模式]: Chunk {chunk_index}, "

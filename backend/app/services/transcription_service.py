@@ -3872,17 +3872,36 @@ class TranscriptionService:
             WHISPER_ARBITRATION_CONF = 0.5  # Whisper 也必须有一定确信度
             MIN_TEXT_LENGTH = 1  # 最少文本长度
 
-            # 判死刑条件：Whisper 也听不清 OR 输出为空
-            if whisper_conf < WHISPER_ARBITRATION_CONF or len(whisper_text) < MIN_TEXT_LENGTH:
-                self.logger.info(
-                    f"仲裁结果: 删除垃圾片段 {sentence_index} - "
-                    f"SenseVoice({sentence.confidence:.2f}) + Whisper({whisper_conf:.2f}, '{whisper_text}')"
+            # V3.8 修复: Whisper 空输出时，保留 SenseVoice 而非删除
+            # 有音频却没有 Whisper 输出，说明 Whisper 幻觉，应回退到 SenseVoice
+            if len(whisper_text) < MIN_TEXT_LENGTH:
+                self.logger.warning(
+                    f"仲裁结果: Whisper 空输出，保留 SenseVoice 结果 {sentence_index} - "
+                    f"SenseVoice({sentence.confidence:.2f}): '{sensevoice_text[:50]}...'"
                 )
-                subtitle_manager.mark_for_deletion(
-                    index=sentence_index,
-                    reason=f"whisper_arbitration_failed_conf_{whisper_conf:.2f}"
-                )
+                # 不删除，直接返回原 SenseVoice 句子
                 return sentence
+
+            # 判死刑条件：Whisper 有输出但置信度极低（两者都不可靠）
+            if whisper_conf < WHISPER_ARBITRATION_CONF:
+                # V3.8: 如果 SenseVoice 有实质内容，优先保留而非删除
+                if sensevoice_text and len(sensevoice_text) >= 2:
+                    self.logger.warning(
+                        f"仲裁结果: Whisper 低置信度({whisper_conf:.2f})，保留 SenseVoice {sentence_index}: "
+                        f"'{sensevoice_text[:50]}...'"
+                    )
+                    return sentence
+                else:
+                    # SenseVoice 也为空或单字符，且 Whisper 低置信度，才删除
+                    self.logger.info(
+                        f"仲裁结果: 删除垃圾片段 {sentence_index} - "
+                        f"SenseVoice({sentence.confidence:.2f}, '{sensevoice_text}') + Whisper({whisper_conf:.2f}, '{whisper_text}')"
+                    )
+                    subtitle_manager.mark_for_deletion(
+                        index=sentence_index,
+                        reason=f"whisper_arbitration_failed_conf_{whisper_conf:.2f}"
+                    )
+                    return sentence
             else:
                 # 挽救成功！
                 self.logger.info(

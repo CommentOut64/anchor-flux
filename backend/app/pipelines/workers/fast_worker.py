@@ -17,6 +17,7 @@ FastWorker - 快流推理 Worker（CPU）
 V3.5 更新：
 - 支持 is_final_output 参数，极速模式下直接输出定稿
 """
+import copy
 import logging
 from typing import Dict, List, Optional, Any
 
@@ -169,7 +170,9 @@ class FastWorker:
         # 阶段 1: SenseVoice 推理
         self.logger.debug(f"Chunk {ctx.chunk_index}: SenseVoice 快流推理")
         sv_result = await self._run_sensevoice(chunk)
-        ctx.sv_result = sv_result
+
+        # V3.8 修复竞态条件：深拷贝 sv_result，避免下游修改影响其他协程
+        ctx.sv_result = copy.deepcopy(sv_result)
 
         # 阶段 2: 分句（Layer 1 + Layer 2）
         # 极速模式下 is_draft=False，表示这是定稿
@@ -323,8 +326,28 @@ class FastWorker:
         ]
 
         if not words:
-            self.logger.warning("SenseVoice 结果没有字级时间戳，无法分句")
-            return []
+            # V3.8 修复: words 为空但 text_clean 有值时，创建覆盖整个 chunk 的单句
+            # 避免"有文本但无字级时间戳"导致字幕丢失
+            if text_clean and text_clean.strip():
+                self.logger.warning(
+                    f"SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
+                    f"text='{text_clean[:50]}...', chunk=[{chunk.start:.2f}s, {chunk.end:.2f}s]"
+                )
+                # 创建覆盖整个 chunk 的单句
+                fallback_sentence = SentenceSegment(
+                    text=text_clean.strip(),
+                    start=chunk.start,
+                    end=chunk.end,
+                    words=[],  # 无字级时间戳
+                    source=TextSource.SENSEVOICE,
+                    confidence=sv_result.get('confidence', 0.5),
+                    is_finalized=not is_draft,
+                    is_draft=is_draft
+                )
+                return [fallback_sentence]
+            else:
+                self.logger.warning("SenseVoice 结果没有字级时间戳且无文本，无法分句")
+                return []
 
         # Layer 1: 分句（使用 draft_splitter，主要依赖 VAD 停顿）
         sentences = self.draft_splitter.split(words, text_clean)

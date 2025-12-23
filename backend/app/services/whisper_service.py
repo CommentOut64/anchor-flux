@@ -579,8 +579,14 @@ class WhisperService:
             float: 0-1 之间的置信度分数
         """
         segments = result.get("segments", [])
-        if not segments:
-            return 0.7  # 默认置信度
+        text = result.get("text", "")
+
+        # V3.8 修复: 空输出返回极低置信度，触发回退机制
+        if not segments or not text or not text.strip():
+            # 检查是否有 no_speech_prob 指示（可能是真正的静音段）
+            # 如果连 segments 都没有，说明 Whisper 完全没有输出，置信度应该极低
+            logger.warning(f"Whisper 输出为空: segments={len(segments)}, text_len={len(text)}, 返回低置信度 0.1")
+            return 0.1  # 极低置信度，确保触发回退
 
         # 基于 avg_logprob 和 no_speech_prob 计算
         total_logprob = sum(s.get("avg_logprob", -0.5) for s in segments)
