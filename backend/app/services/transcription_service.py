@@ -1293,18 +1293,22 @@ class TranscriptionService:
         if delete_data:
             try:
                 job_dir = Path(job.dir)
+
+                # 先从内存中移除任务，避免删除失败时仍显示"未知文件"
+                with self.lock:
+                    if job_id in self.jobs:
+                        del self.jobs[job_id]
+                        self.logger.info(f"已从内存移除任务: {job_id}")
+
                 # 移除文件路径映射
                 if job.input_path:
                     self.job_index.remove_mapping(job.input_path)
 
+                # 最后删除任务目录
                 if job_dir.exists():
                     # V3.7.5: 使用强制删除逻辑，处理 Windows 文件占用问题
                     self._force_remove_directory(job_dir, job_id)
                     self.logger.info(f"已删除任务数据: {job_id}")
-                    # 从内存中移除任务
-                    with self.lock:
-                        if job_id in self.jobs:
-                            del self.jobs[job_id]
             except Exception as e:
                 self.logger.error(f"删除任务数据失败: {e}")
 
@@ -4291,6 +4295,11 @@ class TranscriptionService:
 
         progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
 
+        # 检查任务是否已取消
+        if job.canceled:
+            self.logger.info(f"任务已取消，跳过后处理增强: {job.job_id}")
+            return sentences
+
         # 调试日志：确认方法被调用
         self.logger.debug(f"开始后处理增强: {len(sentences)} 句, enhancement={solution_config.enhancement.value}")
 
@@ -4447,6 +4456,11 @@ class TranscriptionService:
             else:
                 # === SMART_PATCH 模式: 逐句处理 ===
                 for idx, item in enumerate(patch_queue):
+                    # 检查任务是否已取消
+                    if job.canceled:
+                        self.logger.info(f"任务已取消，停止 Whisper 补刀: {job.job_id}")
+                        break
+
                     sent_idx = item["index"]
                     sentence = item["sentence"]
                     is_trash_suspect = item["is_trash_suspect"]
@@ -4497,6 +4511,11 @@ class TranscriptionService:
         from app.services.demucs_service import get_demucs_service
         from app.services.sse_service import get_sse_manager
         from pathlib import Path
+
+        # 检查任务是否已取消
+        if job.canceled:
+            self.logger.info(f"任务已取消，停止执行: {job.job_id}")
+            return
 
         def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
             """推送信号事件（使用统一命名空间格式）"""
@@ -4577,6 +4596,11 @@ class TranscriptionService:
             all_sentences = []
 
             for chunk_state in chunk_states:
+                # 检查任务是否已取消
+                if job.canceled:
+                    self.logger.info(f"任务已取消，停止转录: {job.job_id}")
+                    break
+
                 # 单个 Chunk 转录（含熔断回溯循环）
                 sentences = await self._transcribe_chunk_with_fusing(
                     chunk_state=chunk_state,

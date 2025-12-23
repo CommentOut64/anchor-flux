@@ -360,6 +360,13 @@ class JobQueueService:
                 job.status = "canceled"
                 job.message = "已取消（未开始）"
 
+            # 如果是正在运行的任务，清理 running_job_id
+            if self.running_job_id == job_id:
+                logger.info(f"清理正在运行的任务: {job_id}")
+                self.running_job_id = None
+                job.status = "canceled"
+                job.message = "已取消（运行中）"
+
         # 如果需要删除数据，调用transcription_service的清理逻辑
         if delete_data:
             result = self.transcription_service.cancel_job(job_id, delete_data=True)

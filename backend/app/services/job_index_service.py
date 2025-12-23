@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Optional, Dict
 import logging
+import threading
 
 
 class JobIndexService:
@@ -21,6 +22,7 @@ class JobIndexService:
         self.jobs_root = Path(jobs_root)
         self.index_file = self.jobs_root / "job_index.json"
         self.logger = logging.getLogger(__name__)
+        self.lock = threading.RLock()  # 添加线程锁保护
         self._ensure_index_file()
 
     def _ensure_index_file(self):
@@ -55,13 +57,14 @@ class JobIndexService:
             file_path: 文件路径
             job_id: 任务ID
         """
-        # 规范化路径
-        normalized_path = os.path.normpath(file_path)
+        with self.lock:
+            # 规范化路径
+            normalized_path = os.path.normpath(file_path)
 
-        index = self._load_index()
-        index[normalized_path] = job_id
-        self._save_index(index)
-        self.logger.debug(f"添加映射: {normalized_path} -> {job_id}")
+            index = self._load_index()
+            index[normalized_path] = job_id
+            self._save_index(index)
+            self.logger.debug(f"添加映射: {normalized_path} -> {job_id}")
 
     def remove_mapping(self, file_path: str):
         """
@@ -70,13 +73,14 @@ class JobIndexService:
         Args:
             file_path: 文件路径
         """
-        normalized_path = os.path.normpath(file_path)
+        with self.lock:
+            normalized_path = os.path.normpath(file_path)
 
-        index = self._load_index()
-        if normalized_path in index:
-            del index[normalized_path]
-            self._save_index(index)
-            self.logger.debug(f"移除映射: {normalized_path}")
+            index = self._load_index()
+            if normalized_path in index:
+                del index[normalized_path]
+                self._save_index(index)
+                self.logger.debug(f"移除映射: {normalized_path}")
 
     def get_job_id(self, file_path: str) -> Optional[str]:
         """
@@ -88,9 +92,10 @@ class JobIndexService:
         Returns:
             Optional[str]: 任务ID，不存在则返回None
         """
-        normalized_path = os.path.normpath(file_path)
-        index = self._load_index()
-        return index.get(normalized_path)
+        with self.lock:
+            normalized_path = os.path.normpath(file_path)
+            index = self._load_index()
+            return index.get(normalized_path)
 
     def get_file_path(self, job_id: str) -> Optional[str]:
         """
@@ -102,11 +107,12 @@ class JobIndexService:
         Returns:
             Optional[str]: 文件路径，不存在则返回None
         """
-        index = self._load_index()
-        for file_path, jid in index.items():
-            if jid == job_id:
-                return file_path
-        return None
+        with self.lock:
+            index = self._load_index()
+            for file_path, jid in index.items():
+                if jid == job_id:
+                    return file_path
+            return None
 
     def cleanup_invalid_mappings(self):
         """
