@@ -74,8 +74,8 @@ class ConfigAdapter:
         判断是否需要双流对齐流水线
 
         双流对齐条件:
-        - 新版: transcription_profile 为 sv_whisper_patch 或 sv_whisper_dual
-        - 旧版: sensevoice.preset_id 不是 'default' 且 engine 是 'sensevoice'
+        - 新版: transcription_profile 为 sv_whisper_dual (双流精校)
+        - sv_whisper_patch (智能补刀) 走 _process_video_sensevoice 流水线
 
         Returns:
             bool: 是否需要双流对齐
@@ -85,7 +85,8 @@ class ConfigAdapter:
             return False
 
         profile = ConfigAdapter.get_transcription_profile(settings)
-        return profile in ('sv_whisper_patch', 'sv_whisper_dual')
+        # 只有 sv_whisper_dual 走双流流水线，sv_whisper_patch 走补刀流水线
+        return profile == 'sv_whisper_dual'
 
     @staticmethod
     def get_preset_id(settings: "JobSettings") -> str:
