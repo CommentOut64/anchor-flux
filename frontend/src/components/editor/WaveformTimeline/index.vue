@@ -324,9 +324,11 @@ async function initWavesurfer() {
     await loadAudioData();
   } catch (error) {
     console.error("初始化波形失败:", error);
-    hasError.value = true;
-    errorMessage.value = "波形组件加载失败";
-    isLoading.value = false;
+    // 不显示错误，保持加载状态
+    hasError.value = false;
+    isLoading.value = true;
+    // 启动定时检查
+    startPeaksPolling();
   }
 }
 
@@ -416,26 +418,25 @@ function setupWavesurferEvents() {
 
   wavesurfer.on("error", (error) => {
     console.error("Wavesurfer error:", error);
-    hasError.value = true;
-    isLoading.value = false;
+    // 不显示错误，保持加载状态
+    hasError.value = false;
+    isLoading.value = true;
 
     // 自动重试机制
     if (retryCount.value < maxRetries) {
       retryCount.value++;
-      errorMessage.value = `波形加载失败，正在重试 (${retryCount.value}/${maxRetries})...`;
       console.log(
         `[WaveformTimeline] 自动重试 ${retryCount.value}/${maxRetries}`
       );
 
       // 延迟1秒后重试
       setTimeout(() => {
-        hasError.value = false;
-        isLoading.value = true;
         loadAudioData();
       }, 1000);
     } else {
-      errorMessage.value = "波形加载失败，请手动重试";
-      console.error("[WaveformTimeline] 达到最大重试次数");
+      // 达到最大重试次数，启动定时检查
+      console.log("[WaveformTimeline] 达到最大重试次数，启动定时检查");
+      startPeaksPolling();
     }
   });
 }
@@ -496,6 +497,40 @@ async function loadAudioData() {
     console.error("加载音频失败:", error);
     // 尝试直接加载音频
     wavesurfer.load(audioSource.value);
+  }
+}
+
+// 定时检查波形数据是否可用
+let peaksCheckTimer = null;
+function startPeaksPolling() {
+  if (peaksCheckTimer) return; // 避免重复启动
+
+  console.log('[WaveformTimeline] 启动波形数据定时检查');
+  peaksCheckTimer = setInterval(async () => {
+    try {
+      // 直接尝试加载波形数据
+      if (peaksSource.value) {
+        const response = await fetch(peaksSource.value);
+        if (response.ok) {
+          console.log('[WaveformTimeline] 波形数据已可用，自动重新加载');
+          stopPeaksPolling();
+          retryCount.value = 0;
+          hasError.value = false;
+          isLoading.value = true;
+          await loadAudioData();
+        }
+      }
+    } catch (e) {
+      // 继续等待
+      console.debug('[WaveformTimeline] 波形数据尚未可用，继续等待...');
+    }
+  }, 2000); // 每2秒检查一次
+}
+
+function stopPeaksPolling() {
+  if (peaksCheckTimer) {
+    clearInterval(peaksCheckTimer);
+    peaksCheckTimer = null;
   }
 }
 
@@ -1354,6 +1389,9 @@ onUnmounted(() => {
 
   // 清理滚动条更新定时器
   if (scrollbarUpdateTimer) clearTimeout(scrollbarUpdateTimer);
+
+  // 清理波形数据检查定时器
+  stopPeaksPolling();
 
   clearTimeout(regionUpdateTimer);
   stopSmartFollow(); // 清理智能跟随RAF循环

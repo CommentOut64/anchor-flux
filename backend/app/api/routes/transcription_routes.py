@@ -697,9 +697,11 @@ def create_transcription_router(
                     if file_path:
                         filename = os.path.basename(file_path)
                     else:
-                        # 从目录中找视频文件
+                        # 从目录中找视频文件（排除 proxy 视频）
                         for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
                             matches = list(job_dir.glob(f"*{ext}"))
+                            # 过滤掉 proxy 视频文件
+                            matches = [m for m in matches if m.name not in ['preview_360p.mp4', 'proxy_720p.mp4']]
                             if matches:
                                 filename = matches[0].name
                                 break
@@ -852,9 +854,11 @@ def create_transcription_router(
                 if file_path:
                     filename = os.path.basename(file_path)
                 else:
-                    # 2. 从目录中找视频文件
+                    # 2. 从目录中找视频文件（排除 proxy 视频）
                     for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
                         matches = list(job_dir.glob(f"*{ext}"))
+                        # 过滤掉 proxy 视频文件
+                        matches = [m for m in matches if m.name not in ['preview_360p.mp4', 'proxy_720p.mp4']]
                         if matches:
                             filename = matches[0].name
                             break
