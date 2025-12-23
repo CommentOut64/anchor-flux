@@ -2,7 +2,7 @@
   <div class="preset-selector" :class="{ compact: compact }">
     <!-- 顶层: 快捷场景宏 -->
     <div class="macro-presets">
-      <div class="section-header">
+      <!-- <div class="section-header">
         <span class="header-label">快捷场景</span>
         <button
           class="toggle-btn"
@@ -10,16 +10,16 @@
         >
           {{ showAdvanced ? '收起高级' : '高级设置' }}
         </button>
-      </div>
+      </div> -->
 
       <!-- 硬件信息提示 -->
-      <div v-if="hardwareLoaded" class="hardware-hint">
+      <!-- <div v-if="hardwareLoaded" class="hardware-hint">
         <span class="hw-vram">显存: {{ vramGB }}GB</span>
         <span v-if="!hasGpu" class="hw-warning">(无GPU)</span>
         <span v-if="recommendedPresetId" class="hw-recommend">
           推荐: {{ getPresetName(recommendedPresetId) }}
         </span>
-      </div>
+      </div> -->
 
       <!-- 三个快捷预设卡片 -->
       <div class="preset-cards">
@@ -35,9 +35,9 @@
           @click="isPresetAvailable(preset) && selectMacroPreset(preset.id)"
           :title="getPresetTooltip(preset)"
         >
-          <div class="preset-icon">
+          <!-- <div class="preset-icon">
             <component :is="getPresetIcon(preset.icon)" />
-          </div>
+          </div> -->
           <div class="preset-info">
             <div class="preset-name">{{ preset.name }}</div>
             <div class="preset-desc">{{ preset.description }}</div>
@@ -140,15 +140,15 @@
     </div>
 
     <!-- 当前方案说明 -->
-    <div class="current-preset-info">
+    <!-- <div class="current-preset-info">
       <span class="info-label">当前方案:</span>
       <span class="info-value">{{ currentPresetInfo }}</span>
-    </div>
+    </div> -->
 
     <!-- 显存警告 -->
-    <div v-if="vramWarning" class="vram-warning">
+    <!-- <div v-if="vramWarning" class="vram-warning">
       {{ vramWarning }}
-    </div>
+    </div> -->
   </div>
 </template>
 
@@ -166,16 +166,17 @@ const props = defineProps({
         demucs_model: 'htdemucs',
         demucs_shifts: 1,
         spectrum_threshold: 0.35,
-        vad_filter: true
+        vad_filter: true,
+        enable_spectral_triage: true
       },
       transcription: {
-        transcription_profile: 'sensevoice_only',
+        transcription_profile: 'sv_whisper_patch',
         sensevoice_device: 'auto',
         whisper_model: 'medium',
         patching_threshold: 0.60
       },
       refinement: {
-        llm_task: 'off',
+        llm_task: 'proofread',
         llm_scope: 'sparse',
         sparse_threshold: 0.70,
         target_language: 'zh',
@@ -531,12 +532,11 @@ onMounted(async () => {
         hasGpu.value = false
       }
 
-      // 计算推荐预设
+      // 计算推荐预设 - 优先推荐智能均衡
       if (!hasGpu.value) {
         recommendedPresetId.value = 'fast'
-      } else if (vramMB.value >= 8000) {
-        recommendedPresetId.value = 'quality'
       } else if (vramMB.value >= 4000) {
+        // 4GB+ 显存优先推荐智能均衡（最佳平衡点）
         recommendedPresetId.value = 'balanced'
       } else {
         recommendedPresetId.value = 'fast'
@@ -770,7 +770,7 @@ onMounted(async () => {
     }
 
     .module-title {
-      font-size: 11px;
+      font-size: 12px;
       font-weight: 500;
       color: var(--text-normal);
     }
@@ -919,7 +919,7 @@ onMounted(async () => {
       }
 
       .module-title {
-        font-size: 10px;
+        font-size: 11px;
       }
     }
   }

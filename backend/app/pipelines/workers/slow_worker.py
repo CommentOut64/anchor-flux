@@ -284,9 +284,9 @@ class SlowWorker:
         """
         self.previous_whisper_text = previous_text
         if previous_text:
-            self.logger.info(f"[V3.7] 从检查点恢复 Prompt 缓存: {len(previous_text)} 个字符")
+            self.logger.debug(f"[V3.7] 从检查点恢复 Prompt 缓存: {len(previous_text)} 个字符")
         else:
-            self.logger.info("[V3.7] Prompt 缓存已清空（无历史文本）")
+            self.logger.debug("[V3.7] Prompt 缓存已清空（无历史文本）")
 
     # V3.7: 为兼容检查点保存提供 prompt_cache 属性别名
     @property

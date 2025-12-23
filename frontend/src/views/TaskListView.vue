@@ -170,7 +170,8 @@
       :close-on-click-modal="false"
     >
       <!-- 选项卡 -->
-      <el-tabs v-model="uploadMode">
+      <div class="tabs-container">
+        <el-tabs v-model="uploadMode">
         <!-- 模式A：直接上传 -->
         <el-tab-pane label="直接上传" name="upload">
           <el-upload
@@ -253,6 +254,18 @@
           </div>
         </el-tab-pane>
       </el-tabs>
+
+      <!-- 打开input目录按钮 - 只在"从本地目录选择"标签页显示 -->
+      <el-button
+        v-if="uploadMode === 'select'"
+        text
+        size="small"
+        @click="handleOpenInputFolder"
+        class="open-folder-btn"
+      >
+        打开input目录
+      </el-button>
+    </div>
 
       <!-- 转录设置区域 - v3.5 预设模式 -->
       <div class="transcription-settings">
@@ -372,7 +385,8 @@ const taskConfig = ref({
     demucs_model: 'htdemucs',
     demucs_shifts: 1,
     spectrum_threshold: 0.35,
-    vad_filter: true
+    vad_filter: true,
+    enable_spectral_triage: true
   },
   transcription: {
     transcription_profile: 'sv_whisper_patch',
@@ -442,6 +456,17 @@ async function loadInputFiles() {
     inputFiles.value = [];
   } finally {
     loadingFiles.value = false;
+  }
+}
+
+// 打开input文件夹
+async function handleOpenInputFolder() {
+  try {
+    await fileApi.openInputFolder();
+    ElMessage.success("已打开input文件夹");
+  } catch (error) {
+    console.error("打开文件夹失败:", error);
+    ElMessage.error(`打开文件夹失败: ${error.message || "未知错误"}`);
   }
 }
 
@@ -1291,6 +1316,30 @@ async function handleExit() {
   }
 }
 
+// 标签页容器 - 相对定位
+.tabs-container {
+  position: relative;
+  margin-bottom: 20px;
+
+  .open-folder-btn {
+    position: absolute;
+    top: 8px;
+    right: 0;
+    color: var(--text-secondary);
+    padding: 4px 8px;
+
+    &:hover {
+      color: var(--el-color-primary);
+      background: var(--bg-tertiary);
+    }
+
+    &:active {
+      color: var(--el-color-primary);
+      background: var(--bg-quaternary);
+    }
+  }
+}
+
 // 文件列表容器样式
 .file-list-container {
   min-height: 300px;
@@ -1645,7 +1694,7 @@ async function handleExit() {
     }
 
     span {
-      font-size: 13px;
+      font-size: 14px;
       font-weight: 500;
       color: var(--text-secondary);
     }

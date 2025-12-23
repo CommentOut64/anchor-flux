@@ -2,6 +2,8 @@
 文件管理服务
 """
 import os
+import sys
+import subprocess
 from typing import List, Dict
 from datetime import datetime
 
@@ -62,3 +64,26 @@ class FileManagementService:
     def get_output_file_path(self, filename: str) -> str:
         """获取输出文件的完整路径"""
         return os.path.join(self.output_dir, filename)
+
+    def open_input_folder(self) -> bool:
+        """使用系统文件管理器打开input目录"""
+        try:
+            # 确保目录存在
+            if not os.path.exists(self.input_dir):
+                os.makedirs(self.input_dir, exist_ok=True)
+
+            # 根据操作系统选择打开方式
+            if sys.platform == 'win32':
+                # Windows: 使用 explorer
+                os.startfile(self.input_dir)
+            elif sys.platform == 'darwin':
+                # macOS: 使用 open
+                subprocess.run(['open', self.input_dir], check=True)
+            else:
+                # Linux: 使用 xdg-open
+                subprocess.run(['xdg-open', self.input_dir], check=True)
+
+            return True
+        except Exception as e:
+            print(f"打开文件夹失败: {str(e)}")
+            return False

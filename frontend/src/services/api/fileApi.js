@@ -38,6 +38,14 @@ class FileAPI {
       filenames
     })
   }
+
+  /**
+   * 使用系统文件管理器打开 input 目录
+   * @returns {Promise<{success: boolean, message: string}>}
+   */
+  async openInputFolder() {
+    return apiClient.post('/api/files/open-input-folder')
+  }
 }
 
 // 导出单例实例

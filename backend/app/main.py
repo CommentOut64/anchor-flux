@@ -40,6 +40,7 @@ from app.api.routes import model_routes
 from app.api.routes import media_routes  # 新增：媒体资源路由
 from app.api.routes.transcription_routes import create_transcription_router
 from app.api.routes.demucs_routes import create_demucs_router  # 新增：Demucs配置路由
+from app.api.routes.file_routes import create_file_router  # 新增：文件管理路由
 from app.api.routes import system_routes  # 新增：系统管理路由
 from app.api.routes import config_routes  # 新增：用户配置路由
 from app.services.file_service import FileManagementService
@@ -327,6 +328,10 @@ transcription_service = get_transcription_service(JOBS_DIR)
 
 # 初始化文件管理服务
 file_service = FileManagementService(INPUT_DIR, OUTPUT_DIR)
+
+# 注册文件管理路由
+file_router = create_file_router(file_service)
+app.include_router(file_router)
 
 # 注册转录路由（包含暂停、恢复等新功能）
 # 注意：model_routes已在第59行注册，这里不再重复注册

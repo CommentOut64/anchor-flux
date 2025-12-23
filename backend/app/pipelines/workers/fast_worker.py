@@ -183,13 +183,13 @@ class FastWorker:
         if self.is_final_output:
             # 极速模式：推送定稿
             self.subtitle_manager.add_finalized_sentences(ctx.chunk_index, sentences)
-            self.logger.info(
+            self.logger.debug(
                 f"Chunk {ctx.chunk_index}: 定稿已推送 ({len(sentences)} 个句子) [极速模式]"
             )
         else:
             # 补刀模式：推送草稿
             self.subtitle_manager.add_draft_sentences(ctx.chunk_index, sentences)
-            self.logger.info(
+            self.logger.debug(
                 f"Chunk {ctx.chunk_index}: 草稿已推送 ({len(sentences)} 个句子)"
             )
 

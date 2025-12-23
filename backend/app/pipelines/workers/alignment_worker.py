@@ -144,7 +144,7 @@ class AlignmentWorker:
 
         # 阶段 2: 推送定稿（使用 Chunk 级别的批量替换）
         # V3.8 调试日志：记录对齐结果状态
-        self.logger.info(
+        self.logger.debug(
             f"Chunk {ctx.chunk_index}: 对齐完成 - "
             f"final_sentences={len(final_sentences)}, "
             f"alignment_level={alignment_level.value}, "
@@ -185,7 +185,7 @@ class AlignmentWorker:
         sentences_for_manager = copy.deepcopy(final_sentences)
         self.subtitle_manager.replace_chunk(ctx.chunk_index, sentences_for_manager)
 
-        self.logger.info(
+        self.logger.debug(
             f"Chunk {ctx.chunk_index}: 定稿已推送 "
             f"({len(final_sentences)} 个句子, 对齐级别={alignment_level.value})"
         )
@@ -357,7 +357,7 @@ class AlignmentWorker:
                 sentence.matched_ratio = aligned_subtitle.matched_ratio
                 sentence.whisper_text = whisper_text
 
-            self.logger.info(
+            self.logger.debug(
                 f"双模态对齐成功: alignment_score={aligned_subtitle.alignment_score:.2f}, "
                 f"matched_ratio={aligned_subtitle.matched_ratio:.2f}, "
                 f"分句数={len(sentences)}"
@@ -405,7 +405,7 @@ class AlignmentWorker:
                     sentence.alignment_score = 0.5  # 伪对齐的默认分数
                     sentence.whisper_text = whisper_text
 
-                self.logger.info(f"Whisper 伪对齐成功, 分句数={len(sentences)}")
+                self.logger.debug(f"Whisper 伪对齐成功, 分句数={len(sentences)}")
 
                 return sentences, AlignmentLevel.WHISPER_PSEUDO
 
@@ -421,7 +421,7 @@ class AlignmentWorker:
                         sentence.is_finalized = True
                         sentence.is_draft = False
 
-                    self.logger.info(f"使用 SenseVoice 草稿作为最终结果, 分句数={len(sentences)}")
+                    self.logger.debug(f"使用 SenseVoice 草稿作为最终结果, 分句数={len(sentences)}")
 
                     return sentences, AlignmentLevel.SENSEVOICE_ONLY
 

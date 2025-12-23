@@ -247,7 +247,7 @@ class StreamingSubtitleManager:
         ]
         sentences.sort(key=lambda s: s.start)
         # V3.8 调试日志：导出时记录句子数量
-        logger.info(
+        logger.debug(
             f"get_all_sentences: job_id={self.job_id}, "
             f"total_in_dict={len(self.sentences)}, "
             f"after_filter={len(sentences)}, "
@@ -339,7 +339,7 @@ class StreamingSubtitleManager:
             )
 
         # V3.8 调试日志：确认草稿已添加到管理器
-        logger.info(
+        logger.debug(
             f"add_draft_sentences: Chunk {chunk_index} 添加 {len(sentences)} 个草稿, "
             f"索引 {sentence_indices}, 当前总句子数={len(self.sentences)}"
         )
@@ -429,7 +429,7 @@ class StreamingSubtitleManager:
         )
 
         # V3.8 调试日志：确认替换成功
-        logger.info(
+        logger.debug(
             f"replace_chunk: Chunk {chunk_index} 替换完成 - "
             f"删除 {len(old_indices)} 个草稿 {old_indices}, "
             f"添加 {len(new_indices)} 个定稿 {new_indices}, "
@@ -506,7 +506,7 @@ class StreamingSubtitleManager:
                 }
             )
 
-        logger.info(
+        logger.debug(
             f"添加定稿句子 [极速模式]: Chunk {chunk_index}, "
             f"{len(sentences)} 个句子, 索引 {sentence_indices}"
         )
