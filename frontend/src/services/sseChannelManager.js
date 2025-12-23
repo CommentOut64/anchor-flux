@@ -54,11 +54,14 @@ class SSEChannelManager extends EventEmitter {
         handlers.onQueueUpdate?.(data.queue)
       },
       job_status: (data) => {
-        // 兼容处理：优先使用percent，fallback到progress
-        const percent = data.percent ?? data.progress ?? 0
+        // V3.7.4: 状态事件不应该包含进度信息，避免归零
+        // 只有当后端明确提供了 percent/progress 时才传递，否则不设置默认值
+        const percent = data.percent ?? data.progress
         console.log('[SSE Global] 任务状态:', data)
         // 使用 data.id 而非 data.job_id，兼容全局频道的字段名
-        handlers.onJobStatus?.(data.id || data.job_id, data.status, { ...data, percent })
+        // 只有当 percent 存在时才添加到 data 中
+        const statusData = percent !== undefined ? { ...data, percent } : data
+        handlers.onJobStatus?.(data.id || data.job_id, data.status, statusData)
       },
       job_progress: (data) => {
         // 兼容处理：优先使用percent，fallback到progress

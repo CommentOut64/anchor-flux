@@ -120,6 +120,55 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     }
   }, { deep: true })
 
+  // ========== 工具函数 ==========
+  function normalizeProgress(value) {
+    if (value === null || value === undefined) return null
+    const num = Number(value)
+    if (Number.isNaN(num)) return null
+    return Math.round(Math.max(0, Math.min(100, num)) * 10) / 10
+  }
+
+  /**
+   * V3.7.4: 应用进度字段（单调递增保护）
+   *
+   * 核心规则：
+   * 1. 只接受递增的进度值，绝不允许进度下降
+   * 2. 特殊情况：首次设置进度（current === null）时允许任何值
+   * 3. 特殊情况：任务完成（status === finished）时强制设为 100
+   *
+   * @param {Object} task - 任务对象
+   * @param {number|null} incomingProgress - 传入的进度值
+   * @param {string|null} statusHint - 状态提示（用于特殊处理）
+   */
+  function applyProgressField(task, incomingProgress, statusHint) {
+    const normalized = normalizeProgress(incomingProgress)
+
+    // 如果传入值无效，不做任何修改
+    if (normalized === null) return
+
+    const effectiveStatus = statusHint || task.status
+    const current =
+      typeof task.progress === 'number' && !Number.isNaN(task.progress)
+        ? task.progress
+        : null
+
+    // 任务完成时，强制设置为 100%
+    if (effectiveStatus === TaskStatus.FINISHED) {
+      task.progress = 100
+      return
+    }
+
+    // 首次设置进度（之前没有有效进度值）
+    if (current === null) {
+      task.progress = normalized
+      return
+    }
+
+    // 核心规则：单调递增，取最大值
+    // 即使后端返回 0（如恢复任务时），也保持前端已有的高进度
+    task.progress = Math.max(current, normalized)
+  }
+
   // ========== Actions ==========
 
   /**
@@ -132,7 +181,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       file_path: taskData.file_path || null,
       status: taskData.status || TaskStatus.CREATED,
       phase: taskData.phase || TaskPhase.UPLOADING,
-      progress: taskData.progress || 0,
+      progress: normalizeProgress(taskData.progress) ?? 0,
       phase_percent: taskData.phase_percent || 0,  // 阶段内进度 (0-100)
       message: taskData.message || '',
       settings: taskData.settings || null,
@@ -163,12 +212,16 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
   }
 
   /**
-   * 更新任务状态
+   * 更新任务状态（不更新进度）
+   * V3.7.4: 专门用于状态变更，避免进度被覆盖
    */
-  function updateTaskStatus(jobId, status) {
+  function updateTaskStatus(jobId, status, message = null) {
     const task = tasksMap.value.get(jobId)
     if (task) {
       task.status = status
+      if (message !== null) {
+        task.message = message
+      }
       task.updatedAt = Date.now()
       saveTasks()
       console.log(`[UnifiedTaskStore] 任务状态已更新: ${jobId} -> ${status}`)
@@ -180,28 +233,28 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
    */
   function updateTaskProgress(jobId, percent, status, extraData = {}) {
     const task = tasksMap.value.get(jobId)
-    if (task) {
-      // 保留1位小数
-      task.progress = typeof percent === 'number' ? Math.round(percent * 10) / 10 : 0
-      if (status) task.status = status
+    if (!task) return
 
-      // 更新额外字段
-      if (extraData.phase) task.phase = extraData.phase
-      if (extraData.phase_percent !== undefined) {
-        task.phase_percent = Math.round(extraData.phase_percent * 10) / 10
-      }
-      if (extraData.message) task.message = extraData.message
-      if (extraData.processed !== undefined) task.processed = extraData.processed
-      if (extraData.total !== undefined) task.total = extraData.total
-      if (extraData.language) task.language = extraData.language
+    applyProgressField(task, percent, status)
 
-      // 收到进度更新说明 SSE 连接正常
-      task.sseConnected = true
-      task.lastError = null  // 清除错误信息
+    if (status) task.status = status
 
-      task.updatedAt = Date.now()
-      // 进度更新频繁，不立即保存到 localStorage
+    // 更新额外字段
+    if (extraData.phase) task.phase = extraData.phase
+    if (extraData.phase_percent !== undefined) {
+      task.phase_percent = Math.round(extraData.phase_percent * 10) / 10
     }
+    if (extraData.message) task.message = extraData.message
+    if (extraData.processed !== undefined) task.processed = extraData.processed
+    if (extraData.total !== undefined) task.total = extraData.total
+    if (extraData.language) task.language = extraData.language
+
+    // 收到进度更新说明 SSE 连接正常
+    task.sseConnected = true
+    task.lastError = null  // 清除错误信息
+
+    task.updatedAt = Date.now()
+    // 进度更新频繁，不立即保存到 localStorage
   }
 
   /**
@@ -275,6 +328,11 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
     // 更新失败时间戳
     if (updates.status === 'failed' && task.status !== 'failed') {
       updates.failed_at = Date.now()
+    }
+
+    if (updates.progress !== undefined) {
+      applyProgressField(task, updates.progress, updates.status)
+      delete updates.progress
     }
 
     Object.assign(task, updates, { updatedAt: Date.now() })
@@ -411,7 +469,7 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
         if (existingTask) {
           // 更新现有任务（只更新关键字段）
           existingTask.status = backendTask.status
-          existingTask.progress = backendTask.progress
+          applyProgressField(existingTask, backendTask.progress, backendTask.status)
           existingTask.phase_percent = backendTask.phase_percent || 0
           existingTask.message = backendTask.message
           existingTask.filename = backendTask.filename

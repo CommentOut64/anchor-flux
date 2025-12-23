@@ -513,46 +513,42 @@ export const useProjectStore = defineStore("project", () => {
    * 更新双流进度统计
    */
   function updateDualStreamProgress() {
-    const chunks = new Set();
-    let draftCount = 0;
-    let finalCount = 0;
+    const chunkIds = Array.from(chunkSubtitleMap.value.keys());
+    const totalChunks = chunkIds.length;
 
-    subtitles.value.forEach((s) => {
-      if (s.chunk_id) {
-        chunks.add(s.chunk_id);
-        if (s.isDraft) {
-          draftCount++;
-        } else {
-          finalCount++;
-        }
-      }
-    });
-
-    // 统计 Chunk 级别的草稿/定稿
-    let draftChunks = 0;
+    let processedChunks = 0;
     let finalizedChunks = 0;
 
-    chunkSubtitleMap.value.forEach((ids, chunk_id) => {
+    chunkIds.forEach((chunkId) => {
       const chunkSubtitles = subtitles.value.filter(
-        (s) => s.chunk_id === chunk_id
+        (s) => s.chunk_id === chunkId
       );
+      if (chunkSubtitles.length === 0) return;
+      processedChunks++;
+
       const hasDraft = chunkSubtitles.some((s) => s.isDraft);
-      if (hasDraft) {
-        draftChunks++;
-      } else if (chunkSubtitles.length > 0) {
+      const hasFinal = chunkSubtitles.some((s) => !s.isDraft);
+
+      // 仅在 chunk 内全部为定稿时计入慢流完成
+      if (!hasDraft && hasFinal) {
         finalizedChunks++;
       }
     });
 
+    const fastStream =
+      totalChunks > 0
+        ? Math.round((processedChunks / totalChunks) * 100)
+        : 0;
+    const slowStream =
+      totalChunks > 0
+        ? Math.round((finalizedChunks / totalChunks) * 100)
+        : 0;
+
     dualStreamProgress.value = {
-      fastStream:
-        chunks.size > 0
-          ? Math.round(((draftCount + finalCount) / chunks.size) * 10)
-          : 0,
-      slowStream:
-        chunks.size > 0 ? Math.round((finalizedChunks / chunks.size) * 100) : 0,
-      totalChunks: chunks.size,
-      draftChunks,
+      fastStream,
+      slowStream,
+      totalChunks,
+      draftChunks: Math.max(processedChunks - finalizedChunks, 0),
       finalizedChunks,
     };
   }

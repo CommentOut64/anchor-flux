@@ -113,10 +113,10 @@ onMounted(async () => {
       // 更新 store 中的任务状态
       const task = taskStore.getTask(jobId)
       if (task) {
-        taskStore.updateTask(jobId, {
-          status,
-          message: data.message || ''
-        })
+        // V3.7.4: onJobStatus 只更新 status 和 message，不更新 progress
+        // 避免后端推送的低进度（如恢复时的 0）覆盖前端已有的高进度
+        // progress 的更新由 onJobProgress 专门负责
+        taskStore.updateTaskStatus(jobId, status, data.message || '')
 
         // 转录完成自动跳转到编辑器
         if (status === 'finished' && task.phase === 'transcribing') {

@@ -243,6 +243,8 @@ class JobQueueService:
 
         V3.7.2 更新: 支持 pausing 状态（正在暂停但尚未完全暂停）
 
+        V3.7.4 更新: 恢复时从 checkpoint 恢复进度，避免 SSE 推送 0%
+
         Args:
             job_id: 任务ID
 
@@ -257,6 +259,10 @@ class JobQueueService:
         if job.status not in ("paused", "pausing"):
             logger.warning(f"任务未暂停，无法恢复: {job_id}, status={job.status}")
             return False
+
+        # V3.7.4: 在推送 SSE 之前，先从 checkpoint 恢复进度
+        # 这样 _notify_job_status 推送的进度就是正确的，而非 0
+        self._restore_progress_from_checkpoint(job)
 
         with self.lock:
             # [V3.7] 检查任务是否仍在运行中
@@ -427,6 +433,10 @@ class JobQueueService:
                         self.running_job_id = job_id
                         job.status = "processing"
                         job.message = "开始处理"
+
+                        # V3.7.4: 在推送 SSE 之前，先从 checkpoint 恢复进度
+                        # 这样断点续传时前端收到的进度是正确的，而非 0
+                        self._restore_progress_from_checkpoint(job)
 
                         # 推送队列变化和任务状态通知（在lock内，避免数据不一致）
                         self._notify_queue_change()
@@ -758,9 +768,15 @@ class JobQueueService:
                 # 优先使用 finalized_indices（如果有）
                 # 否则使用 fast 和 slow 的交集（两者都已处理的 chunk）
                 if finalized:
-                    # 有 finalized 数据时，使用 finalized 作为恢复点
-                    safe_indices = finalized
-                    logger.info(f"[V3.7.2] 使用 finalized_indices 作为恢复点: {len(finalized)} 个")
+                    # V3.7.4: 使用 finalized 的最大索引+1 作为安全恢复点
+                    # finalized_indices 包含已完成对齐的 chunk 索引
+                    # 例如：{0, 1, ..., 15}，我们应该跳过 0-15，从 16 开始
+                    max_finalized = max(finalized)
+                    safe_indices = set(range(max_finalized + 1))
+                    logger.info(
+                        f"[V3.7.4] 使用 finalized_indices 的最大值作为恢复点: "
+                        f"max={max_finalized}, 跳过 0-{max_finalized} 共 {len(safe_indices)} 个 Chunk"
+                    )
                 elif fast_indices and slow_indices:
                     # 使用交集：只有两个 Worker 都处理过的 chunk 才能跳过
                     safe_indices = fast_indices & slow_indices
@@ -786,6 +802,12 @@ class JobQueueService:
                 )
                 # V3.7.1: 更新进度发射器的已处理数（使用 safe_indices）
                 progress_emitter.update_fast(len(safe_indices), total_chunks, force_push=True)
+
+                # V3.7.4: 同步 progress_tracker 的已完成数量
+                # 修复进度归零问题：start_phase 会将 completed_items 重置为 0
+                # 这里需要恢复正确的已完成数量
+                progress_tracker.update_phase(ProcessPhase.SENSEVOICE, completed=len(safe_indices))
+                logger.info(f"[V3.7.4] progress_tracker 已同步: {len(safe_indices)}/{total_chunks} 个 Chunk")
 
                 # V3.7.3: 恢复字幕状态（核心修复）
                 # 从 checkpoint 恢复已生成的字幕，确保新字幕索引不会与已有字幕冲突
@@ -826,14 +848,35 @@ class JobQueueService:
                     async_pipeline.slow_worker.restore_prompt_cache(previous_whisper_text)
                     logger.info(f"[V3.7] 已恢复 SlowWorker 上下文: {len(previous_whisper_text)} 字符")
 
+                # V3.7.4: 分别计算各 Worker 的基准偏移量
+                # FastWorker 使用 safe_indices（用于跳过已处理的 chunk）
+                # SlowWorker 和 AlignmentWorker 使用各自实际处理的数量（用于进度计算）
+                base_slow_count = 0
+                base_align_count = 0
+                if is_resuming and checkpoint.transcription:
+                    # SlowWorker 的基准 = checkpoint 中保存的 slow_indices 数量
+                    base_slow_count = len(slow_indices) if slow_indices else len(safe_indices)
+                    # AlignmentWorker 的基准 = checkpoint 中保存的 finalized_indices 数量
+                    base_align_count = len(finalized) if finalized else len(safe_indices)
+                    logger.info(
+                        f"[V3.7.4] Worker 基准偏移量: "
+                        f"FastWorker={len(fast_processed_indices)}, "
+                        f"SlowWorker={base_slow_count}, "
+                        f"AlignmentWorker={base_align_count}"
+                    )
+
                 # 处理所有 Chunks（流水线并行，传递完整音频数组用于 Audio Overlap）
-                # V3.7.2: 使用 finalized_indices 作为恢复点
+                # V3.7.4: 传递初始索引集合，修复恢复后进度不准确问题
                 contexts = await async_pipeline.run(
                     audio_chunks=audio_chunks,
                     full_audio_array=full_audio,
                     full_audio_sr=sr,
                     job_dir=job_dir,  # V3.7
-                    processed_indices=fast_processed_indices  # V3.7.2: 使用 finalized 索引
+                    processed_indices=fast_processed_indices,  # V3.7.2: FastWorker 跳过的索引
+                    base_slow_count=base_slow_count,  # V3.7.4: SlowWorker 的基准偏移量（已废弃）
+                    base_align_count=base_align_count,  # V3.7.4: AlignmentWorker 的基准偏移量（已废弃）
+                    initial_slow_processed_indices=slow_indices if is_resuming else None,  # V3.7.4: SlowWorker 初始索引
+                    initial_finalized_indices=finalized if is_resuming else None  # V3.7.4: AlignmentWorker 初始索引
                 )
 
                 # 提取结果
@@ -1219,6 +1262,88 @@ class JobQueueService:
         self._notify_queue_change()
 
         logger.info(f"[幽灵任务修复] 已广播任务删除事件: {job_id}")
+
+    def _restore_progress_from_checkpoint(self, job: "JobState"):
+        """
+        V3.7.4: 从 checkpoint 恢复任务进度
+
+        在 resume_job 和 worker 开始执行前调用，确保 SSE 推送的进度是正确的。
+        这是修复"暂停恢复后进度归零"问题的关键。
+
+        Args:
+            job: 任务状态对象
+        """
+        logger.info(f"[V3.7.4] 尝试从 checkpoint 恢复进度: {job.job_id}, 当前进度={job.progress:.1f}%")
+
+        try:
+            job_dir = Path(job.dir) if job.dir else None
+            if not job_dir:
+                logger.info(f"[V3.7.4] 任务目录为空，跳过恢复: job.dir={job.dir}")
+                return
+
+            if not job_dir.exists():
+                logger.info(f"[V3.7.4] 任务目录不存在，跳过恢复: path={job_dir}")
+                return
+
+            from app.services.job.checkpoint_manager import CheckpointManagerV37
+
+            checkpoint_manager = CheckpointManagerV37(job_dir, logger)
+            checkpoint = checkpoint_manager.load_checkpoint()
+
+            if not checkpoint:
+                logger.info(f"[V3.7.4] 无 checkpoint 文件，跳过恢复")
+                return
+
+            # 从 checkpoint 恢复进度
+            checkpoint_dict = checkpoint.to_dict() if hasattr(checkpoint, 'to_dict') else {}
+            progress_data = checkpoint_dict.get("progress", {})
+
+            if progress_data:
+                # 直接从 progress 字段恢复（ProgressEmitter 保存的格式）
+                restored_progress = progress_data.get("total", 0)
+            else:
+                # 从 CheckpointV37 格式计算进度
+                preprocessing = checkpoint_dict.get("preprocessing", {})
+                transcription = checkpoint_dict.get("transcription", {})
+                total_chunks = preprocessing.get("total_chunks", 0)
+
+                if total_chunks > 0:
+                    # 计算各阶段进度
+                    preprocess_done = 100 if preprocessing.get("separation_completed") else 0
+
+                    fast_worker = transcription.get("fast_worker", {})
+                    fast_count = fast_worker.get("completed_count", 0) or len(fast_worker.get("processed_indices", []))
+                    fast_progress = (fast_count / total_chunks * 100) if total_chunks > 0 else 0
+
+                    slow_worker = transcription.get("slow_worker", {})
+                    slow_count = slow_worker.get("completed_count", 0) or len(slow_worker.get("processed_indices", []))
+                    slow_progress = (slow_count / total_chunks * 100) if total_chunks > 0 else 0
+
+                    alignment = transcription.get("alignment", {})
+                    align_count = alignment.get("completed_count", 0) or len(alignment.get("finalized_indices", []))
+                    align_progress = (align_count / total_chunks * 100) if total_chunks > 0 else 0
+
+                    # 使用默认权重计算总进度（与 ProgressEmitter 一致）
+                    # dual_stream 权重: preprocess=0.05, fast=0.25, slow=0.50, align=0.20
+                    restored_progress = (
+                        preprocess_done * 0.05 +
+                        fast_progress * 0.25 +
+                        slow_progress * 0.50 +
+                        align_progress * 0.20
+                    )
+                else:
+                    restored_progress = 0
+
+            # 只有当恢复的进度比当前进度高时才更新（单调递增原则）
+            if restored_progress > job.progress:
+                old_progress = job.progress
+                job.progress = round(restored_progress, 1)
+                logger.info(f"[V3.7.4] 从 checkpoint 恢复进度: {job.job_id}, {old_progress:.1f}% -> {job.progress:.1f}%")
+            else:
+                logger.debug(f"[V3.7.4] checkpoint 进度 ({restored_progress:.1f}%) <= 当前进度 ({job.progress:.1f}%)，保持不变")
+
+        except Exception as e:
+            logger.warning(f"[V3.7.4] 恢复进度失败，保持当前进度: {job.job_id}, error={e}")
 
     # ==================== V3.7 取消令牌管理 ====================
 

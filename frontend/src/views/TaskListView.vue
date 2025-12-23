@@ -896,21 +896,22 @@ function subscribeGlobalSSE() {
     onJobProgress: (jobId, progress, data) => {
       // 更新任务进度
       console.log(`[TaskListView] 任务进度更新: ${jobId} -> ${progress}%`);
-      taskStore.updateTask(jobId, {
-        progress: progress,
-        status: data.status || "processing",
-        message: data.message || `转录中 ${progress}%`,
+      // V3.7.4: 使用 updateTaskProgress 而不是 updateTask，确保单调递增保护
+      taskStore.updateTaskProgress(jobId, progress, data.status, {
+        phase: data.phase,
+        phase_percent: data.phase_percent,
+        message: data.message,
+        processed: data.processed,
+        total: data.total,
+        language: data.language
       });
     },
 
     onJobStatus: (jobId, status, data) => {
-      // 更新任务状态
+      // V3.7.4: 只更新状态，不更新进度，避免归零
+      // 进度由 onProgress 专门处理
       console.log(`[TaskListView] 任务状态更新: ${jobId} -> ${status}`);
-      taskStore.updateTask(jobId, {
-        status: status,
-        progress: data.progress || (status === "finished" ? 100 : 0),
-        message: data.message || "",
-      });
+      taskStore.updateTaskStatus(jobId, status, data.message || '');
 
       // 如果任务完成，尝试加载缩略图
       if (status === "finished") {

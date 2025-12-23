@@ -192,6 +192,7 @@ import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
 import { useRouter, onBeforeRouteLeave } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { useProgressStore } from '@/stores/progressStore'
 import { mediaApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
@@ -236,11 +237,22 @@ const isResizing = ref(false)
 const isLoading = ref(true)
 const loadError = ref(null)
 
-// 任务状态
-const taskStatus = ref(null)
-const taskPhase = ref('pending')  // 任务阶段
-const taskProgress = ref(0)
-const isTranscribing = ref(false)
+// 统一进度状态
+const progressStore = useProgressStore()
+const jobProgress = progressStore.getJobProgress(props.jobId)
+const taskStatus = computed(() => jobProgress.value.status || 'idle')
+const taskPhase = computed(() => jobProgress.value.phase || 'pending')
+const taskProgress = computed(() => jobProgress.value.percent || 0)
+const isTranscribing = computed(() =>
+  ['processing', 'queued'].includes(taskStatus.value)
+)
+const dualStreamProgress = computed(() => {
+  const ds = jobProgress.value.dualStream
+  if (ds && ds.mode !== 'unknown') {
+    return ds
+  }
+  return projectStore.dualStreamProgress
+})
 let sseUnsubscribe = null
 let progressPollTimer = null
 
@@ -277,6 +289,16 @@ watch(() => proxyVideo.state.value, (newState, oldState) => {
     currentUrl: proxyVideo.currentUrl.value
   })
 })
+
+// 将 projectStore 的估算双流进度同步到统一状态，供 UI 兜底展示
+watch(
+  () => projectStore.dualStreamProgress,
+  (progress) => {
+    if (!progress) return
+    progressStore.applyDualStreamEstimate(props.jobId, progress)
+  },
+  { deep: true }
+)
 
 // ========== 计算属性 ==========
 
@@ -359,9 +381,6 @@ const activeTasks = computed(() =>
   taskStore.tasks.filter(t => ['processing', 'queued'].includes(t.status)).length
 )
 
-// Phase 5: 双流进度（从 projectStore 获取）
-const dualStreamProgress = computed(() => projectStore.dualStreamProgress)
-
 // Grid 布局样式
 const gridStyle = computed(() => ({
   gridTemplateColumns: `1fr 4px ${sidebarWidth.value}px`
@@ -383,9 +402,19 @@ async function loadProject() {
     const jobStatus = await transcriptionApi.getJobStatus(props.jobId, true)
     console.log('[EditorView] 任务状态:', jobStatus)
 
-    taskStatus.value = jobStatus.status
-    taskPhase.value = jobStatus.phase || 'pending'  // 获取任务阶段
-    taskProgress.value = jobStatus.progress || 0
+    progressStore.applySnapshot(
+      props.jobId,
+      {
+        percent: jobStatus.progress,
+        status: jobStatus.status,
+        phase: jobStatus.phase,
+        phase_percent: jobStatus.phase_percent,
+        message: jobStatus.message,
+        processed: jobStatus.processed,
+        total: jobStatus.total
+      },
+      'http_init'
+    )
 
     // 设置元数据
     projectStore.meta.jobId = props.jobId
@@ -399,12 +428,9 @@ async function loadProject() {
     const restored = await projectStore.restoreProject(props.jobId)
     if (restored && projectStore.subtitles.length > 0) {
       console.log('[EditorView] 从本地存储恢复成功')
-      isTranscribing.value = false
-
       // 即使从本地恢复，如果任务仍在处理中或暂停，也需要订阅SSE以接收实时更新
       if (['processing', 'queued'].includes(jobStatus.status)) {
         console.log('[EditorView] 任务仍在处理中，需要订阅SSE')
-        isTranscribing.value = true
         subscribeSSE()
         startProgressPolling()
       } else if (jobStatus.status === 'paused') {
@@ -423,19 +449,16 @@ async function loadProject() {
       await loadCompletedSRT()
       // useProxyVideo会自动检查视频状态
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
-      isTranscribing.value = true
       await loadTranscribingSegments()
       // 订阅SSE获取实时更新
       subscribeSSE()
       startProgressPolling()
     } else if (jobStatus.status === 'paused') {
       // 暂停状态：加载已有的 segments，并订阅 SSE 以便接收恢复信号
-      isTranscribing.value = false
       await loadTranscribingSegments()
       // 订阅SSE，以便用户点击恢复后能收到状态变更
       subscribeSSE()
     } else if (jobStatus.status === 'created') {
-      isTranscribing.value = true
       // 任务刚创建，订阅SSE等待开始
       subscribeSSE()
     } else if (jobStatus.status === 'failed') {
@@ -474,7 +497,6 @@ async function loadCompletedSRT() {
       videoPath: projectStore.meta.videoPath,
       audioPath: projectStore.meta.audioPath
     })
-    isTranscribing.value = false
   } catch (error) {
     console.warn('[EditorView] 加载 SRT 失败，尝试加载 segments:', error)
     await loadTranscribingSegments()
@@ -494,7 +516,16 @@ async function loadTranscribingSegments() {
         videoPath: projectStore.meta.videoPath,
         audioPath: projectStore.meta.audioPath
       })
-      taskProgress.value = textData.progress?.percentage || 0
+      progressStore.applySnapshot(
+        props.jobId,
+        {
+          percent: textData.progress?.percentage,
+          phase: taskPhase.value,
+          status: taskStatus.value,
+          phase_percent: textData.progress?.phase_percent
+        },
+        'http_segments'
+      )
     }
   } catch (error) {
     console.warn('[EditorView] 加载转录文字失败:', error)
@@ -536,70 +567,24 @@ function subscribeSSE() {
   sseUnsubscribe = sseChannelManager.subscribeJob(props.jobId, {
     onInitialState(data) {
       console.log('[EditorView] SSE 初始状态:', data)
-      if (data.percent !== undefined) {
-        taskProgress.value = data.percent
-      }
-      if (data.status) {
-        taskStatus.value = data.status
-      }
-      if (data.phase) {
-        taskPhase.value = data.phase
-      }
+      progressStore.applySnapshot(props.jobId, data, 'sse_init')
     },
 
     onProgress(data) {
       console.log('[EditorView] SSE 进度更新:', data.percent, data.phase, data.detail)
-
-      // V3.7.2: 防抖动保护 - 检测异常进度跳变
-      const newPercent = data.percent || 0
-      const currentPercent = taskProgress.value
-
-      // 情况1: 进度倒退超过5%，忽略
-      if (newPercent > 0 && newPercent < currentPercent && currentPercent - newPercent > 5) {
-        console.warn('[EditorView] 检测到进度倒退，忽略:', currentPercent, '->', newPercent)
-        // 仍然更新双流进度，因为那是独立的阶段进度
-      }
-      // 情况2: 进度突然跳到100%但当前进度较低（<90%），可能是旧系统的错误推送，忽略
-      else if (newPercent >= 100 && currentPercent < 90 && currentPercent > 0) {
-        console.warn('[EditorView] 检测到异常100%跳变，忽略:', currentPercent, '->', newPercent)
-      }
-      // 情况3: 进度突然跳增超过30%（排除从0开始的情况），可能是系统冲突
-      else if (currentPercent > 10 && newPercent - currentPercent > 30 && newPercent < 100) {
-        console.warn('[EditorView] 检测到异常进度跳增，忽略:', currentPercent, '->', newPercent)
-      }
-      // 正常情况: 更新进度
-      else {
-        taskProgress.value = newPercent
-      }
-
-      taskStatus.value = data.status || taskStatus.value
-      taskPhase.value = data.phase || taskPhase.value
-
-      // V3.7.2: 更新双流进度（从后端 SSE 获取，而非前端计算）
+      progressStore.applySseProgress(props.jobId, data)
       if (data.detail) {
         projectStore.updateDualStreamProgressFromSSE({
           fastStream: Math.round(data.detail.fast || 0),
           slowStream: Math.round(data.detail.slow || 0),
-          // totalChunks 从 processed/total 推断
           totalChunks: data.total || projectStore.dualStreamProgress.totalChunks
         })
       }
-
-      // 同步进度到 store，确保 TaskMonitor 实时更新
-      taskStore.updateTaskProgress(props.jobId, data.percent || 0, data.status, {
-        phase: data.phase,
-        phase_percent: data.phase_percent,
-        message: data.message,
-        processed: data.processed,
-        total: data.total,
-        language: data.language
-      })
     },
 
     async onComplete(data) {
       console.log('[EditorView] 任务完成:', data)
-      isTranscribing.value = false
-      taskStatus.value = 'finished'
+      progressStore.markStatus(props.jobId, 'finished', { percent: 100, phase: 'complete' })
       taskStore.updateTaskStatus(props.jobId, 'finished')
       await loadCompletedSRT()
       stopProgressPolling()
@@ -609,8 +594,7 @@ function subscribeSSE() {
 
     onFailed(data) {
       console.log('[EditorView] 任务失败:', data)
-      taskStatus.value = 'failed'
-      isTranscribing.value = false
+      progressStore.markStatus(props.jobId, 'failed', { message: data.message })
       taskStore.updateTaskStatus(props.jobId, 'failed')
       taskStore.updateTaskSSEStatus(props.jobId, true, data.message || '转录失败')
       stopProgressPolling()
@@ -620,16 +604,14 @@ function subscribeSSE() {
 
     onPaused(data) {
       console.log('[EditorView] 任务已暂停:', data)
-      taskStatus.value = 'paused'
-      isTranscribing.value = false
+      progressStore.markStatus(props.jobId, 'paused')
       taskStore.updateTaskStatus(props.jobId, 'paused')
       // 保持SSE连接和进度显示
     },
 
     onCanceled(data) {
       console.log('[EditorView] 任务已取消:', data)
-      taskStatus.value = 'canceled'
-      isTranscribing.value = false
+      progressStore.markStatus(props.jobId, 'canceled')
       taskStore.updateTaskStatus(props.jobId, 'canceled')
       stopProgressPolling()
       cleanupSSE()
@@ -638,9 +620,9 @@ function subscribeSSE() {
     onResumed(data) {
       // 新增：处理任务恢复信号
       console.log('[EditorView] 任务已恢复:', data)
-      taskStatus.value = data.status || 'queued'
-      isTranscribing.value = data.status === 'processing'
+      progressStore.markStatus(props.jobId, data.status || 'queued')
       taskStore.updateTaskStatus(props.jobId, data.status || 'queued')
+      startProgressPolling()
     },
 
     onConnected() {
@@ -935,16 +917,19 @@ async function refreshTaskProgress() {
     const jobStatus = await transcriptionApi.getJobStatus(props.jobId, true)
     console.log('[EditorView] 刷新任务进度:', jobStatus)
 
-    taskStatus.value = jobStatus.status
-    taskPhase.value = jobStatus.phase || 'pending'
-    taskProgress.value = jobStatus.progress || 0
-
-    // 同步到store
-    taskStore.updateTaskProgress(props.jobId, jobStatus.progress || 0, jobStatus.status, {
-      phase: jobStatus.phase,
-      phase_percent: jobStatus.phase_percent,
-      message: jobStatus.message
-    })
+    progressStore.applySnapshot(
+      props.jobId,
+      {
+        percent: jobStatus.progress,
+        status: jobStatus.status,
+        phase: jobStatus.phase,
+        phase_percent: jobStatus.phase_percent,
+        message: jobStatus.message,
+        processed: jobStatus.processed,
+        total: jobStatus.total
+      },
+      'http_refresh'
+    )
   } catch (error) {
     console.warn('[EditorView] 刷新任务进度失败:', error)
   }
@@ -952,19 +937,36 @@ async function refreshTaskProgress() {
 
 function startProgressPolling() {
   stopProgressPolling()
-  // 仅作为SSE失败时的备用方案，间隔延长到60秒
+  // 仅在 SSE 长时间无心跳时触发 HTTP 兜底
   progressPollTimer = setInterval(async () => {
     if (!isTranscribing.value) {
       stopProgressPolling()
       return
     }
-    // 轮询仅作为SSE断开时的兜底保障
+    const rawState = progressStore.getRawState(props.jobId)
+    if (Date.now() - (rawState.lastSseAt || 0) < 10000) {
+      return
+    }
+
     try {
-      await loadTranscribingSegments()
+      const snapshot = await transcriptionApi.getJobStatus(props.jobId, true)
+      progressStore.applySnapshot(
+        props.jobId,
+        {
+          percent: snapshot.progress,
+          status: snapshot.status,
+          phase: snapshot.phase,
+          phase_percent: snapshot.phase_percent,
+          message: snapshot.message,
+          processed: snapshot.processed,
+          total: snapshot.total
+        },
+        'http_poll'
+      )
     } catch (e) {
       console.warn('[EditorView] 轮询刷新失败:', e)
     }
-  }, 60000)  // 改为60秒
+  }, 15000)
 }
 
 function stopProgressPolling() {
@@ -998,8 +1000,7 @@ async function saveProject() {
 async function pauseTranscription() {
   try {
     await transcriptionApi.pauseJob(props.jobId)
-    taskStatus.value = 'paused'
-    isTranscribing.value = false
+    progressStore.markStatus(props.jobId, 'paused')
     // 更新本地store状态
     taskStore.updateTaskStatus(props.jobId, 'paused')
     // 暂停后保留SSE连接，以便恢复时能继续接收更新
@@ -1015,13 +1016,15 @@ async function resumeTranscription() {
     const result = await transcriptionApi.resumeJob(props.jobId)
 
     // 根据后端返回值设置状态（应该是 queued，而不是 processing）
-    taskStatus.value = result.status || 'queued'
-    isTranscribing.value = result.status === 'processing'
+    progressStore.markStatus(props.jobId, result.status || 'queued')
 
     // 更新本地store状态
     taskStore.updateTaskStatus(props.jobId, result.status || 'queued')
 
     console.log('[EditorView] 任务已恢复，状态:', result.status, '队列位置:', result.queue_position)
+
+    await refreshTaskProgress()
+    startProgressPolling()
   } catch (error) {
     console.error('恢复任务失败:', error)
   }
@@ -1031,8 +1034,7 @@ async function cancelTranscription() {
   if (!confirm('确定要取消当前转录任务吗?')) return
   try {
     await transcriptionApi.cancelJob(props.jobId, false)
-    taskStatus.value = 'canceled'
-    isTranscribing.value = false
+    progressStore.markStatus(props.jobId, 'canceled')
     // 更新本地store状态
     taskStore.updateTaskStatus(props.jobId, 'canceled')
     // 取消后关闭SSE连接
