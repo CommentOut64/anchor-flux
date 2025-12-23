@@ -1197,6 +1197,79 @@ class TranscriptionService:
         self.logger.info(f"⏸️ 任务暂停请求: {job_id}")
         return True
 
+    def _force_remove_directory(self, directory: Path, job_id: str, max_retries: int = 3):
+        """
+        V3.7.5: 强制删除目录，处理 Windows 文件占用问题
+
+        策略：
+        1. 先触发垃圾回收，释放可能的文件句柄
+        2. 尝试直接删除目录（最快）
+        3. 如果失败，等待后重试（处理延迟释放）
+        4. 如果仍失败，逐个删除文件，跳过无法删除的
+
+        Args:
+            directory: 要删除的目录路径
+            job_id: 任务ID（用于日志）
+            max_retries: 最大重试次数
+        """
+        import time
+        import stat
+
+        # 步骤1: 触发垃圾回收，释放可能的文件句柄
+        gc.collect()
+        time.sleep(0.1)  # 给系统一点时间释放资源
+
+        # 步骤2: 尝试直接删除（最快路径）
+        for attempt in range(max_retries):
+            try:
+                shutil.rmtree(directory)
+                self.logger.info(f"[强制删除] 成功删除目录: {job_id}, 尝试次数: {attempt + 1}")
+                return
+            except PermissionError as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(
+                        f"[强制删除] 删除失败 (尝试 {attempt + 1}/{max_retries}): {e}, "
+                        f"等待 {0.5 * (attempt + 1)}s 后重试"
+                    )
+                    time.sleep(0.5 * (attempt + 1))  # 指数退避
+                else:
+                    self.logger.warning(f"[强制删除] 直接删除失败，尝试逐个删除文件: {job_id}")
+
+        # 步骤3: 逐个删除文件（降级策略）
+        failed_files = []
+        for root, dirs, files in os.walk(directory, topdown=False):
+            # 删除文件
+            for name in files:
+                file_path = Path(root) / name
+                try:
+                    # 尝试修改文件权限（Windows 只读文件）
+                    os.chmod(file_path, stat.S_IWRITE)
+                    file_path.unlink()
+                except Exception as e:
+                    self.logger.warning(f"[强制删除] 无法删除文件: {file_path.name}, {e}")
+                    failed_files.append(str(file_path))
+
+            # 删除空目录
+            for name in dirs:
+                dir_path = Path(root) / name
+                try:
+                    dir_path.rmdir()
+                except Exception as e:
+                    self.logger.debug(f"[强制删除] 无法删除目录: {dir_path.name}, {e}")
+
+        # 尝试删除根目录
+        try:
+            directory.rmdir()
+            self.logger.info(f"[强制删除] 逐个删除完成: {job_id}")
+        except Exception as e:
+            if failed_files:
+                self.logger.error(
+                    f"[强制删除] 部分文件无法删除: {job_id}, "
+                    f"失败文件数: {len(failed_files)}, 错误: {e}"
+                )
+            else:
+                self.logger.warning(f"[强制删除] 根目录删除失败: {job_id}, {e}")
+
     def cancel_job(self, job_id: str, delete_data: bool = False) -> bool:
         """
         取消转录任务
@@ -1225,8 +1298,8 @@ class TranscriptionService:
                     self.job_index.remove_mapping(job.input_path)
 
                 if job_dir.exists():
-                    # 删除整个任务目录
-                    shutil.rmtree(job_dir)
+                    # V3.7.5: 使用强制删除逻辑，处理 Windows 文件占用问题
+                    self._force_remove_directory(job_dir, job_id)
                     self.logger.info(f"已删除任务数据: {job_id}")
                     # 从内存中移除任务
                     with self.lock:

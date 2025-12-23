@@ -64,6 +64,12 @@ onMounted(async () => {
       // 同步任务列表到 store（第二阶段修复：实时更新）
       if (state.jobs && Array.isArray(state.jobs)) {
         state.jobs.forEach(job => {
+          // V3.7.5: 过滤掉 filename 为空的任务，避免显示"未知任务"
+          if (!job.filename || job.filename.trim() === '') {
+            console.warn(`[App] 跳过 filename 为空的任务: ${job.id}`)
+            return
+          }
+
           // 检查 store 中是否已有此任务
           const existingTask = taskStore.getTask(job.id)
           if (!existingTask) {

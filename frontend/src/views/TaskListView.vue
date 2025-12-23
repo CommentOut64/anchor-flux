@@ -318,7 +318,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
+import { ref, computed, onMounted, watch, nextTick } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox, ElLoading } from "element-plus";
 import {
@@ -334,7 +334,7 @@ import {
 import { useUnifiedTaskStore } from "@/stores/unifiedTaskStore";
 import { transcriptionApi, systemApi } from "@/services/api";
 import fileApi from "@/services/api/fileApi"; // 导入文件 API
-import sseChannelManager from "@/services/sseChannelManager"; // 导入 SSE 频道管理器
+// V3.7.5: 移除 sseChannelManager 导入，SSE 订阅由 App.vue 统一管理
 import PresetSelector from "@/components/editor/PresetSelector.vue"; // v3.5 预设选择器
 
 const router = useRouter();
@@ -404,8 +404,7 @@ function handlePresetChange(newConfig) {
 // 计算属性 - 使用 computed 包装确保响应式
 const tasks = computed(() => taskStore.tasks);
 
-// SSE 取消订阅函数
-let unsubscribeGlobalSSE = null;
+// V3.7.5: 移除 unsubscribeGlobalSSE，SSE 订阅由 App.vue 统一管理
 
 // 监听任务列表变化，自动加载新增任务的缩略图
 watch(
@@ -879,49 +878,28 @@ onMounted(() => {
   // 避免重复订阅导致的任务重复添加问题
 });
 
-// 订阅全局 SSE 事件
-function subscribeGlobalSSE() {
-  console.log("[TaskListView] 订阅全局 SSE");
+// V3.7.5: 监听任务状态变化，自动加载完成任务的缩略图
+// 替代原来在 SSE 订阅中的缩略图加载逻辑
+watch(
+  () => tasks.value,
+  (newTasks, oldTasks) => {
+    if (!newTasks || !oldTasks) return;
 
-  unsubscribeGlobalSSE = sseChannelManager.subscribeGlobal({
-    onJobProgress: (jobId, progress, data) => {
-      // 更新任务进度
-      console.log(`[TaskListView] 任务进度更新: ${jobId} -> ${progress}%`);
-      // V3.7.4: 使用 updateTaskProgress 而不是 updateTask，确保单调递增保护
-      taskStore.updateTaskProgress(jobId, progress, data.status, {
-        phase: data.phase,
-        phase_percent: data.phase_percent,
-        message: data.message,
-        processed: data.processed,
-        total: data.total,
-        language: data.language
-      });
-    },
+    // 检测状态变为 finished 的任务
+    newTasks.forEach((newTask) => {
+      const oldTask = oldTasks.find(t => t.job_id === newTask.job_id);
 
-    onJobStatus: (jobId, status, data) => {
-      // V3.7.4: 只更新状态，不更新进度，避免归零
-      // 进度由 onProgress 专门处理
-      console.log(`[TaskListView] 任务状态更新: ${jobId} -> ${status}`);
-      taskStore.updateTaskStatus(jobId, status, data.message || '');
-
-      // 如果任务完成，尝试加载缩略图
-      if (status === "finished") {
+      // 如果任务刚完成，自动加载缩略图
+      if (newTask.status === 'finished' && oldTask?.status !== 'finished') {
+        console.log(`[TaskListView] 任务完成，加载缩略图: ${newTask.job_id}`);
         setTimeout(() => {
-          getThumbnailUrl(jobId, true);
+          getThumbnailUrl(newTask.job_id, true);
         }, 1000);
       }
-    },
-
-    onQueueUpdate: (queue) => {
-      console.log("[TaskListView] 队列更新:", queue);
-      // 可以在这里处理队列变化
-    },
-
-    onConnected: () => {
-      console.log("[TaskListView] SSE 连接成功");
-    },
-  });
-}
+    });
+  },
+  { deep: true }
+);
 
 // 获取任务缩略图（带缓存和重试机制）
 async function getThumbnailUrl(jobId, forceReload = false) {

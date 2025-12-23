@@ -464,7 +464,15 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
       // 3. 更新或添加后端任务
       let updatedCount = 0
       let addedCount = 0
+      let skippedCount = 0
       for (const backendTask of backendTasks) {
+        // V3.7.5: 过滤掉 filename 为空的任务，避免显示"未知任务"
+        if (!backendTask.filename || backendTask.filename.trim() === '') {
+          console.warn(`[UnifiedTaskStore] 跳过 filename 为空的任务: ${backendTask.id}`)
+          skippedCount++
+          continue
+        }
+
         const existingTask = tasksMap.value.get(backendTask.id)
         if (existingTask) {
           // 更新现有任务（只更新关键字段）
@@ -508,7 +516,10 @@ export const useUnifiedTaskStore = defineStore('unifiedTask', () => {
         console.log(`[UnifiedTaskStore] 队列顺序已同步: ${queueOrder.value.length} 个任务`)
       }
 
-      console.log(`[UnifiedTaskStore] 任务同步完成: ${updatedCount} 个更新, ${addedCount} 个新增, ${deletedCount} 个删除`)
+      console.log(
+        `[UnifiedTaskStore] 任务同步完成: ${updatedCount} 个更新, ${addedCount} 个新增, ${deletedCount} 个删除` +
+        (skippedCount > 0 ? `, ${skippedCount} 个跳过（filename为空）` : '')
+      )
       saveTasks()
       return true
     } catch (error) {
