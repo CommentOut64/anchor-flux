@@ -229,6 +229,20 @@ class SSEChannelManager extends EventEmitter {
         handlers.onSubtitleUpdate?.(data)
       },
 
+      // V3.7.3: 字幕恢复事件（断点续传后恢复字幕）
+      'subtitle.restored': (data) => {
+        console.log(`[SSE Job ${jobId}] 恢复字幕:`, data)
+        handlers.onRestored?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+
+      // V3.5: 极速模式定稿事件
+      'subtitle.finalized': (data) => {
+        console.log(`[SSE Job ${jobId}] 定稿字幕:`, data)
+        handlers.onFinalized?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+
       // 旧版事件 (兼容)
       'subtitle.sv_sentence': (data) => {
         console.log(`[SSE Job ${jobId}] SenseVoice 句子:`, data)

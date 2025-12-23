@@ -669,6 +669,18 @@ function subscribeSSE() {
       handleReplaceChunk(data)
     },
 
+    // V3.7.3: 恢复字幕事件（断点续传后恢复）
+    onRestored(data) {
+      console.log('[EditorView] 收到恢复字幕:', data)
+      handleRestoredChunk(data)
+    },
+
+    // V3.5: 极速模式定稿事件
+    onFinalized(data) {
+      console.log('[EditorView] 收到定稿字幕:', data)
+      handleFinalizedSubtitle(data)
+    },
+
     // 新增：BGM 检测事件
     onBgmDetected(data) {
       console.log('[EditorView] BGM 检测结果:', data)
@@ -840,6 +852,81 @@ function handleReplaceChunk(data) {
   projectStore.replaceChunk(chunkIndex, formattedSentences)
 
   console.log(`[EditorView] 替换 Chunk ${chunkIndex}，共 ${formattedSentences.length} 条定稿字幕`)
+}
+
+/**
+ * V3.7.3: 处理恢复的字幕（断点续传后恢复）
+ * 后端数据格式: { chunk_index, sentences: [...], is_restore: true }
+ */
+function handleRestoredChunk(data) {
+  if (!data) return
+
+  const chunkIndex = data.chunk_index
+  const sentences = Array.isArray(data.sentences) ? data.sentences : []
+
+  if (sentences.length === 0) {
+    console.log(`[EditorView] Chunk ${chunkIndex} 恢复的字幕为空，跳过`)
+    return
+  }
+
+  // 转换为 projectStore 需要的格式
+  const formattedSentences = sentences.map((sentence, idx) => ({
+    index: sentence.index ?? idx,
+    text: sentence.text || '',
+    start: sentence.start ?? 0,
+    end: sentence.end ?? 0,
+    confidence: sentence.confidence ?? 1.0,
+    words: sentence.words || [],
+    warning_type: sentence.warning_type || 'none',
+    source: sentence.source || 'restored',
+    is_draft: sentence.is_draft ?? false,
+    is_finalized: sentence.is_finalized ?? true
+  }))
+
+  // 调用 projectStore 的恢复方法
+  projectStore.restoreChunk(chunkIndex, formattedSentences)
+
+  console.log(`[EditorView] 恢复 Chunk ${chunkIndex}，共 ${formattedSentences.length} 条字幕`)
+}
+
+/**
+ * V3.5: 处理极速模式定稿字幕
+ * 后端数据格式: { index, chunk_index, sentence: {...}, mode: 'sensevoice_only' }
+ */
+function handleFinalizedSubtitle(data) {
+  if (!data) return
+
+  // 极速模式的定稿字幕处理方式与草稿类似，但标记为定稿
+  const sentence = data.sentence || {}
+  const chunkIndex = data.chunk_index
+
+  // 格式化为单个句子的数组，复用 replaceChunk 逻辑
+  const formattedSentences = [{
+    index: data.index ?? 0,
+    text: sentence.text || '',
+    start: sentence.start ?? 0,
+    end: sentence.end ?? 0,
+    confidence: sentence.confidence ?? 1.0,
+    words: sentence.words || [],
+    warning_type: sentence.warning_type || 'none',
+    source: sentence.source || 'sensevoice'
+  }]
+
+  // 极速模式下使用 appendOrUpdateDraft，但标记为定稿
+  const sentenceData = {
+    index: data.index ?? 0,
+    text: sentence.text || '',
+    start: sentence.start ?? 0,
+    end: sentence.end ?? 0,
+    confidence: sentence.confidence ?? 1.0,
+    words: sentence.words || [],
+    warning_type: sentence.warning_type || 'none'
+  }
+
+  // 调用草稿方法，但数据已标记为定稿
+  projectStore.appendOrUpdateDraft(chunkIndex, sentenceData)
+
+  console.log(`[EditorView] 极速模式定稿 Chunk ${chunkIndex}，句子索引 ${data.index}`)
 }
 
 // 刷新任务进度（用于SSE重连后的状态同步）

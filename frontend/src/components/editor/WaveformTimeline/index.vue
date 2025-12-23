@@ -500,13 +500,36 @@ async function loadAudioData() {
 }
 
 // 渲染字幕区域
+// V3.7.3: 增强日志，便于调试 regions 消失问题
 function renderSubtitleRegions() {
-  if (!isReady.value || !regionsPlugin) return;
+  // 前置检查
+  if (!isReady.value) {
+    console.warn('[WaveformTimeline] renderSubtitleRegions: 波形未就绪，跳过渲染');
+    return;
+  }
+  if (!regionsPlugin) {
+    console.warn('[WaveformTimeline] renderSubtitleRegions: regions 插件未加载，跳过渲染');
+    return;
+  }
+
+  const subtitleCount = projectStore.subtitles.length;
+  console.log(`[WaveformTimeline] renderSubtitleRegions: 开始渲染 ${subtitleCount} 个 regions`);
+
+  if (subtitleCount === 0) {
+    console.log('[WaveformTimeline] renderSubtitleRegions: 无字幕数据，清除 regions');
+    regionsPlugin.clearRegions();
+    return;
+  }
 
   isUpdatingRegions.value = true;
   regionsPlugin.clearRegions();
 
+  let addedCount = 0;
   projectStore.subtitles.forEach((subtitle) => {
+    if (subtitle.start === undefined || subtitle.end === undefined) {
+      console.warn(`[WaveformTimeline] 跳过无效字幕: id=${subtitle.id}, start=${subtitle.start}, end=${subtitle.end}`);
+      return;
+    }
     const isSelected = subtitle.id === projectStore.view.selectedSubtitleId;
     regionsPlugin.addRegion({
       id: subtitle.id,
@@ -516,7 +539,10 @@ function renderSubtitleRegions() {
       drag: props.dragEnabled,
       resize: props.resizeEnabled,
     });
+    addedCount++;
   });
+
+  console.log(`[WaveformTimeline] renderSubtitleRegions: 成功添加 ${addedCount}/${subtitleCount} 个 regions`);
 
   setTimeout(() => {
     isUpdatingRegions.value = false;
@@ -1148,14 +1174,28 @@ function formatTime(seconds) {
 }
 
 // 监听字幕变化
+// V3.7.3: 修复 watch 监听失效问题 - 同时监听数组长度确保 splice 操作也能触发
 watch(
-  () => [...projectStore.subtitles],
-  () => {
+  () => [projectStore.subtitles.length, ...projectStore.subtitles],
+  (newVal, oldVal) => {
+    const lengthChanged = !oldVal || newVal[0] !== oldVal[0];
+    console.log(`[WaveformTimeline] subtitles watch 触发: length=${newVal[0]}, lengthChanged=${lengthChanged}, isReady=${isReady.value}, isUpdating=${isUpdatingRegions.value}`);
+
     if (isReady.value && !isUpdatingRegions.value) {
       clearTimeout(regionUpdateTimer);
       regionUpdateTimer = setTimeout(() => {
         renderSubtitleRegions();
       }, 100);
+    } else {
+      // V3.7.3: 如果当前条件不满足，延迟重试
+      if (!isReady.value) {
+        console.log('[WaveformTimeline] 波形未就绪，延迟 500ms 后重试渲染 regions');
+        setTimeout(() => {
+          if (isReady.value && projectStore.subtitles.length > 0) {
+            renderSubtitleRegions();
+          }
+        }, 500);
+      }
     }
   },
   { deep: true }

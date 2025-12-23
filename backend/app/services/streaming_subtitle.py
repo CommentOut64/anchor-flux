@@ -453,6 +453,190 @@ class StreamingSubtitleManager:
 
         return sentence_indices
 
+    # ========== V3.7.3: 字幕持久化方法 ==========
+
+    def to_checkpoint_data(self) -> dict:
+        """
+        V3.7.3: 导出字幕快照用于 Checkpoint 保存
+
+        返回完整的字幕状态，包括：
+        - sentences_snapshot: 所有句子的序列化数据
+        - sentence_count: 全局句子计数器
+        - chunk_sentences_map: Chunk 到句子索引的映射
+
+        Returns:
+            dict: 可直接保存到 Checkpoint 的字幕数据
+        """
+        sentences_snapshot = []
+        for idx, sentence in self.sentences.items():
+            # 使用 SentenceSegment.to_dict() 序列化
+            sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
+                "text": sentence.text_clean or sentence.text,
+                "start": sentence.start,
+                "end": sentence.end,
+                "confidence": sentence.confidence,
+                "source": sentence.source.value if hasattr(sentence.source, 'value') else str(sentence.source),
+            }
+            # 添加索引信息
+            sentence_dict["_index"] = idx
+            sentence_dict["_is_draft"] = getattr(sentence, 'is_draft', False)
+            sentence_dict["_is_finalized"] = getattr(sentence, 'is_finalized', False)
+            sentences_snapshot.append(sentence_dict)
+
+        return {
+            "sentences_snapshot": sentences_snapshot,
+            "sentence_count": self.sentence_count,
+            "chunk_sentences_map": self.chunk_sentences
+        }
+
+    def restore_from_checkpoint(self, checkpoint_data: dict) -> bool:
+        """
+        V3.7.3: 从 Checkpoint 恢复字幕状态
+
+        恢复所有已保存的句子，并恢复索引计数器状态。
+        恢复后，新添加的句子会从正确的索引继续编号，不会与已有句子冲突。
+
+        Args:
+            checkpoint_data: Checkpoint 中的字幕数据，包含：
+                - sentences_snapshot: 句子快照列表
+                - sentence_count: 句子计数器
+                - chunk_sentences_map: Chunk 映射
+
+        Returns:
+            bool: 恢复是否成功
+        """
+        from app.models.sensevoice_models import SentenceSegment, TextSource, WarningType, WordTimestamp
+
+        try:
+            sentences_snapshot = checkpoint_data.get("sentences_snapshot", [])
+            sentence_count = checkpoint_data.get("sentence_count", 0)
+            chunk_sentences_map = checkpoint_data.get("chunk_sentences_map", {})
+
+            if not sentences_snapshot:
+                logger.info(f"[V3.7.3] 无字幕快照需要恢复: job_id={self.job_id}")
+                return True
+
+            # 恢复句子
+            restored_count = 0
+            for sentence_dict in sentences_snapshot:
+                idx = sentence_dict.get("_index")
+                if idx is None:
+                    continue
+
+                # 从字典重建 SentenceSegment
+                sentence = SentenceSegment(
+                    text=sentence_dict.get("original_text") or sentence_dict.get("text", ""),
+                    text_clean=sentence_dict.get("text", ""),
+                    start=sentence_dict.get("start", 0.0),
+                    end=sentence_dict.get("end", 0.0),
+                    confidence=sentence_dict.get("confidence", 1.0),
+                )
+
+                # 恢复来源
+                source_str = sentence_dict.get("source", "sensevoice")
+                try:
+                    sentence.source = TextSource(source_str)
+                except ValueError:
+                    sentence.source = TextSource.SENSEVOICE
+
+                # 恢复警告类型
+                warning_str = sentence_dict.get("warning_type", "none")
+                try:
+                    sentence.warning_type = WarningType(warning_str)
+                except ValueError:
+                    sentence.warning_type = WarningType.NONE
+
+                # 恢复其他字段
+                sentence.is_modified = sentence_dict.get("is_modified", False)
+                sentence.original_text = sentence_dict.get("original_text")
+                sentence.whisper_alternative = sentence_dict.get("whisper_alternative")
+                sentence.perplexity = sentence_dict.get("perplexity")
+                sentence.translation = sentence_dict.get("translation")
+                sentence.translation_confidence = sentence_dict.get("translation_confidence")
+                sentence.is_draft = sentence_dict.get("_is_draft", False)
+                sentence.is_finalized = sentence_dict.get("_is_finalized", False)
+
+                # 恢复字级时间戳
+                words_data = sentence_dict.get("words", [])
+                sentence.words = []
+                for word_dict in words_data:
+                    word = WordTimestamp(
+                        word=word_dict.get("word", ""),
+                        start=word_dict.get("start", 0.0),
+                        end=word_dict.get("end", 0.0),
+                        confidence=word_dict.get("confidence", 1.0),
+                        is_pseudo=word_dict.get("is_pseudo", False)
+                    )
+                    sentence.words.append(word)
+
+                self.sentences[idx] = sentence
+                restored_count += 1
+
+            # 恢复计数器（关键：确保新句子索引不会冲突）
+            self.sentence_count = max(sentence_count, restored_count)
+
+            # 恢复 Chunk 映射
+            # JSON 反序列化后键是 str，需要转换为 int
+            if chunk_sentences_map:
+                self.chunk_sentences = {
+                    int(k): v for k, v in chunk_sentences_map.items()
+                }
+
+            logger.info(
+                f"[V3.7.3] 字幕恢复成功: job_id={self.job_id}, "
+                f"恢复了 {restored_count} 个句子, "
+                f"sentence_count={self.sentence_count}, "
+                f"chunk_count={len(self.chunk_sentences)}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"[V3.7.3] 字幕恢复失败: job_id={self.job_id}, error={e}", exc_info=True)
+            return False
+
+    def push_restored_subtitles_to_frontend(self):
+        """
+        V3.7.3: 恢复后推送所有字幕到前端
+
+        在恢复字幕后调用此方法，将已恢复的字幕通过 SSE 推送到前端，
+        确保前端状态与后端同步。
+        """
+        # 按 Chunk 分组推送
+        for chunk_index, sentence_indices in self.chunk_sentences.items():
+            sentences_data = []
+            for idx in sentence_indices:
+                if idx in self.sentences:
+                    sentence = self.sentences[idx]
+                    sentence_dict = sentence.to_dict() if hasattr(sentence, 'to_dict') else {
+                        "text": sentence.text_clean or sentence.text,
+                        "start": sentence.start,
+                        "end": sentence.end,
+                        "confidence": sentence.confidence,
+                    }
+                    sentence_dict["index"] = idx
+                    sentence_dict["is_draft"] = getattr(sentence, 'is_draft', False)
+                    sentence_dict["is_finalized"] = getattr(sentence, 'is_finalized', True)
+                    sentences_data.append(sentence_dict)
+
+            if sentences_data:
+                # 推送恢复事件（使用新的事件类型，避免与实时推送混淆）
+                push_subtitle_event(
+                    self.sse_manager,
+                    self.job_id,
+                    "restored",  # 恢复事件类型
+                    {
+                        "chunk_index": chunk_index,
+                        "sentences": sentences_data,
+                        "is_restore": True
+                    }
+                )
+
+        logger.info(
+            f"[V3.7.3] 已推送恢复的字幕到前端: job_id={self.job_id}, "
+            f"chunks={len(self.chunk_sentences)}, "
+            f"total_sentences={len(self.sentences)}"
+        )
+
 
 # ========== 单例工厂 ==========
 

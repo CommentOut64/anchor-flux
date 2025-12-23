@@ -20,6 +20,7 @@ export const STATUS_CONFIG = {
   created: { label: '已创建', color: '#8b949e', bgColor: 'rgba(139, 148, 158, 0.15)' },
   queued: { label: '排队中', color: '#8b949e', bgColor: 'rgba(139, 148, 158, 0.15)' },
   processing: { label: '处理中', color: '#58a6ff', bgColor: 'rgba(88, 166, 255, 0.15)' },
+  pausing: { label: '正在暂停...', color: '#d29922', bgColor: 'rgba(210, 153, 34, 0.15)' },  // V3.7.3: 新增正在暂停状态
   paused: { label: '已暂停', color: '#d29922', bgColor: 'rgba(210, 153, 34, 0.15)' },
   finished: { label: '已完成', color: '#3fb950', bgColor: 'rgba(63, 185, 80, 0.15)' },
   failed: { label: '失败', color: '#f85149', bgColor: 'rgba(248, 81, 73, 0.15)' },

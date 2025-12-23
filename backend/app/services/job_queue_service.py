@@ -787,6 +787,25 @@ class JobQueueService:
                 # V3.7.1: 更新进度发射器的已处理数（使用 safe_indices）
                 progress_emitter.update_fast(len(safe_indices), total_chunks, force_push=True)
 
+                # V3.7.3: 恢复字幕状态（核心修复）
+                # 从 checkpoint 恢复已生成的字幕，确保新字幕索引不会与已有字幕冲突
+                if transcription_state.sentences_snapshot:
+                    subtitle_checkpoint_data = {
+                        "sentences_snapshot": transcription_state.sentences_snapshot,
+                        "sentence_count": transcription_state.sentence_count,
+                        "chunk_sentences_map": transcription_state.chunk_sentences_map
+                    }
+                    if subtitle_manager.restore_from_checkpoint(subtitle_checkpoint_data):
+                        logger.info(f"[V3.7.3] 字幕状态已恢复: {len(transcription_state.sentences_snapshot)} 个句子")
+                        # 推送已恢复的字幕到前端
+                        subtitle_manager.push_restored_subtitles_to_frontend()
+                    else:
+                        logger.warning("[V3.7.3] 字幕恢复失败，将从头生成字幕")
+                else:
+                    logger.info("[V3.7.3] checkpoint 中无字幕快照，字幕将从头生成")
+
+            pipeline_sentences = []  # 用于收集本轮流水线产出的句子，作为无字幕快照时的兜底
+
             if use_async_pipeline:
                 # V3.1.0: 异步流水线（三级流水线，错位并行）
                 logger.info(f"[双流对齐] 使用异步流水线处理 {total_chunks} 个 Chunk (queue_maxsize={queue_maxsize})")
@@ -818,9 +837,8 @@ class JobQueueService:
                 )
 
                 # 提取结果
-                all_sentences = []
                 for ctx in contexts:
-                    all_sentences.extend(ctx.final_sentences)
+                    pipeline_sentences.extend(ctx.final_sentences)
 
             else:
                 # V3.0: 串行流水线（兼容模式）
@@ -836,9 +854,8 @@ class JobQueueService:
                 results = await dual_pipeline.run(audio_chunks)
 
                 # 提取结果
-                all_sentences = []
                 for result in results:
-                    all_sentences.extend(result.sentences)
+                    pipeline_sentences.extend(result.sentences)
 
             progress_tracker.complete_phase(ProcessPhase.SENSEVOICE)
             # V3.7.1: 双流对齐完成
@@ -849,13 +866,25 @@ class JobQueueService:
             # 阶段 3: 生成字幕文件
             progress_tracker.start_phase(ProcessPhase.SRT, 1, "生成字幕...")
 
+            # 选取用于导出的字幕集合：优先使用字幕管理器的完整快照，确保恢复场景下包含暂停前的句子
+            final_sentences = pipeline_sentences
+            if subtitle_manager:
+                subtitle_snapshot = subtitle_manager.get_all_sentences()
+                if subtitle_snapshot:
+                    final_sentences = subtitle_snapshot
+                    logger.info(
+                        f"[V3.7.4] 使用字幕管理器快照生成 SRT: sentences={len(final_sentences)}"
+                    )
+                else:
+                    logger.info("[V3.7.4] 字幕管理器无有效句子，回退到流水线结果")
+
             # 按时间排序
-            all_sentences.sort(key=lambda s: s.start)
+            final_sentences.sort(key=lambda s: s.start)
 
             # 生成 SRT
             output_path = str(Path(job.dir) / f"{job.job_id}.srt")
             self.transcription_service._generate_subtitle_from_sentences(
-                all_sentences,
+                final_sentences,
                 output_path,
                 include_translation=False
             )

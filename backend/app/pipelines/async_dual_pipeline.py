@@ -34,6 +34,7 @@ from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.sse_service import get_sse_manager
 from app.pipelines.workers import FastWorker, SlowWorker, AlignmentWorker
+from app.utils.cancellation_token import CancelledException, PausedException  # V3.7.4: 捕获取消/暂停异常
 
 # V3.7: 导入取消令牌和异常
 if TYPE_CHECKING:
@@ -139,6 +140,8 @@ class AsyncDualPipeline:
 
         # 错误收集
         self.errors: List[Exception] = []
+        # V3.7.4: 记录暂停异常，待数据排空后统一抛出
+        self.pause_exception: Optional[PausedException] = None
 
     async def run(
         self,
@@ -242,19 +245,42 @@ class AsyncDualPipeline:
             # V3.7: 每个 Chunk 处理完成后检查暂停/取消并保存检查点
             if token and job_dir:
                 processed_indices.add(i)
+
+                # V3.7.3: 获取字幕快照用于实时持久化（极速模式）
+                subtitle_checkpoint_data = {}
+                if self.fast_worker and self.fast_worker.subtitle_manager:
+                    subtitle_checkpoint_data = self.fast_worker.subtitle_manager.to_checkpoint_data()
+
                 checkpoint_data = {
                     "transcription": {
                         "mode": "sensevoice_only",
                         "processed_indices": list(processed_indices),
                         "processed_count": len(processed_indices),
-                        "total_chunks": len(audio_chunks)
+                        "total_chunks": len(audio_chunks),
+                        # V3.7.3: 保存 finalized_indices（极速模式下所有 processed 都是 finalized）
+                        "finalized_indices": list(processed_indices),
+                        # V3.7.3: 字幕快照（实时持久化核心）
+                        **subtitle_checkpoint_data
                     }
                 }
-                token.check_and_save(checkpoint_data, job_dir)
+                try:
+                    token.check_and_save(checkpoint_data, job_dir)
+                except PausedException as e:
+                    # V3.7.4: 捕获取消暂停，停止派发新 Chunk，等待上层处理
+                    if not self.pause_exception:
+                        self.pause_exception = e
+                    self.logger.info(
+                        f"[V3.7.4] 极速模式捕获暂停信号，已处理 {len(processed_indices)} / {total_chunks} 个 Chunk"
+                    )
+                    break
 
         if self.errors:
             self.logger.error(f"极速模式执行中发生 {len(self.errors)} 个错误")
             raise self.errors[0]
+
+        if self.pause_exception:
+            # V3.7.4: 触发暂停时抛出异常，保持上层状态机一致
+            raise self.pause_exception
 
         self.logger.info(f"极速模式完成: {len(results)} 个 Chunk 已处理")
         return results
@@ -290,6 +316,10 @@ class AsyncDualPipeline:
         Returns:
             List[ProcessingContext]: 处理结果列表
         """
+        # V3.7.4: 清理历史状态，避免重复抛出旧异常
+        self.errors.clear()
+        self.pause_exception = None
+
         total_chunks = len(audio_chunks)  # V3.7.1: 保存总数用于进度计算
         self.logger.info(f"开始三级流水线: {total_chunks} 个 Chunk")
 
@@ -322,6 +352,10 @@ class AsyncDualPipeline:
         if self.errors:
             self.logger.error(f"流水线执行中发生 {len(self.errors)} 个错误")
             raise self.errors[0]
+
+        if self.pause_exception:
+            # V3.7.4: 等待队列排空后再通知上层暂停，避免进度回退
+            raise self.pause_exception
 
         self.logger.info(f"三级流水线完成: {len(results)} 个 Chunk 已处理")
 
@@ -361,6 +395,8 @@ class AsyncDualPipeline:
         processed_indices = processed_indices or set()
         total_chunks = total_chunks or len(chunks)
         fast_processed_count = 0  # V3.7.1: 追踪已处理数量
+        pause_requested = False  # V3.7.4: 捕获暂停后进入排空模式
+        should_send_end_signal = True  # V3.7.4: 控制是否需要发送正常结束信号
 
         try:
             for i, chunk in enumerate(chunks):
@@ -413,18 +449,32 @@ class AsyncDualPipeline:
                             "total_chunks": len(chunks)
                         }
                     }
-                    token.check_and_save(checkpoint_data, job_dir)
+                    try:
+                        token.check_and_save(checkpoint_data, job_dir)
+                    except PausedException as e:
+                        # V3.7.4: 捕获暂停信号，停止派发新 Chunk，但允许下游排空
+                        pause_requested = True
+                        if not self.pause_exception:
+                            self.pause_exception = e
+                        self.logger.info(
+                            f"[V3.7.4] FastWorker 捕获暂停信号，已完成 {len(processed_indices)} / {len(chunks)} 个 Chunk"
+                        )
+                        break
 
-            # 发送结束信号
-            end_ctx = ProcessingContext(
+        except CancelledException as e:
+            self.logger.error(f"FastWorker 循环取消: {e}", exc_info=True)
+            self.errors.append(e)
+            should_send_end_signal = False
+
+            error_ctx = ProcessingContext(
                 job_id=self.job_id,
                 chunk_index=-1,
                 audio_chunk=None,
-                is_end=True
+                is_end=True,
+                error=e
             )
-            await self.queue_inter.put(end_ctx)
-
-            self.logger.info("FastWorker 循环完成")
+            await self.queue_inter.put(error_ctx)
+            return
 
         except Exception as e:
             self.logger.error(f"FastWorker 循环异常: {e}", exc_info=True)
@@ -439,6 +489,21 @@ class AsyncDualPipeline:
                 error=e
             )
             await self.queue_inter.put(error_ctx)
+            should_send_end_signal = False
+            return
+        finally:
+            if should_send_end_signal:
+                end_ctx = ProcessingContext(
+                    job_id=self.job_id,
+                    chunk_index=-1,
+                    audio_chunk=None,
+                    is_end=True
+                )
+                await self.queue_inter.put(end_ctx)
+                if pause_requested:
+                    self.logger.info("[V3.7.4] FastWorker 已发送暂停结束信号，等待下游排空")
+                else:
+                    self.logger.info("FastWorker 循环完成")
 
     async def _slow_loop(self, job_dir: Optional[Path] = None, total_chunks: int = 0):  # V3.7.1: 新增 total_chunks
         """
@@ -457,6 +522,7 @@ class AsyncDualPipeline:
         token = self.cancellation_token  # V3.7
         slow_processed_count = 0  # V3.7: 追踪已处理数量
         slow_processed_indices = []  # V3.7.2: 追踪已处理索引
+        pause_requested = False  # V3.7.4: 捕获暂停后继续排空队列
 
         try:
             while True:
@@ -513,7 +579,15 @@ class AsyncDualPipeline:
                             "last_slow_chunk_index": chunk_index
                         }
                     }
-                    token.check_and_save(checkpoint_data, job_dir)
+                    try:
+                        token.check_and_save(checkpoint_data, job_dir)
+                    except PausedException as e:
+                        if not pause_requested:
+                            self.logger.info("[V3.7.4] SlowWorker 捕获暂停信号，继续排空 queue_inter")
+                        pause_requested = True
+                        if not self.pause_exception:
+                            self.pause_exception = e
+                        # 不抛异常，等待队列排空
 
             self.logger.info("SlowWorker 循环完成")
 
@@ -530,6 +604,9 @@ class AsyncDualPipeline:
                 error=e
             )
             await self.queue_final.put(error_ctx)
+        finally:
+            if pause_requested:
+                self.logger.info("[V3.7.4] SlowWorker 已完成排空，等待 AlignmentWorker 同步完成")
 
     async def _align_loop(self, results: List[ProcessingContext], job_dir: Optional[Path] = None, total_chunks: int = 0):  # V3.7.1
         """
@@ -551,6 +628,7 @@ class AsyncDualPipeline:
         """
         token = self.cancellation_token  # V3.7
         align_processed_count = 0  # V3.7: 追踪已处理数量
+        pause_requested = False  # V3.7.4: 捕获暂停后继续排空 queue_final
 
         try:
             while True:
@@ -593,20 +671,40 @@ class AsyncDualPipeline:
 
                 # V3.7: 每个 Chunk 处理完成后保存检查点
                 if token and job_dir:
+                    # V3.7.3: 获取字幕快照用于实时持久化
+                    subtitle_checkpoint_data = {}
+                    if self.alignment_worker and self.alignment_worker.subtitle_manager:
+                        subtitle_checkpoint_data = self.alignment_worker.subtitle_manager.to_checkpoint_data()
+
                     checkpoint_data = {
                         "transcription": {
                             "align_processed_count": align_processed_count,
                             "last_align_chunk_index": chunk_index,
-                            "completed_chunks": len(results)
+                            "completed_chunks": len(results),
+                            # V3.7.3: 保存 finalized_indices（用于安全恢复）
+                            "finalized_indices": [r.chunk_index for r in results],
+                            # V3.7.3: 字幕快照（实时持久化核心）
+                            **subtitle_checkpoint_data
                         }
                     }
-                    token.check_and_save(checkpoint_data, job_dir)
+                    try:
+                        token.check_and_save(checkpoint_data, job_dir)
+                    except PausedException as e:
+                        if not pause_requested:
+                            self.logger.info("[V3.7.4] AlignmentWorker 捕获暂停信号，继续排空 queue_final")
+                        pause_requested = True
+                        if not self.pause_exception:
+                            self.pause_exception = e
+                        # 继续排空，待数据全部写入后再暂停
 
             self.logger.info("AlignmentWorker 循环完成")
 
         except Exception as e:
             self.logger.error(f"AlignmentWorker 循环异常: {e}", exc_info=True)
             self.errors.append(e)
+        finally:
+            if pause_requested:
+                self.logger.info("[V3.7.4] AlignmentWorker 已排空所有上下文，等待上层暂停")
 
     def get_statistics(self) -> dict:
         """

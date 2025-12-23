@@ -411,6 +411,87 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   /**
+   * V3.7.3: 恢复字幕（断点续传后恢复）
+   *
+   * 当收到 subtitle.restored 事件时调用
+   * 将从 Checkpoint 恢复的字幕添加到前端，确保不会与已有字幕冲突
+   *
+   * @param {string} chunk_id - Chunk ID
+   * @param {Array} sentences - 恢复的句子列表
+   */
+  function restoreChunk(chunk_id, sentences) {
+    console.log(`[ProjectStore] restoreChunk 被调用: chunk_id=${chunk_id}, sentences.length=${sentences?.length || 0}`);
+
+    // 参数校验
+    if (chunk_id === undefined || chunk_id === null) {
+      console.warn('[ProjectStore] restoreChunk: chunk_id 为 undefined/null，使用 "unknown" 作为默认值');
+      chunk_id = 'unknown';
+    }
+
+    if (!sentences || sentences.length === 0) {
+      console.warn('[ProjectStore] restoreChunk: sentences 为空，跳过恢复');
+      return;
+    }
+
+    // 暂停历史记录，恢复的内容不应被撤销
+    pauseHistory();
+
+    // 检查该 Chunk 是否已有字幕（避免重复恢复）
+    const existingIds = chunkSubtitleMap.value.get(chunk_id) || [];
+    if (existingIds.length > 0) {
+      console.log(
+        `[ProjectStore] Chunk ${chunk_id} 已有 ${existingIds.length} 个字幕，跳过恢复`
+      );
+      resumeHistory();
+      return;
+    }
+
+    // 添加恢复的字幕
+    const newSubtitleIds = [];
+    const beforeLength = subtitles.value.length;
+
+    sentences.forEach((sentence, idx) => {
+      // 使用 restored 前缀标识恢复的字幕
+      const subtitleId = `restored-${chunk_id}-${sentence.index ?? idx}`;
+      const subtitleData = {
+        id: subtitleId,
+        start: sentence.start,
+        end: sentence.end,
+        text: sentence.text,
+        isDirty: false,
+        chunk_id,
+        isDraft: sentence.is_draft ?? false,
+        isRestored: true, // 标记为恢复的字幕
+        words: sentence.words || [],
+        confidence: sentence.confidence ?? 1.0,
+        warning_type: sentence.warning_type || "none",
+        source: sentence.source || "restored",
+        sentenceIndex: sentence.index,
+      };
+
+      // 按时间顺序插入
+      const insertIndex = findInsertIndex(sentence.start);
+      subtitles.value.splice(insertIndex, 0, subtitleData);
+      newSubtitleIds.push(subtitleId);
+    });
+
+    // 更新 Chunk 映射
+    chunkSubtitleMap.value.set(chunk_id, newSubtitleIds);
+
+    const afterLength = subtitles.value.length;
+    console.log(
+      `[ProjectStore] 恢复 Chunk ${chunk_id}: 添加 ${sentences.length} 个字幕, ` +
+      `subtitles: ${beforeLength} -> ${afterLength}`
+    );
+
+    // 更新双流进度
+    updateDualStreamProgress();
+
+    // 恢复历史记录
+    resumeHistory();
+  }
+
+  /**
    * 查找按时间顺序的插入位置
    */
   function findInsertIndex(startTime) {
@@ -688,6 +769,7 @@ export const useProjectStore = defineStore("project", () => {
     // Phase 5: 双模态架构方法
     appendOrUpdateDraft,
     replaceChunk,
+    restoreChunk, // V3.7.3: 断点续传字幕恢复
     updateDualStreamProgress,
     updateDualStreamProgressFromSSE,  // V3.7.2: 从 SSE 更新双流进度
 

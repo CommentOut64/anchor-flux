@@ -85,6 +85,12 @@ class TranscriptionState:
     alignment_completed_count: int = 0
     alignment_levels: Dict[int, str] = field(default_factory=dict)
 
+    # V3.7.3: 字幕快照（断点续传核心）
+    # 保存已生成的所有字幕句子，确保恢复时不丢失
+    sentences_snapshot: List[Dict[str, Any]] = field(default_factory=list)
+    sentence_count: int = 0  # 全局句子计数器
+    chunk_sentences_map: Dict[int, List[int]] = field(default_factory=dict)  # chunk_index -> [sentence_indices]
+
 
 @dataclass
 class ControlState:
@@ -176,7 +182,11 @@ class CheckpointV37:
                     "finalized_indices": self.transcription.finalized_indices,
                     "completed_count": self.transcription.alignment_completed_count,
                     "alignment_levels": self.transcription.alignment_levels
-                }
+                },
+                # V3.7.3: 字幕快照
+                "sentences_snapshot": self.transcription.sentences_snapshot,
+                "sentence_count": self.transcription.sentence_count,
+                "chunk_sentences_map": self.transcription.chunk_sentences_map
             },
             "output": {
                 "srt_generated": self.srt_generated,
@@ -242,6 +252,15 @@ class CheckpointV37:
         checkpoint.transcription.finalized_indices = align.get("finalized_indices", [])
         checkpoint.transcription.alignment_completed_count = align.get("completed_count", 0)
         checkpoint.transcription.alignment_levels = align.get("alignment_levels", {})
+
+        # V3.7.3: 字幕快照
+        checkpoint.transcription.sentences_snapshot = trans.get("sentences_snapshot", [])
+        checkpoint.transcription.sentence_count = trans.get("sentence_count", 0)
+        # chunk_sentences_map 的键是 int，JSON 反序列化后变成 str，需要转换
+        raw_chunk_map = trans.get("chunk_sentences_map", {})
+        checkpoint.transcription.chunk_sentences_map = {
+            int(k): v for k, v in raw_chunk_map.items()
+        } if raw_chunk_map else {}
 
         # 输出状态
         output = data.get("output", {})
@@ -1085,6 +1104,22 @@ class CheckpointManagerV37:
                 pass  # 可选记录
             if "completed_chunks" in trans_data:
                 trans.alignment_completed_count = trans_data["completed_chunks"]
+
+            # V3.7.3: 字幕快照字段（实时持久化核心）
+            if "sentences_snapshot" in trans_data:
+                trans.sentences_snapshot = trans_data["sentences_snapshot"]
+            if "sentence_count" in trans_data:
+                trans.sentence_count = trans_data["sentence_count"]
+            if "chunk_sentences_map" in trans_data:
+                # JSON 键是 str，需要转换为 int
+                raw_map = trans_data["chunk_sentences_map"]
+                trans.chunk_sentences_map = {
+                    int(k): v for k, v in raw_map.items()
+                } if raw_map else {}
+            # 支持 finalized_indices 字段（用于恢复点计算）
+            if "finalized_indices" in trans_data:
+                trans.finalized_indices = trans_data["finalized_indices"]
+                trans.alignment_completed_count = len(trans_data["finalized_indices"])
 
         # 更新控制状态
         if "control" in checkpoint_data:
