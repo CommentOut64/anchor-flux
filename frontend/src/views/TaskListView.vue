@@ -127,7 +127,7 @@
                 class="meta-item"
               >
                 <el-icon><Loading /></el-icon>
-                {{ task.progress }}%
+                {{ (task.progress || 0).toFixed(1) }}%
               </span>
             </div>
 
@@ -875,17 +875,8 @@ onMounted(() => {
     });
   }
 
-  // 订阅全局 SSE 以实时更新任务进度
-  subscribeGlobalSSE();
-});
-
-// 组件卸载时取消 SSE 订阅
-onUnmounted(() => {
-  if (unsubscribeGlobalSSE) {
-    unsubscribeGlobalSSE();
-    unsubscribeGlobalSSE = null;
-    console.log("[TaskListView] 已取消 SSE 订阅");
-  }
+  // V3.7.5: 移除重复的 SSE 订阅，由 App.vue 统一处理
+  // 避免重复订阅导致的任务重复添加问题
 });
 
 // 订阅全局 SSE 事件

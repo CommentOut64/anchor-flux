@@ -102,8 +102,9 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { transcriptionApi } from '@/services/api'
 import { PHASE_CONFIG, STATUS_CONFIG, formatProgress } from '@/constants/taskPhases'
 
@@ -115,6 +116,10 @@ const props = defineProps({
 })
 
 const router = useRouter()
+
+// V3.7.4: 防抖控制 - 防止频繁切换暂停/恢复
+const lastOperationTime = ref(0)
+const DEBOUNCE_DELAY = 2000 // 2秒防抖
 
 const showProgress = computed(() =>
   ['processing', 'queued', 'paused'].includes(props.task.status)
@@ -146,11 +151,27 @@ function getPhaseLabel(task) {
 
 // 暂停任务
 async function pauseTask() {
+  // V3.7.4: 防抖检查
+  const now = Date.now()
+  if (now - lastOperationTime.value < DEBOUNCE_DELAY) {
+    ElMessage.warning('操作过于频繁，请稍后再试')
+    return
+  }
+
+  lastOperationTime.value = now
   await transcriptionApi.pauseJob(props.task.job_id)
 }
 
 // 恢复任务
 async function resumeTask() {
+  // V3.7.4: 防抖检查
+  const now = Date.now()
+  if (now - lastOperationTime.value < DEBOUNCE_DELAY) {
+    ElMessage.warning('操作过于频繁，请稍后再试')
+    return
+  }
+
+  lastOperationTime.value = now
   await transcriptionApi.resumeJob(props.task.job_id)
 }
 

@@ -71,8 +71,8 @@
               </span>
               <!-- Phase 5: 双流进度显示 -->
               <span v-if="showDualStreamProgress" class="progress-percent dual">
-                <span class="fast-label">S</span>{{ dualStreamProgress.fastStream }}%
-                <span class="slow-label">W</span>{{ dualStreamProgress.slowStream }}%
+                <span class="fast-label">S</span>{{ (dualStreamProgress.fastStream || 0).toFixed(1) }}%
+                <span class="slow-label">W</span>{{ (dualStreamProgress.slowStream || 0).toFixed(1) }}%
               </span>
               <span v-else class="progress-percent">{{ formatProgress(currentTaskProgress) }}%</span>
             </span>

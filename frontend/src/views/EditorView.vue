@@ -437,6 +437,8 @@ async function loadProject() {
         // 暂停状态也需要订阅SSE，以便接收恢复信号
         console.log('[EditorView] 任务已暂停，订阅SSE以接收恢复信号')
         subscribeSSE()
+        // V3.7.4: 暂停状态下立即刷新一次进度，不等待 SSE 连接
+        refreshTaskProgress()
       } else if (jobStatus.status === 'finished') {
         // 任务已完成，useProxyVideo会自动处理视频转码状态
         console.log('[EditorView] 本地恢复后任务已完成，useProxyVideo将自动检查视频转码状态')
@@ -458,6 +460,8 @@ async function loadProject() {
       await loadTranscribingSegments()
       // 订阅SSE，以便用户点击恢复后能收到状态变更
       subscribeSSE()
+      // V3.7.4: 暂停状态下立即刷新一次进度，不等待 SSE 连接
+      refreshTaskProgress()
     } else if (jobStatus.status === 'created') {
       // 任务刚创建，订阅SSE等待开始
       subscribeSSE()
