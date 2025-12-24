@@ -122,7 +122,10 @@ class ProjectConfig:
         # ========== 日志配置 ==========
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
         self.LOG_DIR = self.BASE_DIR / "logs"
-        self.LOG_FILE = self.LOG_DIR / "app.log"
+        # 每次启动创建新的日志文件（带时间戳）
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.LOG_FILE = self.LOG_DIR / f"app_{timestamp}.log"
         self.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
         # ========== SSE配置 ==========

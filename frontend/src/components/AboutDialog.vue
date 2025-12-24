@@ -10,11 +10,16 @@
     <div class="about-content">
       <!-- 图标占位 -->
       <div class="app-icon">
-        <div class="icon-placeholder"></div>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <path 
+    fill="#58A6FF" 
+    d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zM5 10h9v2H5zm0-3h9v2H5zm0 6h6v2H5z" 
+  />
+</svg>
       </div>
 
       <!-- 应用名称 -->
-      <h2 class="app-name">Video to SRT GPU</h2>
+      <h2 class="app-name">AnchorFlux</h2>
 
       <!-- 版本号 -->
       <div class="version">版本 {{ version }}</div>
@@ -22,7 +27,7 @@
       <!-- 链接 -->
       <div class="links">
         <a
-          href="https://github.com/your-repo/video-to-srt-gpu"
+          href="https://github.com/CommentOut64/anchor-flux"
           target="_blank"
           class="link-item"
         >
@@ -33,7 +38,7 @@
         </a>
 
         <a
-          href="https://space.bilibili.com/your-uid"
+          href="https://space.bilibili.com/515407408"
           target="_blank"
           class="link-item"
         >
