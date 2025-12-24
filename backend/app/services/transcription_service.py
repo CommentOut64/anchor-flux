@@ -432,7 +432,6 @@ class TranscriptionService:
                 auto_strategy=True
             )
             self.audio_pipeline = AudioProcessingPipeline(
-                config=audio_config,
                 logger=self.logger
             )
 

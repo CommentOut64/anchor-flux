@@ -7,8 +7,9 @@ import asyncio
 import time
 import subprocess
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import json
 from typing import Optional, List
@@ -932,16 +933,57 @@ async def open_browser_if_needed():
         if os.name == 'nt':
             # Windows: 使用 start 命令强制打开新窗口/标签页
             subprocess.Popen(
-                ['cmd', '/c', 'start', '', 'http://localhost:5173'],
+                ['cmd', '/c', 'start', '', 'http://localhost:8000'],
                 shell=False,
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
         else:
             import webbrowser
-            webbrowser.open("http://localhost:5173", new=2)
-        logger.info("浏览器标签页已打开: http://localhost:5173")
+            webbrowser.open("http://localhost:8000", new=2)
+        logger.info("浏览器标签页已打开: http://localhost:8000")
     except Exception as e:
         logger.error(f"打开浏览器失败: {e}")
+
+
+# ========== 静态文件托管 (生产模式) ==========
+# 检测前端 dist 目录并托管静态文件，实现开箱即用
+FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend", "dist")
+
+if os.path.exists(FRONTEND_DIST):
+    # 托管静态资源 (js, css, images等)
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="static-assets")
+
+    # 根路径返回 index.html
+    @app.get("/", response_class=HTMLResponse)
+    async def serve_index():
+        index_path = os.path.join(FRONTEND_DIST, "index.html")
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                return HTMLResponse(content=f.read())
+        return HTMLResponse(content="Frontend not found", status_code=404)
+
+    # SPA 路由支持: 所有非 API/media 路由都返回 index.html
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        # 排除 API 和 media 路由
+        if full_path.startswith(("api/", "media/", "docs", "openapi.json", "redoc")):
+            raise HTTPException(status_code=404, detail="Not Found")
+
+        # 检查是否是静态资源文件
+        static_file = os.path.join(FRONTEND_DIST, full_path)
+        if os.path.exists(static_file) and os.path.isfile(static_file):
+            return FileResponse(static_file)
+
+        # SPA 路由回退到 index.html
+        index_path = os.path.join(FRONTEND_DIST, "index.html")
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                return HTMLResponse(content=f.read())
+        return HTMLResponse(content="Frontend not found", status_code=404)
+
+    logger.info(f"前端静态文件托管已启用: {FRONTEND_DIST}")
+else:
+    logger.info("未检测到前端 dist 目录，静态文件托管未启用 (开发模式请使用 npm run dev)")
 
 
 if __name__ == "__main__":

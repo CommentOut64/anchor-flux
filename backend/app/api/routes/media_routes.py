@@ -210,8 +210,8 @@ async def _get_video_duration(video_path: Path) -> float:
         if not duration_str:
             print(f"[media] FFprobe 返回空时长，视频路径: {video_path}")
             return 0.0
-        
-        print(f"[media] FFprobe 成功获取时长: {duration_str}秒")
+
+        logger.debug(f"FFprobe 成功获取时长: {duration_str}秒")
         return float(duration_str)
     except subprocess.TimeoutExpired:
         print(f"[media] FFprobe 超时，视频路径: {video_path}")
@@ -584,7 +584,7 @@ async def get_video(job_id: str, request: Request):
         print(f"[media] 视频文件不存在: {job_id}")
         raise HTTPException(status_code=404, detail="视频文件不存在")
 
-    print(f"[media] 找到源视频: {video_file.name}, 扩展名: {video_file.suffix.lower()}")
+    logger.debug(f"找到源视频: {video_file.name}, 扩展名: {video_file.suffix.lower()}")
 
     # 3. 检查是否需要生成Proxy（先检查扩展名，再检查编码）
     needs_transcode = False
@@ -730,7 +730,7 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
         # 上限100k（约800KB JSON），下限4k
         target_samples = int(duration * 20)
         samples = max(4000, min(target_samples, 100000))
-        print(f"[media] 动态采样：时长{duration:.1f}s → {samples}个采样点")
+        logger.debug(f"动态采样：时长{duration:.1f}s → {samples}个采样点")
 
     # 【修复】使用版本号标识缓存，算法更新后自动使旧缓存失效
     # v2: 修复了采样位置计算的累积误差问题

@@ -2,7 +2,7 @@
   <el-dialog
     v-model="visible"
     title="关于"
-    width="400px"
+    width="320px"
     :close-on-click-modal="true"
     :close-on-press-escape="true"
     class="about-dialog"
@@ -48,6 +48,25 @@
           <span>Bilibili</span>
         </a>
       </div>
+
+      <!-- 日志级别设置（已禁用：控制台固定INFO，文件固定DEBUG）
+      <div class="log-level-section">
+        <div class="log-level-label">日志级别</div>
+        <el-select
+          v-model="logLevel"
+          placeholder="选择日志级别"
+          size="small"
+          @change="handleLogLevelChange"
+          class="log-level-select"
+        >
+          <el-option label="DEBUG" value="DEBUG" />
+          <el-option label="INFO" value="INFO" />
+          <el-option label="WARNING" value="WARNING" />
+          <el-option label="ERROR" value="ERROR" />
+        </el-select>
+        <div class="log-level-hint">修改后需要重启系统生效</div>
+      </div>
+      -->
     </div>
   </el-dialog>
 </template>
@@ -57,8 +76,14 @@ import { ref } from 'vue'
 
 const visible = defineModel({ type: Boolean, default: false })
 
-// 版本号（可以从 package.json 读取）
+// 版本号
 const version = ref('3.1.0')
+
+// 日志级别设置已禁用（控制台固定INFO，文件固定DEBUG）
+// const logLevel = ref('INFO')
+// const fetchLogLevel = async () => { ... }
+// const handleLogLevelChange = async (newLevel) => { ... }
+// watch(visible, (newVal) => { if (newVal) fetchLogLevel() })
 </script>
 
 <style scoped lang="scss">
@@ -151,5 +176,31 @@ const version = ref('3.1.0')
     border-color: var(--primary);
     color: var(--primary);
   }
+}
+
+.log-level-section {
+  width: 100%;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.log-level-label {
+  font-size: 13px;
+  color: var(--text-normal);
+  font-weight: 500;
+}
+
+.log-level-select {
+  width: 100%;
+}
+
+.log-level-hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: center;
 }
 </style>

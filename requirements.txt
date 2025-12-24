@@ -17,9 +17,9 @@ sympy
 
 # --- PyTorch (CUDA 11.8) ---
 # 包含 CUDA 11 运行库
+# 注意: torchvision 已移除以减小安装包体积 (~800MB)
 torch==2.4.0+cu118
 torchaudio==2.4.0+cu118
-torchvision==0.19.0+cu118
 
 # --- AI 推理引擎 (混合 CUDA 环境) ---
 # Faster-Whisper 1.2.1 需要 CTranslate2 4.x

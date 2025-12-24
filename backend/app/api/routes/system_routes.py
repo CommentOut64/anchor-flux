@@ -42,6 +42,11 @@ class ShutdownRequest(BaseModel):
     force: bool = False
 
 
+class LogLevelRequest(BaseModel):
+    """日志级别设置请求"""
+    level: str
+
+
 # ========== 客户端心跳管理 ==========
 
 @router.post("/api/system/heartbeat")
@@ -480,6 +485,75 @@ async def _terminate_processes():
     # 自我终止
     logger.info("后端进程即将退出...")
     logger.info("=" * 60)
-    
+
     # 使用 os._exit 确保立即退出，不执行 cleanup handlers
     os._exit(0)
+
+
+# ========== 日志级别管理 ==========
+
+@router.get("/api/system/log-level")
+async def get_log_level():
+    """获取当前日志级别"""
+    try:
+        # 根logger设置为DEBUG，实际级别由处理器控制
+        root_logger = logging.getLogger()
+        level_name = "INFO"  # 默认值
+
+        # 从控制台处理器获取实际的日志级别
+        for handler in root_logger.handlers:
+            if isinstance(handler, logging.StreamHandler):
+                level_name = logging.getLevelName(handler.level)
+                break
+
+        return {
+            "success": True,
+            "level": level_name,
+            "message": "日志级别获取成功"
+        }
+    except Exception as e:
+        logger.error(f"获取日志级别失败: {e}")
+        return {
+            "success": False,
+            "level": "INFO",
+            "message": f"获取日志级别失败: {str(e)}"
+        }
+
+
+@router.post("/api/system/log-level")
+async def set_log_level(req: LogLevelRequest):
+    """设置日志级别"""
+    try:
+        # 验证日志级别
+        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        level = req.level.upper()
+
+        if level not in valid_levels:
+            return {
+                "success": False,
+                "message": f"无效的日志级别: {req.level}，有效值: {', '.join(valid_levels)}"
+            }
+
+        # 设置根日志记录器的级别
+        root_logger = logging.getLogger()
+        root_logger.setLevel(getattr(logging, level))
+
+        # 同时更新所有已存在的日志记录器
+        for name in logging.Logger.manager.loggerDict:
+            logger_obj = logging.getLogger(name)
+            if isinstance(logger_obj, logging.Logger):
+                logger_obj.setLevel(getattr(logging, level))
+
+        logger.info(f"日志级别已更新为: {level}")
+
+        return {
+            "success": True,
+            "level": level,
+            "message": f"日志级别已更新为 {level}，重启系统后永久生效"
+        }
+    except Exception as e:
+        logger.error(f"设置日志级别失败: {e}")
+        return {
+            "success": False,
+            "message": f"设置日志级别失败: {str(e)}"
+        }

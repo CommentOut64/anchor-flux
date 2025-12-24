@@ -589,9 +589,9 @@ class SentenceSplitter:
                     if not strategy.is_incomplete_ending(last_word):
                         should_split = True
                         split_reason = "long_pause"
-                        logger.warning(f"[长停顿切分] pause={pause:.2f}s, 语义完整")
+                        logger.debug(f"[长停顿切分] pause={pause:.2f}s, 语义完整")
                     else:
-                        logger.warning(f"[长停顿跳过] pause={pause:.2f}s, 语义不完整，跳过切分")
+                        logger.debug(f"[长停顿跳过] pause={pause:.2f}s, 语义不完整，跳过切分")
                 elif pause >= dynamic_threshold:
                     # 动态停顿 + 分句标点
                     if word.word in self.config.clause_punctuation:

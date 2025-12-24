@@ -359,21 +359,43 @@ class SenseVoiceONNXService:
                 sess_options = ort.SessionOptions()
                 sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-                # CPU 线程限制（防止卡顿）
-                # 原理：ONNX Runtime 默认会占满所有 CPU 核心，导致 Whisper 的 CUDA 调度线程无核可用
-                # 解决：保留 4 个核心给操作系统和其他任务（V3.5: 用户要求至少保留4核）
-                import multiprocessing
-                total_cores = multiprocessing.cpu_count()
-                reserved_cores = 4  # V3.5: 保留 4 个核心
-                intra_op_threads = max(1, total_cores - reserved_cores)
+                # V3.9: 智能 CPU 线程配置（根据 Intel/AMD 架构优化）
+                # 原理：
+                # - Intel 混合架构：仅使用 P-Core，避免 E-Core 拖慢推理
+                # - AMD 全大核：使用物理核心数的 50-60%，避免跨 CCX 开销
+                # - 使用物理核心而非逻辑核心，避免超线程带来的缓存竞争
+                from app.utils.cpu_optimizer import ONNXThreadOptimizer, CPUArchitectureDetector
 
-                sess_options.intra_op_num_threads = intra_op_threads  # 算子内部并行度（最关键）
-                sess_options.inter_op_num_threads = 1  # 算子间并行度（通常设为 1）
+                vendor = CPUArchitectureDetector.detect_cpu_vendor()
+                physical_cores = CPUArchitectureDetector.get_physical_cores()
+                optimal_threads, thread_info = ONNXThreadOptimizer.calculate_optimal_threads(
+                    vendor=vendor,
+                    physical_cores=physical_cores,
+                    usage_ratio=0.6  # 使用 60% 的核心，避免功耗墙
+                )
+
+                sess_options.intra_op_num_threads = optimal_threads  # 算子内部并行度
+                sess_options.inter_op_num_threads = 1  # 算子间并行度
+
+                # 通用 CPU 优化（适用于 Intel/AMD）
+                try:
+                    # 1. 关闭线程自旋等待，降低空转功耗
+                    sess_options.add_session_config_entry('session.intra_op.allow_spinning', '0')
+                    sess_options.add_session_config_entry('session.inter_op.allow_spinning', '0')
+
+                    # 2. 将极小浮点数（denormal）视为 0，提升性能
+                    sess_options.add_session_config_entry('session.set_denormal_as_zero', '1')
+
+                    self.logger.debug("CPU 优化配置已启用: allow_spinning=0, denormal_as_zero=1")
+                except Exception as e:
+                    self.logger.debug(f"CPU 优化配置失败: {e}")
 
                 self.logger.info(
-                    f"CPU 线程配置: 总核心={total_cores}, "
-                    f"SenseVoice 使用={intra_op_threads}, 预留={reserved_cores}"
+                    f"CPU 线程配置: 厂商={vendor.upper()}, "
+                    f"物理核心={physical_cores}, "
+                    f"ONNX 使用={optimal_threads} 线程"
                 )
+                self.logger.info(f"配置策略: {thread_info['strategy']}")
 
                 # 选择执行提供者
                 providers = self._get_execution_providers()

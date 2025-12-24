@@ -5,6 +5,11 @@ import path from 'path'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [vue()],
+  // 生产环境构建配置 - 移除 console 和 debugger
+  esbuild: {
+    drop: ['console', 'debugger'],
+    pure: ['console.log', 'console.info', 'console.debug', 'console.warn']
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, 'src')

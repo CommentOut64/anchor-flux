@@ -639,7 +639,7 @@ class VADService:
                 continue
 
             # 处理超长片段
-            self.logger.warning(
+            self.logger.debug(
                 f"发现超长 VAD 片段: {duration_samples/sr:.2f}s > {max_duration}s，执行强制拆分"
             )
 
