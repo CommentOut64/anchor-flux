@@ -188,7 +188,7 @@
  * - 可拖拽调整侧边栏宽度
  * - 智能进度显示和多任务管理
  */
-import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, provide, watch, toRef } from 'vue'
 import { useRouter, onBeforeRouteLeave } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
@@ -219,8 +219,11 @@ const taskStore = useUnifiedTaskStore()
 // 全局播放管理器
 const playbackManager = usePlaybackManager()
 
+// 创建响应式 jobId ref，用于监听路由变化
+const jobIdRef = toRef(props, 'jobId')
+
 // Proxy 视频加载状态（新重构版本）
-const proxyVideo = useProxyVideo(props.jobId)
+const proxyVideo = useProxyVideo(jobIdRef)
 
 // Refs
 const videoStageRef = ref(null)
@@ -239,7 +242,7 @@ const loadError = ref(null)
 
 // 统一进度状态
 const progressStore = useProgressStore()
-const jobProgress = progressStore.getJobProgress(props.jobId)
+const jobProgress = computed(() => progressStore.getJobProgress(jobIdRef.value))
 const taskStatus = computed(() => jobProgress.value.status || 'idle')
 const taskPhase = computed(() => jobProgress.value.phase || 'pending')
 const taskProgress = computed(() => jobProgress.value.percent || 0)
@@ -261,7 +264,7 @@ let progressPollTimer = null
 
 // 提供编辑器上下文给子组件
 provide('editorContext', {
-  jobId: props.jobId,
+  jobId: jobIdRef,
   saving,
   // 视频就绪状态（用于播放控制拦截）
   isVideoReady: computed(() => proxyVideo.isReady.value)
@@ -295,10 +298,26 @@ watch(
   () => projectStore.dualStreamProgress,
   (progress) => {
     if (!progress) return
-    progressStore.applyDualStreamEstimate(props.jobId, progress)
+    progressStore.applyDualStreamEstimate(jobIdRef.value, progress)
   },
   { deep: true }
 )
+
+// 监听 jobId 变化，重新加载项目（支持任务切换）
+watch(jobIdRef, async (newJobId, oldJobId) => {
+  if (newJobId === oldJobId) return
+
+  console.log('[EditorView] jobId 变化，重新加载项目:', { oldJobId, newJobId })
+
+  // 取消旧的 SSE 订阅
+  cleanupSSE()
+
+  // 重置项目状态
+  projectStore.resetProject()
+
+  // 重新加载项目
+  await loadProject()
+})
 
 // ========== 计算属性 ==========
 

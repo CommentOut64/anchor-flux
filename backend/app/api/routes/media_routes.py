@@ -597,15 +597,14 @@ async def get_video(job_id: str, request: Request):
         print(f"[media] 扩展名需要转码: {video_file.suffix.lower()} 属于 {NEED_TRANSCODE_FORMATS}")
     # 3.2 即使是 .mp4/.webm，也需检查实际编码是否兼容
     elif video_file.suffix.lower() in BROWSER_COMPATIBLE_FORMATS:
-        print(f"[media] 扩展名兼容，检查视频编码...")
         codec = _get_video_codec(video_file)
-        print(f"[media] 检测到视频编码: {codec}")
         if codec and codec in NEED_TRANSCODE_CODECS:
             needs_transcode = True
             transcode_reason = f"编码不兼容 ({codec.upper()})"
-            print(f"[media] 编码需要转码: {codec} 属于 {NEED_TRANSCODE_CODECS}")
+            logger.debug(f"视频编码检测: {codec} (不兼容，需转码)")
         else:
-            print(f"[media] 编码兼容，无需转码")
+            # 编码兼容，无需转码
+            logger.debug(f"视频编码检测: {codec} (兼容)")
 
     if needs_transcode:
         print(f"[media] 视频需要转码: {transcode_reason}")
@@ -674,7 +673,7 @@ async def get_video(job_id: str, request: Request):
         )
 
     # 4. 返回兼容格式的源视频
-    print(f"[media] 无需转码，直接返回源视频")
+    # 日志已在编码检测时输出，此处不再重复
     return _serve_file_with_range(video_file, request, 'video/mp4')
 
 

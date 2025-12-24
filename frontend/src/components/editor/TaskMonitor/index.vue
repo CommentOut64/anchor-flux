@@ -25,13 +25,13 @@
 
     <!-- 滚动区：任务分组 -->
     <div class="monitor-body" ref="scrollContainer">
-      <!-- SSE 断开警告 -->
-      <div v-if="!sseConnected" class="sse-alert">
+      <!-- SSE 断开警告 - 已禁用，避免误报干扰用户 -->
+      <!-- <div v-if="!sseConnected" class="sse-alert">
         <svg viewBox="0 0 24 24" fill="currentColor">
           <path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z" />
         </svg>
         <span>实时连接已断开，正在尝试重连...</span>
-      </div>
+      </div> -->
 
       <!-- 失败任务 -->
       <TaskGroup
