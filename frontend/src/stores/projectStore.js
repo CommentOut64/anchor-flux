@@ -69,6 +69,7 @@ export const useProjectStore = defineStore("project", () => {
     deep: true,
     capacity: 50, // 限制历史记录步数
     clone: true, // 深拷贝，确保历史记录独立
+    flush: 'sync', // 同步记录，避免一次操作产生多个历史记录
   });
 
   // ========== 4. 播放器全局状态 ==========
@@ -118,10 +119,18 @@ export const useProjectStore = defineStore("project", () => {
     console.log("[ProjectStore] 自动保存成功:", jobId);
     // 使用标记避免循环触发 watch
     isUpdatingAfterSave = true;
+
+    // 暂停历史记录追踪，避免 isDirty 重置创建历史记录
+    pauseHistory();
+
     meta.value.lastSaved = Date.now();
     meta.value.isDirty = false;
     // 重置每个字幕的 isDirty 标记
     subtitles.value.forEach((s) => (s.isDirty = false));
+
+    // 恢复历史记录追踪
+    resumeHistory();
+
     isUpdatingAfterSave = false;
   };
 
@@ -310,6 +319,241 @@ export const useProjectStore = defineStore("project", () => {
       subtitles.value.splice(index, 1);
       meta.value.isDirty = true;
     }
+  }
+
+  // ========== 字幕切分功能 ==========
+
+  /**
+   * 切分字幕（核心方法）
+   *
+   * 支持两种切分模式：
+   * 1. 基于时间点切分（波形图右键）- 传入 splitTime
+   * 2. 基于光标位置切分（字幕列表编辑模式）- 传入 cursorPosition
+   *
+   * 时间戳计算策略（混合策略）：
+   * - 优先使用字级时间戳（words 数组）精确切分
+   * - 回退到字数比例估算
+   *
+   * @param {string} id - 要切分的字幕 ID
+   * @param {Object} options - 切分选项
+   * @param {number} [options.splitTime] - 切分时间点（秒），用于波形图切分
+   * @param {number} [options.cursorPosition] - 光标位置（字符索引），用于文本切分
+   * @returns {Object|null} 切分结果 { success, leftId, rightId, error }
+   */
+  function splitSubtitle(id, options = {}) {
+    const { splitTime, cursorPosition } = options;
+
+    // 1. 查找目标字幕
+    const index = subtitles.value.findIndex((s) => s.id === id);
+    if (index === -1) {
+      return { success: false, error: '字幕不存在' };
+    }
+
+    const subtitle = subtitles.value[index];
+
+    // 2. 前置校验：草稿字幕不允许切分
+    if (subtitle.isDraft) {
+      return { success: false, error: '草稿字幕不允许切分，请等待转录完成' };
+    }
+
+    // 3. 计算切分点
+    let splitResult;
+    if (splitTime !== undefined) {
+      // 基于时间点切分（波形图模式）
+      splitResult = _splitByTime(subtitle, splitTime);
+    } else if (cursorPosition !== undefined) {
+      // 基于光标位置切分（文本编辑模式）
+      splitResult = _splitByCursor(subtitle, cursorPosition);
+    } else {
+      return { success: false, error: '必须提供 splitTime 或 cursorPosition' };
+    }
+
+    if (!splitResult.success) {
+      return splitResult;
+    }
+
+    const { left, right } = splitResult;
+
+    // 4. 生成新字幕 ID
+    const timestamp = Date.now();
+    const leftId = `${id}-split-L-${timestamp}`;
+    const rightId = `${id}-split-R-${timestamp}`;
+
+    // 5. 构建新字幕对象
+    const leftSubtitle = {
+      ...subtitle,
+      id: leftId,
+      start: left.start,
+      end: left.end,
+      text: left.text,
+      words: left.words || [],
+      isDirty: true,
+      source: 'split',  // 标记来源为切分
+    };
+
+    const rightSubtitle = {
+      ...subtitle,
+      id: rightId,
+      start: right.start,
+      end: right.end,
+      text: right.text,
+      words: right.words || [],
+      isDirty: true,
+      source: 'split',
+    };
+
+    // 6. 原子操作：删除旧字幕，插入两个新字幕
+    console.log('[ProjectStore] 切分前历史记录数:', history.value.length);
+    subtitles.value.splice(index, 1, leftSubtitle, rightSubtitle);
+    console.log('[ProjectStore] 切分后历史记录数:', history.value.length);
+
+    // 7. 标记项目已修改
+    meta.value.isDirty = true;
+
+    console.log(`[ProjectStore] 字幕切分成功: ${id} -> ${leftId}, ${rightId}`);
+
+    return {
+      success: true,
+      leftId,
+      rightId,
+      leftSubtitle,
+      rightSubtitle,
+    };
+  }
+
+  /**
+   * 基于时间点切分（内部方法）
+   * 用于波形图右键切分场景
+   */
+  function _splitByTime(subtitle, splitTime) {
+    const { start, end, text, words } = subtitle;
+
+    // 校验时间点是否在字幕范围内
+    if (splitTime <= start || splitTime >= end) {
+      return { success: false, error: '切分点必须在字幕时间范围内' };
+    }
+
+    // 优先使用字级时间戳
+    if (words && words.length > 0) {
+      // 查找切分点所在的字
+      const splitIndex = words.findIndex(w => w.end >= splitTime);
+
+      if (splitIndex > 0) {
+        const leftWords = words.slice(0, splitIndex);
+        const rightWords = words.slice(splitIndex);
+
+        return {
+          success: true,
+          left: {
+            start: start,
+            end: leftWords[leftWords.length - 1].end,
+            text: leftWords.map(w => w.word).join(''),
+            words: leftWords,
+          },
+          right: {
+            start: rightWords[0].start,
+            end: end,
+            text: rightWords.map(w => w.word).join(''),
+            words: rightWords,
+          },
+        };
+      }
+    }
+
+    // 回退：按时间比例估算文本切分点
+    const ratio = (splitTime - start) / (end - start);
+    const charIndex = Math.max(1, Math.min(text.length - 1, Math.round(text.length * ratio)));
+
+    return {
+      success: true,
+      left: {
+        start: start,
+        end: splitTime,
+        text: text.slice(0, charIndex),
+        words: [],
+      },
+      right: {
+        start: splitTime,
+        end: end,
+        text: text.slice(charIndex),
+        words: [],
+      },
+    };
+  }
+
+  /**
+   * 基于光标位置切分（内部方法）
+   * 用于字幕列表编辑模式右键切分场景
+   */
+  function _splitByCursor(subtitle, cursorPosition) {
+    const { start, end, text, words } = subtitle;
+
+    // 校验光标位置
+    if (cursorPosition <= 0 || cursorPosition >= text.length) {
+      return { success: false, error: '光标位置必须在文本中间' };
+    }
+
+    const leftText = text.slice(0, cursorPosition);
+    const rightText = text.slice(cursorPosition);
+
+    // 优先使用字级时间戳
+    if (words && words.length > 0) {
+      // 根据文本切分点找字级时间戳边界
+      let charCount = 0;
+      let splitWordIndex = 0;
+
+      for (let i = 0; i < words.length; i++) {
+        charCount += words[i].word.length;
+        if (charCount >= cursorPosition) {
+          splitWordIndex = i + 1;
+          break;
+        }
+      }
+
+      // 确保至少切分出一个字
+      splitWordIndex = Math.max(1, Math.min(words.length - 1, splitWordIndex));
+
+      const leftWords = words.slice(0, splitWordIndex);
+      const rightWords = words.slice(splitWordIndex);
+
+      if (leftWords.length > 0 && rightWords.length > 0) {
+        return {
+          success: true,
+          left: {
+            start: start,
+            end: leftWords[leftWords.length - 1].end,
+            text: leftText,
+            words: leftWords,
+          },
+          right: {
+            start: rightWords[0].start,
+            end: end,
+            text: rightText,
+            words: rightWords,
+          },
+        };
+      }
+    }
+
+    // 回退：按字数比例估算时间
+    const ratio = cursorPosition / text.length;
+    const splitTime = start + (end - start) * ratio;
+
+    return {
+      success: true,
+      left: {
+        start: start,
+        end: splitTime,
+        text: leftText,
+        words: [],
+      },
+      right: {
+        start: splitTime,
+        end: end,
+        text: rightText,
+        words: [],
+      },
+    };
   }
 
   // ========== Phase 5: 双模态架构专用方法 ==========
@@ -795,6 +1039,7 @@ export const useProjectStore = defineStore("project", () => {
     updateSubtitle,
     addSubtitle,
     removeSubtitle,
+    splitSubtitle,  // 字幕切分
     generateSRT,
     seekTo,
     saveProject,

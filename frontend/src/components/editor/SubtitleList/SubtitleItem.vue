@@ -85,6 +85,7 @@
           @blur="stopEditing"
           @keydown.enter.ctrl="stopEditing"
           @keydown.escape="cancelEditing"
+          @contextmenu="handleTextareaContextMenu"
           placeholder="输入字幕文本..."
           rows="2"
         ></textarea>
@@ -141,6 +142,14 @@
         </svg>
       </button>
     </el-tooltip>
+
+    <!-- 右键菜单 -->
+    <ContextMenu
+      ref="contextMenuRef"
+      :items="contextMenuItems"
+      @select="handleContextMenuSelect"
+      @close="handleContextMenuClose"
+    />
   </div>
 </template>
 
@@ -155,6 +164,7 @@
  */
 import { ref, computed, nextTick, watch } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import ContextMenu from '@/components/editor/ContextMenu.vue'
 
 const props = defineProps({
   subtitle: { type: Object, required: true },
@@ -183,6 +193,11 @@ const originalText = ref('')
 
 // 删除确认状态
 const isDeleteConfirming = ref(false)
+
+// 右键菜单状态
+const contextMenuRef = ref(null)
+const cursorPosition = ref(0)
+const isContextMenuOpen = ref(false)  // 防止菜单打开时 blur 触发 stopEditing
 
 // 播放状态
 const isPlaying = computed(() => projectStore.player.isPlaying)
@@ -265,6 +280,10 @@ function startEditing() {
 
 // 停止编辑
 function stopEditing() {
+  // 右键菜单打开时不触发停止编辑，防止菜单项消失
+  if (isContextMenuOpen.value) {
+    return
+  }
   isEditing.value = false
 }
 
@@ -300,6 +319,85 @@ function handleDelete() {
 // 重置删除确认状态
 function resetDeleteConfirm() {
   isDeleteConfirming.value = false
+}
+
+// ============ 右键菜单逻辑 ============
+
+// 右键菜单项配置
+const contextMenuItems = computed(() => {
+  if (!isEditing.value || props.subtitle.isDraft) {
+    return []
+  }
+
+  return [{
+    key: 'split',
+    label: '从此处切分',
+  }]
+})
+
+// 编辑区域右键事件处理
+function handleTextareaContextMenu(e) {
+  console.log('[SubtitleItem] 右键事件触发', {
+    isEditing: isEditing.value,
+    isDraft: props.subtitle.isDraft,
+    hasTextarea: !!editTextarea.value,
+    hasContextMenu: !!contextMenuRef.value
+  })
+
+  e.preventDefault()
+  e.stopPropagation()
+
+  if (!isEditing.value || props.subtitle.isDraft) {
+    console.log('[SubtitleItem] 右键菜单被阻止：不在编辑模式或是草稿')
+    return
+  }
+
+  // 获取光标位置
+  const textarea = editTextarea.value
+  if (!textarea) {
+    console.log('[SubtitleItem] 右键菜单被阻止：textarea不存在')
+    return
+  }
+
+  cursorPosition.value = textarea.selectionStart
+  console.log('[SubtitleItem] 显示右键菜单，光标位置:', cursorPosition.value)
+
+  // 标记菜单打开，防止 blur 触发 stopEditing
+  isContextMenuOpen.value = true
+
+  // 显示右键菜单
+  contextMenuRef.value?.show(e.clientX, e.clientY)
+}
+
+// 右键菜单项选择处理
+function handleContextMenuSelect(key) {
+  console.log('[SubtitleItem] 菜单项被选择:', key)
+
+  // 重置菜单打开标志
+  isContextMenuOpen.value = false
+
+  if (key === 'split') {
+    console.log('[SubtitleItem] 开始切分，光标位置:', cursorPosition.value)
+
+    const result = projectStore.splitSubtitle(props.subtitle.id, {
+      cursorPosition: cursorPosition.value
+    })
+
+    console.log('[SubtitleItem] 切分结果:', result)
+
+    if (!result.success) {
+      console.error('[SubtitleItem] 切分失败:', result.error)
+    } else {
+      console.log('[SubtitleItem] 切分成功:', result)
+      // 切分成功后退出编辑模式
+      isEditing.value = false
+    }
+  }
+}
+
+// 右键菜单关闭处理
+function handleContextMenuClose() {
+  isContextMenuOpen.value = false
 }
 
 // 渲染带置信度高亮的文本

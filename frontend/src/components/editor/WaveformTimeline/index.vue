@@ -48,6 +48,7 @@
       class="waveform-wrapper"
       ref="waveformWrapperRef"
       :style="{ cursor: currentMouseCursor }"
+      @contextmenu="handleWaveformContextMenu"
     >
       <!-- 上半部分交互层：只处理光标拖拽，阻止Region操作 -->
       <div
@@ -88,6 +89,13 @@
         <div class="scrollbar-thumb" :style="scrollbarThumbStyle"></div>
       </div>
     </div>
+
+    <!-- 右键菜单 -->
+    <ContextMenu
+      ref="contextMenuRef"
+      :items="contextMenuItems"
+      @select="handleContextMenuSelect"
+    />
   </div>
 </template>
 
@@ -95,6 +103,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from "vue";
 import { useProjectStore } from "@/stores/projectStore";
 import { usePlaybackManager } from "@/services/PlaybackManager";
+import ContextMenu from "@/components/editor/ContextMenu.vue";
 
 // ============ 缩放配置常量 ============
 const ZOOM_MIN = 20; // 最小缩放 20%
@@ -165,6 +174,11 @@ const scrollbarThumbWidth = ref(100);
 const isDraggingScrollbar = ref(false);
 let scrollbarDragStartX = 0;
 let scrollbarDragStartScroll = 0;
+
+// 右键菜单状态
+const contextMenuRef = ref(null);
+const contextMenuTarget = ref(null); // 右键点击的目标字幕ID
+const contextMenuTime = ref(0); // 右键点击的时间点
 
 // RAF节流状态
 let scrollbarRafId = null;
@@ -1032,6 +1046,69 @@ function handleCursorDragEnd() {
  */
 function handleWaveformMouseLeave() {
   currentMouseCursor.value = "default";
+}
+
+// ============ 右键菜单逻辑 ============
+
+/**
+ * 右键菜单项配置
+ */
+const contextMenuItems = computed(() => {
+  const items = [];
+
+  if (contextMenuTarget.value) {
+    items.push({
+      key: 'split',
+      label: '从此处切分',
+    });
+  }
+
+  return items;
+});
+
+/**
+ * 波形区域右键事件处理
+ */
+function handleWaveformContextMenu(e) {
+  e.preventDefault();
+  e.stopPropagation();
+
+  if (!wavesurfer || !isReady.value) return;
+
+  const clickTime = getTimeFromClientX(e.clientX);
+
+  // 查找点击位置对应的字幕
+  const targetSubtitle = projectStore.subtitles.find(
+    s => clickTime >= s.start && clickTime < s.end
+  );
+
+  // 只有在字幕范围内才显示菜单
+  if (targetSubtitle && !targetSubtitle.isDraft) {
+    contextMenuTarget.value = targetSubtitle.id;
+    contextMenuTime.value = clickTime;
+    contextMenuRef.value?.show(e.clientX, e.clientY);
+  }
+}
+
+/**
+ * 右键菜单项选择处理
+ */
+function handleContextMenuSelect(key) {
+  if (key === 'split' && contextMenuTarget.value) {
+    const result = projectStore.splitSubtitle(contextMenuTarget.value, {
+      splitTime: contextMenuTime.value
+    });
+
+    if (!result.success) {
+      console.error('[WaveformTimeline] 切分失败:', result.error);
+    } else {
+      console.log('[WaveformTimeline] 切分成功:', result);
+    }
+  }
+
+  // 清空状态
+  contextMenuTarget.value = null;
+  contextMenuTime.value = 0;
 }
 
 // ============ 自定义滚动条逻辑 ============

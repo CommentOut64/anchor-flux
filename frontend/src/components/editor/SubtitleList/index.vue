@@ -49,21 +49,24 @@
       </div>
 
       <!-- Phase 5: 使用 SubtitleItem 组件替代内联渲染 -->
-      <SubtitleItem
-        v-for="(subtitle, index) in filteredSubtitles"
-        :key="subtitle.id"
-        :subtitle="subtitle"
-        :index="index"
-        :is-active="activeSubtitleId === subtitle.id"
-        :is-current="currentSubtitleId === subtitle.id"
-        :editable="props.editable"
-        @click="onSubtitleClick"
-        @update-time="updateTime"
-        @update-text="updateText"
-        @delete="deleteSubtitle"
-        @insert-before="insertBefore(index)"
-        @insert-after="insertAfter(index)"
-      />
+      <!-- 添加 TransitionGroup 实现切分动画 -->
+      <TransitionGroup name="subtitle-list" tag="div">
+        <SubtitleItem
+          v-for="(subtitle, index) in filteredSubtitles"
+          :key="subtitle.id"
+          :subtitle="subtitle"
+          :index="index"
+          :is-active="activeSubtitleId === subtitle.id"
+          :is-current="currentSubtitleId === subtitle.id"
+          :editable="props.editable"
+          @click="onSubtitleClick"
+          @update-time="updateTime"
+          @update-text="updateText"
+          @delete="deleteSubtitle"
+          @insert-before="insertBefore(index)"
+          @insert-after="insertAfter(index)"
+        />
+      </TransitionGroup>
     </div>
   </div>
 </template>
@@ -559,5 +562,22 @@ watch(currentSubtitleId, (id) => {
       color: var(--danger);
     }
   }
+}
+
+// 字幕切分动画
+.subtitle-list-move,
+.subtitle-list-enter-active,
+.subtitle-list-leave-active {
+  transition: all 0.3s ease;
+}
+
+.subtitle-list-enter-from {
+  opacity: 0;
+  transform: translateY(-20px);
+}
+
+.subtitle-list-leave-to {
+  opacity: 0;
+  transform: scale(0.95);
 }
 </style>
