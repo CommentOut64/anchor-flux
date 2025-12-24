@@ -400,6 +400,11 @@ const activeTasks = computed(() =>
   taskStore.tasks.filter(t => ['processing', 'queued'].includes(t.status)).length
 )
 
+// 问题检查计数（统计有警告的字幕数量）
+const errorCount = computed(() =>
+  projectStore.subtitles.filter(s => s.warning_type && s.warning_type !== 'none').length
+)
+
 // Grid 布局样式
 const gridStyle = computed(() => ({
   gridTemplateColumns: `1fr 4px ${sidebarWidth.value}px`
@@ -447,6 +452,16 @@ async function loadProject() {
     const restored = await projectStore.restoreProject(props.jobId)
     if (restored && projectStore.subtitles.length > 0) {
       console.log('[EditorView] 从本地存储恢复成功')
+
+      // 检查缓存数据是否有 sentenceIndex 字段（新格式）
+      const hasValidFormat = projectStore.subtitles.every(s => s.sentenceIndex !== undefined)
+
+      if (!hasValidFormat && ['processing', 'queued', 'paused'].includes(jobStatus.status)) {
+        // 缓存数据是旧格式，需要重新从 API 加载以获取 sentenceIndex
+        console.log('[EditorView] 缓存数据格式过旧（缺少 sentenceIndex），重新从 API 加载')
+        await loadTranscribingSegments()
+      }
+
       // 即使从本地恢复，如果任务仍在处理中或暂停，也需要订阅SSE以接收实时更新
       if (['processing', 'queued'].includes(jobStatus.status)) {
         console.log('[EditorView] 任务仍在处理中，需要订阅SSE')
@@ -531,8 +546,8 @@ async function loadTranscribingSegments() {
   try {
     const textData = await transcriptionApi.getTranscriptionText(props.jobId)
     if (textData.segments && textData.segments.length > 0) {
-      const srtContent = segmentsToSRT(textData.segments)
-      projectStore.importSRT(srtContent, {
+      // 直接导入 segments，保留 sentenceIndex 字段
+      projectStore.importSegments(textData.segments, {
         jobId: props.jobId,
         filename: projectStore.meta.filename,
         duration: projectStore.meta.duration,
@@ -792,8 +807,10 @@ function handleStreamingSubtitle(data) {
     // 更新已有字幕
     projectStore.updateSubtitle(existingIndex, subtitleData)
   } else {
-    // 添加新字幕
-    projectStore.addSubtitle(subtitleData)
+    // 添加新字幕 - 按时间顺序找到插入位置
+    const insertIndex = projectStore.subtitles.findIndex(s => s.start > (start ?? 0))
+    const finalIndex = insertIndex === -1 ? projectStore.subtitles.length : insertIndex
+    projectStore.addSubtitle(finalIndex, subtitleData)
   }
 
   // 恢复历史记录

@@ -195,6 +195,43 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   /**
+   * 导入 Segments（从 API 加载转录中的字幕）
+   *
+   * 与 importSRT 的区别：
+   * - 直接导入 segments，不经过 SRT 转换
+   * - 保留 sentenceIndex 字段，用于 SSE 推送时的字幕匹配
+   * - 保留 confidence、source 等元数据
+   */
+  function importSegments(segments, metadata) {
+    subtitles.value = segments.map((seg) => ({
+      id: `subtitle-${seg.id}`,
+      sentenceIndex: seg.id,  // 关键：保留全局句子索引
+      start: seg.start,
+      end: seg.end,
+      text: seg.text,
+      isDirty: false,
+      chunk_id: null,
+      isDraft: false,
+      words: [],
+      confidence: seg.confidence || 1.0,
+      warning_type: "none",
+      source: seg.source || "imported",
+    }));
+
+    meta.value = {
+      ...meta.value,
+      ...metadata,
+      lastSaved: Date.now(),
+      isDirty: false,
+    };
+
+    // 清除历史记录，避免撤销到空状态
+    clearHistory();
+    // 清除 Chunk 映射
+    chunkSubtitleMap.value.clear();
+  }
+
+  /**
    * 从缓存/存储恢复项目
    */
   async function restoreProject(jobId) {
@@ -753,6 +790,7 @@ export const useProjectStore = defineStore("project", () => {
 
     // 操作方法
     importSRT,
+    importSegments,
     restoreProject,
     updateSubtitle,
     addSubtitle,

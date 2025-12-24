@@ -1186,36 +1186,68 @@ def create_transcription_router(
             with open(checkpoint_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
-            # 提取未对齐结果
-            unaligned_results = data.get("unaligned_results", [])
+            # V3.7.3+: 优先从 transcription.sentences_snapshot 读取（实时字幕快照）
+            transcription = data.get("transcription", {})
+            sentences_snapshot = transcription.get("sentences_snapshot", [])
 
-            # 合并所有segments
             all_segments = []
             detected_language = None
-            for result in unaligned_results:
-                if not detected_language and 'language' in result:
-                    detected_language = result['language']
-                all_segments.extend(result.get('segments', []))
 
-            # 按时间排序
-            all_segments.sort(key=lambda x: x.get('start', 0))
+            if sentences_snapshot:
+                # 使用新格式（V3.7.3+ 实时字幕快照）
+                for sentence in sentences_snapshot:
+                    all_segments.append({
+                        "id": sentence.get("_index", 0),
+                        "start": sentence.get("start", 0),
+                        "end": sentence.get("end", 0),
+                        "text": sentence.get("text", ""),
+                        "confidence": sentence.get("confidence", 0),
+                        "source": sentence.get("source", "unknown")
+                    })
 
-            # 重新编号
-            for idx, seg in enumerate(all_segments):
-                seg['id'] = idx
+                # 按 _index 排序（已经是正确顺序，但保险起见）
+                all_segments.sort(key=lambda x: x.get('id', 0))
+
+                # 语言信息从 transcription 或 job 获取
+                detected_language = transcription.get("language") or job.language
+
+                # 进度信息从 transcription 获取
+                processed_count = transcription.get("processed_count", 0)
+                total_chunks = transcription.get("total_chunks", 0)
+
+            else:
+                # 回退到旧格式（unaligned_results）
+                unaligned_results = data.get("unaligned_results", [])
+
+                for result in unaligned_results:
+                    if not detected_language and 'language' in result:
+                        detected_language = result['language']
+                    all_segments.extend(result.get('segments', []))
+
+                # 按时间排序
+                all_segments.sort(key=lambda x: x.get('start', 0))
+
+                # 重新编号
+                for idx, seg in enumerate(all_segments):
+                    seg['id'] = idx
+
+                # 进度信息从旧格式获取
+                processed_count = len(data.get("processed_indices", []))
+                total_chunks = data.get("total_segments", 0)
 
             return {
                 "job_id": job_id,
                 "has_checkpoint": True,
-                "language": detected_language or job.language or "unknown",
+                "language": detected_language or "unknown",
                 "segments": all_segments,
+                "sentence_count": transcription.get("sentence_count", len(all_segments)),
                 "progress": {
-                    "processed": len(data.get("processed_indices", [])),
-                    "total": data.get("total_segments", 0),
+                    "processed": processed_count,
+                    "total": total_chunks,
                     "percentage": round(
-                        len(data.get("processed_indices", [])) / max(1, data.get("total_segments", 1)) * 100,
+                        processed_count / max(1, total_chunks) * 100,
                         2
-                    )
+                    ) if total_chunks > 0 else 0
                 }
             }
 
