@@ -113,6 +113,7 @@ class AsyncDualPipeline:
             sensevoice_language=sensevoice_language,
             enable_semantic_grouping=enable_semantic_grouping,
             is_final_output=self.is_sensevoice_only,  # 极速模式下 FastWorker 输出为定稿
+            enable_cross_chunk_merge=True,  # V3.9.1: 启用跨chunk合并（仅SenseVoice模式）
             logger=self.logger
         )
 

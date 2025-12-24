@@ -43,6 +43,7 @@ class PreprocessingPipeline:
         self,
         config: PreprocessingConfig,
         chunk_engine: Optional[ChunkEngine] = None,
+        vad_config: Optional[VADConfig] = None,  # V3.9.1: 新增 VAD 配置参数
         logger: Optional[logging.Logger] = None,
         cancellation_token: Optional["CancellationToken"] = None  # V3.7: 新增
     ):
@@ -52,12 +53,14 @@ class PreprocessingPipeline:
         Args:
             config: 预处理配置
             chunk_engine: 音频切分引擎（可选）
+            vad_config: VAD 配置（可选，V3.9.1 新增，用于语言特定的 VAD 策略）
             logger: 日志记录器（可选）
             cancellation_token: 取消令牌（可选，V3.7）
         """
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
         self.cancellation_token = cancellation_token  # V3.7
+        self.vad_config = vad_config  # V3.9.1: 保存 VAD 配置
 
         # 初始化 ChunkEngine（用于音频提取和VAD切分）
         self.chunk_engine = chunk_engine or ChunkEngine(logger=self.logger)
@@ -265,8 +268,9 @@ class PreprocessingPipeline:
         Returns:
             List[AudioChunk]: VAD切分后的 Chunk 列表
         """
-        # 构建 VAD 配置（使用默认配置）
-        vad_config = VADConfig()
+        # V3.9.1: 使用传入的 VAD 配置，如果没有则使用默认配置
+        vad_config = self.vad_config or VADConfig()
+        self.logger.info(f"VAD配置: merge_max_gap={vad_config.merge_max_gap}s, merge_max_duration={vad_config.merge_max_duration}s")
 
         # 定义进度回调
         def progress_callback(progress: float, message: str):

@@ -644,10 +644,42 @@ class TranscriptionService:
             List[AudioChunk]: 预处理完成的 Chunk 列表
         """
         from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
+        from app.services.audio.chunk_engine import ChunkEngine
+        from app.services.audio.vad_service import VADConfig
+
+        # V3.9: 根据引擎类型选择 VAD 配置
+        # 英语使用 Whisper，需要合并 VAD（避免幻觉）
+        # 其他语言使用 SenseVoice，需要保留停顿信息
+        language = getattr(job.settings, 'language', 'auto')
+        is_english = language in {'en', 'english'}
+
+        if is_english:
+            # Whisper 模式：合并 VAD，避免幻觉
+            vad_config = VADConfig(
+                merge_max_gap=1.0,
+                merge_max_duration=12.0,
+                smart_target_duration=12.0
+            )
+            self.logger.info("使用 Whisper VAD 配置（合并模式）")
+        else:
+            # SenseVoice 模式：保留停顿信息
+            vad_config = VADConfig(
+                merge_max_gap=0.3,           # 只合并极短停顿
+                merge_max_duration=8.0,      # 更短的 chunk
+                smart_target_duration=8.0    # 软上限降低
+            )
+            self.logger.info("使用 SenseVoice VAD 配置（保留停顿）")
+
+        # 创建自定义 ChunkEngine
+        chunk_engine = ChunkEngine(
+            vad_config=vad_config,
+            logger=self.logger
+        )
 
         # 创建 PreprocessingPipeline 实例
         preprocessing_pipeline = PreprocessingPipeline(
             config=job.settings.preprocessing,
+            chunk_engine=chunk_engine,
             logger=self.logger
         )
 
@@ -4566,13 +4598,38 @@ class TranscriptionService:
             # ========== 新架构：使用 PreprocessingPipeline ==========
             # 统一执行：音频提取 + VAD切分 + 频谱分诊 + 按需分离
             from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
+            from app.services.audio.vad_service import VADConfig
             import soundfile as sf
 
             self.logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
 
-            # 创建预处理流水线
+            # V3.9.1: 根据语言选择 VAD 配置
+            # 英语使用 Whisper，需要合并 VAD（避免幻觉）
+            # 其他语言使用 SenseVoice，需要保留停顿信息以获得更好的断句
+            language = getattr(job.settings, 'language', 'auto')
+            is_english = language in {'en', 'english'}
+
+            if is_english:
+                # Whisper 模式：合并 VAD，避免幻觉
+                vad_config = VADConfig(
+                    merge_max_gap=1.0,
+                    merge_max_duration=12.0,
+                    smart_target_duration=12.0
+                )
+                self.logger.info(f"VAD配置: Whisper模式（合并），language={language}")
+            else:
+                # SenseVoice 模式：保留停顿信息，获得更自然的断句
+                vad_config = VADConfig(
+                    merge_max_gap=0.3,           # 只合并极短停顿（保留自然停顿）
+                    merge_max_duration=8.0,      # 更短的 chunk（避免强制切分）
+                    smart_target_duration=8.0    # 软上限降低
+                )
+                self.logger.info(f"VAD配置: SenseVoice模式（保留停顿），language={language}")
+
+            # 创建预处理流水线（传入 VAD 配置）
             preprocessing_pipeline = PreprocessingPipeline(
                 config=job.settings.preprocessing,
+                vad_config=vad_config,
                 logger=self.logger
             )
 

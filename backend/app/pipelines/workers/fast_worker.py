@@ -59,6 +59,8 @@ class FastWorker:
         demucs_service: Optional[DemucsService] = None,
         # V3.5: 极速模式参数
         is_final_output: bool = False,
+        # V3.9.1: 跨 chunk 合并参数
+        enable_cross_chunk_merge: bool = False,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -77,6 +79,7 @@ class FastWorker:
             fuse_auto_upgrade: 是否启用第二次自动升级到 MDX_EXTRA（默认False）
             demucs_service: Demucs服务实例
             is_final_output: 是否为最终输出（极速模式下为True，输出定稿而非草稿）
+            enable_cross_chunk_merge: 是否启用跨chunk合并（默认False，仅SenseVoice模式推荐启用）
             logger: 日志记录器
         """
         self.job_id = job_id
@@ -85,8 +88,15 @@ class FastWorker:
         self.is_final_output = is_final_output
         self.logger = logger or logging.getLogger(__name__)
 
+        # V3.9.1: 跨 chunk 合并机制
+        self.enable_cross_chunk_merge = enable_cross_chunk_merge
+        self.pending_sentence = None  # 缓存上一个 chunk 的最后一句（如果语义不完整）
+
         if is_final_output:
             self.logger.info("FastWorker 运行在极速模式：输出为定稿")
+
+        if enable_cross_chunk_merge:
+            self.logger.info("跨 chunk 合并已启用：将自动合并语义不完整的句子")
 
         # 初始化执行器
         self.sensevoice_executor = sensevoice_executor or SenseVoiceExecutor()
@@ -109,7 +119,7 @@ class FastWorker:
             self.fuse_breaker = None
             self.demucs_service = None
 
-        # 初始化快流分句器（主要依赖 VAD 停顿）
+        # 初始化快流分句器（默认配置，主要依赖 VAD 停顿）
         if draft_split_config is None:
             draft_split_config = SplitConfig(
                 prefer_punctuation_break=False,  # 不依赖标点
@@ -121,6 +131,23 @@ class FastWorker:
                 merge_short_sentences=True
             )
         self.draft_splitter = SentenceSplitter(draft_split_config)
+
+        # V3.9: 中文专用分句器（优先标点断句）
+        chinese_split_config = SplitConfig(
+            language="zh",
+            prefer_punctuation_break=True,       # 优先在标点处断句
+            delay_split_to_punctuation=True,     # 延迟到标点切分
+            delay_split_max_wait=8.0,            # 等待标点的最大时长（秒）
+            use_dynamic_pause=True,
+            pause_threshold=0.3,                 # 降低停顿阈值
+            max_duration=12.0,                   # 中文句子可以更长
+            enable_hard_limit=True,
+            hard_limit_duration=20.0,            # 硬上限提高到20秒（避免VAD合并导致的强制切分）
+            merge_short_sentences=True,
+            min_duration_threshold=1.5           # 短句合并阈值
+        )
+        self.chinese_splitter = SentenceSplitter(chinese_split_config)
+        self.logger.debug("中文专用分句器已初始化")
 
         # 初始化快流语义分组器（主要依赖物理约束）
         if draft_group_config is None:
@@ -178,6 +205,20 @@ class FastWorker:
         # 极速模式下 is_draft=False，表示这是定稿
         is_draft = not self.is_final_output
         sentences = self._split_sentences(sv_result, chunk, is_draft=is_draft)
+
+        # V3.9.1: 跨 chunk 合并（仅在启用时）
+        if self.enable_cross_chunk_merge and sentences:
+            # 如果有缓存的句子，与第一句合并
+            if self.pending_sentence:
+                sentences[0] = self._merge_sentences(self.pending_sentence, sentences[0])
+                self.pending_sentence = None
+
+            # 检查最后一句是否语义完整
+            if self._is_sentence_incomplete(sentences[-1]):
+                # 缓存最后一句，不推送
+                self.pending_sentence = sentences[-1]
+                sentences = sentences[:-1]
+                self.logger.debug(f"[跨chunk] 缓存最后一句，等待下一个chunk")
 
         # 阶段 3: 推送
         if self.is_final_output:
@@ -262,6 +303,20 @@ class FastWorker:
 
         # 阶段 3: 分句（Layer 1 + Layer 2）
         draft_sentences = self._split_sentences(sv_result, chunk, is_draft=True)
+
+        # V3.9.1: 跨 chunk 合并（仅在启用时）
+        if self.enable_cross_chunk_merge and draft_sentences:
+            # 如果有缓存的句子，与第一句合并
+            if self.pending_sentence:
+                draft_sentences[0] = self._merge_sentences(self.pending_sentence, draft_sentences[0])
+                self.pending_sentence = None
+
+            # 检查最后一句是否语义完整
+            if self._is_sentence_incomplete(draft_sentences[-1]):
+                # 缓存最后一句，不推送
+                self.pending_sentence = draft_sentences[-1]
+                draft_sentences = draft_sentences[:-1]
+                self.logger.debug(f"[跨chunk] 缓存最后一句，等待下一个chunk")
 
         # 阶段 4: 立即推送草稿（关键：不等待 Whisper）
         self.subtitle_manager.add_draft_sentences(ctx.chunk_index, draft_sentences)
@@ -349,9 +404,17 @@ class FastWorker:
                 self.logger.warning("SenseVoice 结果没有字级时间戳且无文本，无法分句")
                 return []
 
-        # Layer 1: 分句（使用 draft_splitter，主要依赖 VAD 停顿）
-        sentences = self.draft_splitter.split(words, text_clean)
-        self.logger.debug(f"快流分句: {len(sentences)} 个句子（依赖 VAD 停顿）")
+        # V3.9: 根据语言选择分句器
+        detected_language = sv_result.get('language', 'auto')
+        is_chinese = detected_language in {'zh', 'yue'}
+
+        # Layer 1: 分句（根据语言选择分句器）
+        if is_chinese:
+            sentences = self.chinese_splitter.split(words, text_clean)
+            self.logger.warning(f"[分句器选择] 中文模式: {len(sentences)} 个句子, language={detected_language}")
+        else:
+            sentences = self.draft_splitter.split(words, text_clean)
+            self.logger.warning(f"[分句器选择] 默认模式: {len(sentences)} 个句子, language={detected_language}")
 
         # Layer 2: 语义分组（如果启用）
         if self.enable_semantic_grouping:
@@ -374,3 +437,75 @@ class FastWorker:
         self.logger.debug(f"快流分句完成: {len(sentences)} 个句子")
 
         return sentences
+
+    def _is_sentence_incomplete(self, sentence: SentenceSegment) -> bool:
+        """
+        检查句子是否语义不完整（V3.9.1）
+
+        使用中文分句器的语义完整性检查逻辑。
+
+        Args:
+            sentence: 句子对象
+
+        Returns:
+            bool: True 表示语义不完整，False 表示完整
+        """
+        if not sentence or not sentence.text:
+            return False
+
+        # 使用中文分句器的 strategy 进行语义检查
+        strategy = self.chinese_splitter.config.get_strategy()
+        is_incomplete = strategy.is_incomplete_ending(sentence.text)
+
+        if is_incomplete:
+            self.logger.debug(f"[跨chunk检查] 句子语义不完整: '{sentence.text[-20:]}'")
+
+        return is_incomplete
+
+    def _merge_sentences(self, sent1: SentenceSegment, sent2: SentenceSegment) -> SentenceSegment:
+        """
+        合并两个句子（V3.9.1）
+
+        用于跨 chunk 合并：将上一个 chunk 的最后一句与当前 chunk 的第一句合并。
+
+        Args:
+            sent1: 第一个句子（上一个 chunk 的最后一句）
+            sent2: 第二个句子（当前 chunk 的第一句）
+
+        Returns:
+            SentenceSegment: 合并后的句子
+        """
+        # 合并文本
+        merged_text = sent1.text + sent2.text
+
+        # 合并时间戳（使用 sent1 的 start，sent2 的 end）
+        merged_start = sent1.start
+        merged_end = sent2.end
+
+        # 合并 words 列表
+        merged_words = sent1.words + sent2.words
+
+        # 计算平均置信度
+        avg_confidence = (sent1.confidence + sent2.confidence) / 2
+
+        # 创建合并后的句子对象
+        merged_sentence = SentenceSegment(
+            index=sent1.index,  # 保留第一个句子的索引
+            start=merged_start,
+            end=merged_end,
+            text=merged_text,
+            words=merged_words,
+            confidence=avg_confidence,
+            is_draft=sent1.is_draft,
+            is_finalized=sent1.is_finalized,
+            source=sent1.source,
+            warning_type=sent1.warning_type or sent2.warning_type  # 保留任一警告
+        )
+
+        self.logger.debug(
+            f"[跨chunk合并] 合并句子: "
+            f"'{sent1.text[-15:]}' + '{sent2.text[:15]}' -> "
+            f"'{merged_text[-30:]}'"
+        )
+
+        return merged_sentence
