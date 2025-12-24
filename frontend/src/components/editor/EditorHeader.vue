@@ -2,11 +2,13 @@
   <header class="editor-header">
     <!-- 左侧：返回 + 任务信息堆叠 -->
     <div class="header-left">
-      <router-link to="/tasks" class="nav-back" title="返回任务列表">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
-        </svg>
-      </router-link>
+      <el-tooltip content="返回任务列表" placement="bottom" :show-after="500">
+        <router-link to="/tasks" class="nav-back">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
+          </svg>
+        </router-link>
+      </el-tooltip>
 
       <div class="divider-vertical"></div>
 
@@ -22,12 +24,17 @@
             @keydown.enter="finishEditTitle"
             @keydown.escape="cancelEditTitle"
           />
-          <h1
+          <el-tooltip
             v-else
-            class="task-name"
-            :title="taskName + ' (双击重命名)'"
-            @dblclick="startEditTitle"
-          >{{ taskName }}</h1>
+            :content="taskName + ' (双击重命名)'"
+            placement="bottom"
+            :show-after="500"
+          >
+            <h1
+              class="task-name"
+              @dblclick="startEditTitle"
+            >{{ taskName }}</h1>
+          </el-tooltip>
         </div>
         <div class="task-meta">
           <span class="status-dot" :class="statusClass"></span>
@@ -130,11 +137,13 @@
       >
         <template #reference>
           <div class="monitor-trigger">
-            <button class="icon-btn" title="任务监控">
-              <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M20 19V8H4v11h16m0-14a2 2 0 012 2v12a2 2 0 01-2 2H4a2 2 0 01-2-2V7a2 2 0 012-2h16M6 10h2v6H6v-6m4-1h2v7h-2V9m4 4h2v3h-2v-3z"/>
-              </svg>
-            </button>
+            <el-tooltip content="任务监控" placement="bottom" :show-after="500">
+              <button class="icon-btn">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M20 19V8H4v11h16m0-14a2 2 0 012 2v12a2 2 0 01-2 2H4a2 2 0 01-2-2V7a2 2 0 012-2h16M6 10h2v6H6v-6m4-1h2v7h-2V9m4 4h2v3h-2v-3z"/>
+                </svg>
+              </button>
+            </el-tooltip>
             <span v-if="activeTasks > 0" class="badge">{{ activeTasks }}</span>
           </div>
         </template>
@@ -795,4 +804,43 @@ $header-h: 56px;
     border-color: var(--border-default) !important;
   }
 }
+
+// 导出下拉菜单样式 - 与任务监控配色一致
+.el-dropdown__popper.el-popper {
+  background: var(--bg-secondary) !important;
+  border: 1px solid var(--border-default) !important;
+  border-radius: 6px !important;
+  box-shadow: var(--shadow-lg) !important;
+  padding: 4px 0 !important;
+
+  .el-popper__arrow::before {
+    background: var(--bg-secondary) !important;
+    border-color: var(--border-default) !important;
+  }
+
+  .el-dropdown-menu {
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+
+    .el-dropdown-menu__item {
+      padding: 8px 16px !important;
+      font-size: 13px !important;
+      color: var(--text-primary) !important;
+      background: transparent !important;
+      transition: all 0.2s !important;
+
+      &:hover {
+        background: rgba(255, 255, 255, 0.03) !important;
+        color: var(--text-primary) !important;
+      }
+
+      &:focus {
+        background: rgba(255, 255, 255, 0.03) !important;
+        color: var(--text-primary) !important;
+      }
+    }
+  }
+}
 </style>
+

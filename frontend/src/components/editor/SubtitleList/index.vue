@@ -28,11 +28,13 @@
       </div>
 
       <div class="toolbar-right">
-        <button class="toolbar-btn" @click="addNewSubtitle" title="添加字幕">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
-          </svg>
-        </button>
+        <el-tooltip content="添加字幕" placement="bottom" :show-after="500">
+          <button class="toolbar-btn" @click="addNewSubtitle">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+            </svg>
+          </button>
+        </el-tooltip>
       </div>
     </div>
 
@@ -127,10 +129,8 @@ function updateText(id, text) {
 }
 
 function deleteSubtitle(id) {
-  if (confirm('确定删除这条字幕吗?')) {
-    projectStore.removeSubtitle(id)
-    emit('subtitle-delete', id)
-  }
+  projectStore.removeSubtitle(id)
+  emit('subtitle-delete', id)
 }
 
 function addNewSubtitle() {

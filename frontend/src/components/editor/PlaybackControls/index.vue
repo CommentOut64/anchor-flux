@@ -4,28 +4,34 @@
     <!-- 主控制区 -->
     <div class="controls-main">
       <!-- 快退 -->
-      <button class="ctrl-btn" :disabled="!isVideoReady" @click="seek(-seekStep)" title="快退5秒">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"/>
-        </svg>
-      </button>
+      <el-tooltip content="快退5秒" placement="top" :show-after="500">
+        <button class="ctrl-btn" :disabled="!isVideoReady" @click="seek(-seekStep)">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"/>
+          </svg>
+        </button>
+      </el-tooltip>
 
       <!-- 播放/暂停 -->
-      <button class="ctrl-btn ctrl-btn--play" :disabled="!isVideoReady" @click="togglePlay" :title="isPlaying ? '暂停' : '播放'">
-        <svg v-if="!isPlaying" viewBox="0 0 24 24" fill="currentColor">
-          <path d="M8 5v14l11-7z"/>
-        </svg>
-        <svg v-else viewBox="0 0 24 24" fill="currentColor">
-          <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
-        </svg>
-      </button>
+      <el-tooltip :content="isPlaying ? '暂停' : '播放'" placement="top" :show-after="500">
+        <button class="ctrl-btn ctrl-btn--play" :disabled="!isVideoReady" @click="togglePlay">
+          <svg v-if="!isPlaying" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M8 5v14l11-7z"/>
+          </svg>
+          <svg v-else viewBox="0 0 24 24" fill="currentColor">
+            <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+          </svg>
+        </button>
+      </el-tooltip>
 
       <!-- 快进 -->
-      <button class="ctrl-btn" :disabled="!isVideoReady" @click="seek(seekStep)" title="快进5秒">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"/>
-        </svg>
-      </button>
+      <el-tooltip content="快进5秒" placement="top" :show-after="500">
+        <button class="ctrl-btn" :disabled="!isVideoReady" @click="seek(seekStep)">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"/>
+          </svg>
+        </button>
+      </el-tooltip>
     </div>
 
     <!-- 进度条区域 -->
@@ -47,10 +53,11 @@
     <div class="controls-extra">
       <!-- 音量控制 -->
       <div class="volume-control" v-if="showVolume">
-        <button class="ctrl-btn ctrl-btn--sm" @click="toggleMute" :title="isMuted ? '取消静音' : '静音'">
-          <svg v-if="isMuted || volume === 0" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
-          </svg>
+        <el-tooltip :content="isMuted ? '取消静音' : '静音'" placement="top" :show-after="500">
+          <button class="ctrl-btn ctrl-btn--sm" @click="toggleMute">
+            <svg v-if="isMuted || volume === 0" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
+            </svg>
           <svg v-else-if="volume < 0.5" viewBox="0 0 24 24" fill="currentColor">
             <path d="M18.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM5 9v6h4l5 5V4L9 9H5z"/>
           </svg>
@@ -58,6 +65,7 @@
             <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
           </svg>
         </button>
+        </el-tooltip>
         <div class="volume-slider" @click.stop>
           <input
             type="range"
@@ -89,17 +97,17 @@
       </div>
 
       <!-- 循环播放 -->
-      <button
-        v-if="showLoop"
-        class="ctrl-btn ctrl-btn--sm"
-        :class="{ active: isLooping }"
-        @click="toggleLoop"
-        title="循环播放"
-      >
-        <svg viewBox="0 0 24 24" fill="currentColor">
+      <el-tooltip v-if="showLoop" content="循环播放" placement="top" :show-after="500">
+        <button
+          class="ctrl-btn ctrl-btn--sm"
+          :class="{ active: isLooping }"
+          @click="toggleLoop"
+        >
+          <svg viewBox="0 0 24 24" fill="currentColor">
           <path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/>
         </svg>
       </button>
+      </el-tooltip>
     </div>
   </div>
 </template>
