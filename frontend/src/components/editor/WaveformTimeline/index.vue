@@ -1288,10 +1288,10 @@ function formatTime(seconds) {
 // 监听字幕变化
 // V3.7.3: 修复 watch 监听失效问题 - 同时监听数组长度确保 splice 操作也能触发
 watch(
-  () => [projectStore.subtitles.length, ...projectStore.subtitles],
+  () => projectStore.subtitles,
   (newVal, oldVal) => {
-    const lengthChanged = !oldVal || newVal[0] !== oldVal[0];
-    console.log(`[WaveformTimeline] subtitles watch 触发: length=${newVal[0]}, lengthChanged=${lengthChanged}, isReady=${isReady.value}, isUpdating=${isUpdatingRegions.value}`);
+    const lengthChanged = !oldVal || newVal.length !== oldVal.length;
+    console.log(`[WaveformTimeline] subtitles watch 触发: length=${newVal.length}, lengthChanged=${lengthChanged}, isReady=${isReady.value}, isUpdating=${isUpdatingRegions.value}`);
 
     if (isReady.value && !isUpdatingRegions.value) {
       clearTimeout(regionUpdateTimer);

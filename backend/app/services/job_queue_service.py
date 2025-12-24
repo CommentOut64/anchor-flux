@@ -1559,17 +1559,16 @@ class JobQueueService:
             if running_id:
                 job = self._load_job_for_recovery(running_id)
                 if job:
-                    # 自动恢复：设为 queued 状态，放队列头部继续执行
-                    job.status = "queued"
-                    job.paused = False
-                    job.message = "程序重启，任务自动恢复"
+                    # 系统重启后强制暂停，需要用户手动恢复
+                    job.status = "paused"
+                    job.paused = True
+                    job.message = "程序重启，任务已暂停，请手动恢复"
                     self.jobs[running_id] = job
-                    self.queue.appendleft(running_id)  # 放队头
                     # 同步到 transcription_service.jobs（确保 SSE 路由能找到任务）
                     self.transcription_service.jobs[running_id] = job
                     # 更新 job_meta.json 中的状态
                     self.transcription_service.save_job_meta(job)
-                    logger.info(f"恢复中断任务到队头（自动继续）: {running_id}")
+                    logger.info(f"恢复中断任务为暂停状态（需手动恢复）: {running_id}")
 
             # 2. 恢复队列中的任务
             for job_id in state.get("queue", []):
@@ -1579,32 +1578,32 @@ class JobQueueService:
 
                 job = self._load_job_for_recovery(job_id)
                 if job:
-                    job.status = "queued"
-                    job.paused = False
-                    job.message = f"排队中 (位置: {len(self.queue) + 1})"
+                    # 系统重启后强制暂停，需要用户手动恢复
+                    job.status = "paused"
+                    job.paused = True
+                    job.message = "程序重启，任务已暂停，请手动恢复"
                     self.jobs[job_id] = job
-                    self.queue.append(job_id)
                     # 同步到 transcription_service.jobs（确保 SSE 路由能找到任务）
                     self.transcription_service.jobs[job_id] = job
                     # 更新 job_meta.json 中的状态
                     self.transcription_service.save_job_meta(job)
-                    logger.info(f"恢复排队任务: {job_id}")
+                    logger.info(f"恢复排队任务为暂停状态（需手动恢复）: {job_id}")
 
             # 3. 恢复 interrupted 任务（被强制中断的任务）
             interrupted_id = state.get("interrupted")
             if interrupted_id and interrupted_id not in self.jobs:
                 job = self._load_job_for_recovery(interrupted_id)
                 if job:
-                    job.status = "queued"
-                    job.paused = False
-                    job.message = "程序重启，被中断任务自动恢复"
+                    # 系统重启后强制暂停，需要用户手动恢复
+                    job.status = "paused"
+                    job.paused = True
+                    job.message = "程序重启，被中断任务已暂停，请手动恢复"
                     self.jobs[interrupted_id] = job
-                    self.queue.append(interrupted_id)
                     # 同步到 transcription_service.jobs（确保 SSE 路由能找到任务）
                     self.transcription_service.jobs[interrupted_id] = job
                     # 更新 job_meta.json 中的状态
                     self.transcription_service.save_job_meta(job)
-                    logger.info(f"恢复被中断任务到队列: {interrupted_id}")
+                    logger.info(f"恢复被中断任务为暂停状态（需手动恢复）: {interrupted_id}")
 
             # 4. 恢复暂停的任务（保持暂停状态）
             for job_id in state.get("paused", []):

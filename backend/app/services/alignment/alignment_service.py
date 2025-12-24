@@ -19,6 +19,7 @@ from app.models.confidence_models import (
     ConfidenceLevel
 )
 from app.models.sensevoice_models import WordTimestamp
+from app.utils.text_utils import smart_join_words
 
 
 @dataclass
@@ -546,7 +547,7 @@ class AlignmentService:
             start=aligned_words[0].start,
             end=aligned_words[-1].end,
             words=aligned_words,
-            sv_text=" ".join([t.word for t in sv_tokens]),
+            sv_text=smart_join_words(sv_tokens),
             whisper_text=whisper_text,
             vad_start=vad_range[0],
             vad_end=vad_range[1],

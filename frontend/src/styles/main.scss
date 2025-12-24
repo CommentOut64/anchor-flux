@@ -30,6 +30,10 @@ body {
   color: var(--text-normal);
   line-height: 1.5;
   min-height: 100vh;
+  user-select: none; // 全局禁止文字选中
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
 }
 
 // ==============================================
@@ -77,6 +81,10 @@ select {
   font-family: inherit;
   font-size: inherit;
   outline: none;
+  user-select: text; // 恢复可编辑元素的文字选择
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  -ms-user-select: text;
 }
 
 // ==============================================

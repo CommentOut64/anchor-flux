@@ -3,7 +3,7 @@
     <!-- 顶部导航栏 -->
     <header class="task-header">
       <div class="header-left">
-        <h1 class="app-title">
+        <h1 class="app-title" @click="showAboutDialog = true">
           <svg class="app-icon" viewBox="0 0 24 24" fill="currentColor">
             <path
               d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zM5 10h9v2H5zm0-3h9v2H5zm0 6h6v2H5z"
@@ -327,6 +327,9 @@
         </div>
       </template>
     </el-dialog>
+
+    <!-- 关于对话框 -->
+    <AboutDialog v-model="showAboutDialog" />
   </div>
 </template>
 
@@ -349,12 +352,14 @@ import { transcriptionApi, systemApi } from "@/services/api";
 import fileApi from "@/services/api/fileApi"; // 导入文件 API
 // V3.7.5: 移除 sseChannelManager 导入，SSE 订阅由 App.vue 统一管理
 import PresetSelector from "@/components/editor/PresetSelector.vue"; // v3.5 预设选择器
+import AboutDialog from "@/components/AboutDialog.vue"; // 关于对话框
 
 const router = useRouter();
 const taskStore = useUnifiedTaskStore();
 
 // 响应式数据 - 上传相关
 const showUploadDialog = ref(false);
+const showAboutDialog = ref(false);
 const uploadMode = ref("upload"); // 上传模式：'upload' 或 'select'
 const uploading = ref(false);
 const uploadRef = ref(null);
@@ -1095,6 +1100,12 @@ async function handleExit() {
     align-items: center;
     gap: 8px;
     margin: 0;
+    cursor: pointer;
+    transition: color 0.2s;
+
+    &:hover {
+      color: var(--primary);
+    }
   }
 
   .app-icon {

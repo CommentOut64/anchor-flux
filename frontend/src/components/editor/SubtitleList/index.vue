@@ -288,6 +288,7 @@ watch(currentSubtitleId, (id) => {
   flex: 1;
   overflow-y: auto;
   padding: 6px;
+  position: relative;
 
   &::-webkit-scrollbar {
     width: 6px;
@@ -565,19 +566,25 @@ watch(currentSubtitleId, (id) => {
 }
 
 // 字幕切分动画
-.subtitle-list-move,
+.subtitle-list-move {
+  transition: transform 0.3s ease;
+}
+
 .subtitle-list-enter-active,
 .subtitle-list-leave-active {
-  transition: all 0.3s ease;
+  transition: all 0.2s ease;
 }
 
-.subtitle-list-enter-from {
-  opacity: 0;
-  transform: translateY(-20px);
-}
-
+.subtitle-list-enter-from,
 .subtitle-list-leave-to {
   opacity: 0;
-  transform: scale(0.95);
+  transform: scaleY(0.3);
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.subtitle-list-leave-active {
+  position: absolute;
+  width: calc(100% - 32px);
 }
 </style>
