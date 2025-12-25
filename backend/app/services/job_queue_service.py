@@ -486,13 +486,16 @@ class JobQueueService:
 
                     if use_dual_alignment:
                         # 双流对齐流水线 (V3.0+ 新架构)
-                        # 触发条件: transcription_profile 为 sv_whisper_patch 或 sv_whisper_dual
+                        # V3.8.1: 所有 SenseVoice 模式都走新架构
                         logger.info(f"使用双流对齐流水线 (profile={transcription_profile}, preset={preset_id})")
                         _run_async_safely(self._run_dual_alignment_pipeline(job, preset_id))
                     elif engine == 'sensevoice':
-                        # SenseVoice 流水线（旧架构，仅 default 预设）
-                        logger.info(f"使用 SenseVoice 流水线 (极速模式)")
-                        _run_async_safely(self.transcription_service._process_video_sensevoice(job))
+                        # V3.8.1: 旧架构已废弃，所有 SenseVoice 模式都应该走新架构
+                        logger.error(f"错误：SenseVoice 任务未走新架构！profile={transcription_profile}")
+                        logger.error(f"这是一个配置错误，请检查 ConfigAdapter.needs_dual_alignment() 方法")
+                        raise RuntimeError(f"SenseVoice 任务路由错误：{transcription_profile} 应该走新架构")
+                        # 旧代码（已废弃）：
+                        # _run_async_safely(self.transcription_service._process_video_sensevoice(job))
                     else:
                         # 新架构 Pipeline 流水线（2025-12-17 架构改造）
                         # 使用 AudioProcessingPipeline + AsyncDualPipeline
@@ -675,9 +678,32 @@ class JobQueueService:
 
             logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
 
-            # 创建预处理流水线（V3.7: 传递取消令牌）
+            # V3.8.1: 根据语言选择VAD配置（迁移自旧架构）
+            from app.services.audio.vad_service import VADConfig
+            language = getattr(job.settings, 'language', 'auto')
+            is_english = language in {'en', 'english'}
+
+            if is_english:
+                # Whisper模式：合并VAD，避免幻觉
+                vad_config = VADConfig(
+                    merge_max_gap=1.0,
+                    merge_max_duration=12.0,
+                    smart_target_duration=12.0
+                )
+                logger.info(f"VAD配置: Whisper模式（合并），language={language}")
+            else:
+                # SenseVoice模式：保留停顿信息，获得更自然的断句
+                vad_config = VADConfig(
+                    merge_max_gap=0.3,
+                    merge_max_duration=8.0,
+                    smart_target_duration=8.0
+                )
+                logger.info(f"VAD配置: SenseVoice模式（保留停顿），language={language}")
+
+            # 创建预处理流水线（V3.7: 传递取消令牌，V3.8.1: 传递VAD配置）
             preprocessing_pipeline = PreprocessingPipeline(
                 config=job.settings.preprocessing,
+                vad_config=vad_config,  # V3.8.1: 新增
                 logger=logger,
                 cancellation_token=cancellation_token  # V3.7
             )

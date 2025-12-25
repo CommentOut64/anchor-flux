@@ -11,6 +11,10 @@ SlowWorker - 慢流推理 Worker（GPU）
 - 精度优先（~2秒/Chunk）
 - Prompt 策略：关键词提取，避免完整句子
 - 幻觉防御：内置检测逻辑，自动回退到 SenseVoice
+
+V3.10 更新：
+- 智能补刀模式：根据 SenseVoice 置信度决定是否跳过 Whisper
+- 混合 Prompt 策略：关键词提取 + SenseVoice 语义线索
 """
 import copy
 import logging
@@ -20,6 +24,7 @@ from app.schemas.pipeline_context import ProcessingContext
 from app.services.audio.chunk_engine import AudioChunk
 from app.services.inference.whisper_executor import WhisperExecutor
 from app.utils.prompt_builder import get_prompt_builder
+from app.core.thresholds import needs_whisper_patch, ThresholdConfig
 
 
 class SlowWorker:
@@ -30,6 +35,9 @@ class SlowWorker:
     1. 构建安全的 Whisper Prompt
     2. Whisper 推理（GPU CUDA）
     3. 幻觉检测与防御
+
+    V3.10 更新：
+    - 智能补刀模式：根据 SenseVoice 置信度决定是否跳过 Whisper
     """
 
     def __init__(
@@ -37,6 +45,9 @@ class SlowWorker:
         whisper_language: str = "auto",
         user_glossary: Optional[list] = None,
         whisper_executor: Optional[WhisperExecutor] = None,
+        # V3.10: 智能补刀参数
+        is_patching_mode: bool = False,
+        patching_threshold: Optional[ThresholdConfig] = None,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -46,11 +57,23 @@ class SlowWorker:
             whisper_language: Whisper 语言设置
             user_glossary: 用户词表
             whisper_executor: Whisper 执行器
+            is_patching_mode: 是否为智能补刀模式（True 时根据 SenseVoice 质量跳过 Whisper）
+            patching_threshold: 补刀阈值配置
             logger: 日志记录器
         """
         self.whisper_language = whisper_language
         self.user_glossary = user_glossary
         self.logger = logger or logging.getLogger(__name__)
+
+        # V3.10: 智能补刀配置
+        self.is_patching_mode = is_patching_mode
+        self.patching_threshold = patching_threshold or ThresholdConfig()
+
+        if is_patching_mode:
+            self.logger.info(
+                f"SlowWorker 运行在智能补刀模式: "
+                f"confidence_threshold={self.patching_threshold.whisper_patch_trigger_confidence}"
+            )
 
         # 初始化执行器
         self.whisper_executor = whisper_executor or WhisperExecutor()
@@ -63,19 +86,34 @@ class SlowWorker:
         处理单个 Chunk（慢流）
 
         流程：
-        1. 构建安全的 Whisper Prompt
-        2. Whisper 推理（带 Audio Overlap）
-        3. 幻觉检测
-        4. 填充 ctx.whisper_result
+        1. 【V3.10 智能补刀】检查是否需要跳过 Whisper
+        2. 构建安全的 Whisper Prompt（混合策略）
+        3. Whisper 推理（带 Audio Overlap）
+        4. 幻觉检测
+        5. 填充 ctx.whisper_result
 
         Args:
             ctx: 处理上下文
         """
         chunk = ctx.audio_chunk
+        sv_result = ctx.sv_result
 
-        # 阶段 1: 构建安全 Prompt（关键词提取策略）
+        # V3.10: 智能补刀模式 - 检查是否需要跳过 Whisper
+        if self.is_patching_mode and sv_result:
+            if not self._needs_whisper_patch(sv_result, chunk):
+                # SenseVoice 质量足够高，跳过 Whisper
+                ctx.whisper_skipped = True
+                ctx.whisper_result = {}  # 空结果
+                self.logger.info(
+                    f"Chunk {ctx.chunk_index}: SenseVoice 质量足够，跳过 Whisper "
+                    f"(confidence={sv_result.get('confidence', 0):.2f})"
+                )
+                return
+
+        # 阶段 1: 构建安全 Prompt（V3.10 混合策略：关键词 + SenseVoice 语义线索）
         self.logger.debug(f"Chunk {ctx.chunk_index}: 构建 Whisper Prompt")
-        prompt = self._build_safe_prompt()
+        sv_context = sv_result.get('text_clean', '') if sv_result else None
+        prompt = self._build_safe_prompt(sv_context=sv_context)
 
         # 阶段 2: Whisper 推理（带 Audio Overlap）
         self.logger.debug(f"Chunk {ctx.chunk_index}: Whisper 慢流推理（带 Audio Overlap）")
@@ -92,32 +130,81 @@ class SlowWorker:
 
         # V3.8 修复竞态条件：深拷贝 whisper_result，避免下游修改影响其他协程
         ctx.whisper_result = copy.deepcopy(whisper_result)
+        ctx.whisper_skipped = False  # 明确标记未跳过
 
         self.logger.info(
             f"Chunk {ctx.chunk_index}: Whisper 推理完成 "
             f"(text_length={len(whisper_result.get('text', ''))})"
         )
 
-    def _build_safe_prompt(self) -> str:
+    def _needs_whisper_patch(self, sv_result: Dict[str, Any], chunk: AudioChunk) -> bool:
         """
-        构建安全的 Whisper Prompt（关键词提取策略）
+        V3.10: 判断是否需要 Whisper 补刀
+
+        基于 SenseVoice 的输出质量判断，调用 thresholds.needs_whisper_patch()
+
+        Args:
+            sv_result: SenseVoice 推理结果
+            chunk: AudioChunk
+
+        Returns:
+            bool: True 表示需要补刀，False 表示可以跳过
+        """
+        confidence = sv_result.get('confidence', 0.0)
+        text_clean = sv_result.get('text_clean', '')
+        words = sv_result.get('words', [])
+        duration = chunk.duration
+
+        # 调用 thresholds 模块的判断函数
+        return needs_whisper_patch(
+            confidence=confidence,
+            duration=duration,
+            text_length=len(text_clean),
+            words=words,
+            config=self.patching_threshold
+        )
+
+    def _build_safe_prompt(self, sv_context: Optional[str] = None) -> str:
+        """
+        构建安全的 Whisper Prompt（V3.10 混合策略）
 
         新策略：
         1. 从上一个 Chunk 的定稿文本中提取关键词（专有名词）
         2. 添加用户词表
-        3. 构建 "Glossary: word1, word2, ..." 格式的 prompt
-        4. 避免使用完整句子，防止 Whisper 误判
+        3. 【V3.10】添加 SenseVoice 语义线索（取最后 50 字符）
+        4. 构建混合格式的 prompt
+        5. 避免使用完整句子，防止 Whisper 误判
+
+        Args:
+            sv_context: SenseVoice 当前 Chunk 的输出文本（用于语义线索）
 
         Returns:
             str: Whisper Prompt
         """
         prompt_builder = get_prompt_builder()
 
-        # 构建安全的 Prompt
-        prompt = prompt_builder.build_prompt(
+        # 构建基础 Prompt（关键词提取）
+        base_prompt = prompt_builder.build_prompt(
             previous_text=self.previous_whisper_text,
             user_glossary=self.user_glossary
         )
+
+        # V3.10: 添加 SenseVoice 语义线索
+        # 当 Chunk 被跳过时，上下文可能断裂，使用 SenseVoice 输出作为补充
+        if sv_context:
+            # 取最后 50 字符作为语义提示，避免 Whisper 照抄完整句子
+            semantic_hint = sv_context[-50:] if len(sv_context) > 50 else sv_context
+            # 清理语义提示（去除开头的不完整词）
+            semantic_hint = semantic_hint.lstrip()
+
+            if base_prompt:
+                # 混合格式：Context + Glossary
+                prompt = f"Context: {semantic_hint}. {base_prompt}"
+            else:
+                # 只有语义线索
+                prompt = f"Context: {semantic_hint}."
+        else:
+            prompt = base_prompt
 
         return prompt
 

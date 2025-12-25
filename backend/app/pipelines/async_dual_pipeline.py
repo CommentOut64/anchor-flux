@@ -97,11 +97,15 @@ class AsyncDualPipeline:
 
         # 判断是否为纯 SenseVoice 模式
         self.is_sensevoice_only = (transcription_profile == "sensevoice_only")
+        # V3.10: 判断是否为智能补刀模式
+        self.is_patching_mode = (transcription_profile == "sv_whisper_patch")
 
         if self.is_sensevoice_only:
             self.logger.info("极速模式: 纯 SenseVoice 流水线，跳过 Whisper")
+        elif self.is_patching_mode:
+            self.logger.info("智能补刀模式: 根据 SenseVoice 质量决定是否调用 Whisper")
         else:
-            self.logger.info(f"转录模式: {transcription_profile}")
+            self.logger.info(f"双流精校模式: 全量 Whisper 转录")
 
         # 创建队列（带背压）
         self.queue_inter = asyncio.Queue(maxsize=queue_maxsize)  # FastWorker -> SlowWorker
@@ -122,9 +126,11 @@ class AsyncDualPipeline:
             self.slow_worker = None
             self.alignment_worker = None
         else:
+            # V3.10: 智能补刀模式下设置 is_patching_mode=True
             self.slow_worker = SlowWorker(
                 whisper_language=whisper_language,
                 user_glossary=user_glossary,
+                is_patching_mode=self.is_patching_mode,  # V3.10: 智能补刀模式
                 logger=self.logger
             )
 

@@ -118,15 +118,38 @@ class AlignmentWorker:
         处理单个 Chunk（对齐层）
 
         流程：
-        1. 双流对齐（三级降级）
-        2. 分句 + 语义分组
-        3. 推送定稿
-        4. 填充 ctx.final_sentences
+        1. 【V3.10】快速路径：Whisper 跳过时直接使用 SenseVoice
+        2. 双流对齐（三级降级）
+        3. 分句 + 语义分组
+        4. 推送定稿
+        5. 填充 ctx.final_sentences
 
         Args:
             ctx: 处理上下文
         """
         chunk = ctx.audio_chunk
+
+        # V3.10: 快速路径 - SlowWorker 跳过时直接使用 SenseVoice
+        if ctx.whisper_skipped:
+            self.logger.info(f"Chunk {ctx.chunk_index}: Whisper 跳过，直接使用 SenseVoice 定稿")
+            final_sentences = self._split_sentences_from_sv(ctx.sv_result, chunk)
+
+            # 设置为定稿状态
+            for sentence in final_sentences:
+                sentence.is_finalized = True
+                sentence.is_draft = False
+
+            ctx.final_sentences = final_sentences
+
+            # 推送定稿
+            sentences_for_manager = copy.deepcopy(final_sentences)
+            self.subtitle_manager.replace_chunk(ctx.chunk_index, sentences_for_manager)
+
+            self.logger.debug(
+                f"Chunk {ctx.chunk_index}: SenseVoice 定稿已推送 "
+                f"({len(final_sentences)} 个句子) [智能补刀-跳过]"
+            )
+            return
 
         # 阶段 1: 双流对齐（三级降级策略）
         self.logger.debug(f"Chunk {ctx.chunk_index}: 双流对齐")

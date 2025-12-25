@@ -488,12 +488,11 @@ class FastWorker:
         # 计算平均置信度
         avg_confidence = (sent1.confidence + sent2.confidence) / 2
 
-        # 创建合并后的句子对象
+        # 创建合并后的句子对象（V3.8.1: 移除不存在的index参数）
         merged_sentence = SentenceSegment(
-            index=sent1.index,  # 保留第一个句子的索引
+            text=merged_text,
             start=merged_start,
             end=merged_end,
-            text=merged_text,
             words=merged_words,
             confidence=avg_confidence,
             is_draft=sent1.is_draft,
