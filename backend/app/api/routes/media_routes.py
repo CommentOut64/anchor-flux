@@ -22,6 +22,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.core.config import config
+from app.utils.ass_converter import ASSConverter
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +181,7 @@ async def _get_video_duration(video_path: Path) -> float:
 
     # 检查视频文件是否存在
     if not video_path.exists():
-        print(f"[media] 视频文件不存在: {video_path}")
+        logger.debug(f"[media] 视频文件不存在: {video_path}")
         return 0.0
 
     cmd = [
@@ -189,8 +190,8 @@ async def _get_video_duration(video_path: Path) -> float:
         '-of', 'default=noprint_wrappers=1:nokey=1',
         str(video_path)
     ]
-    
-    print(f"[media] FFprobe 命令: {' '.join(cmd)}")
+
+    logger.debug(f"[media] FFprobe 命令: {' '.join(cmd)}")
 
     try:
         # 使用同步 subprocess 来避免异步事件循环问题
@@ -201,23 +202,23 @@ async def _get_video_duration(video_path: Path) -> float:
             timeout=30,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
-        
+
         if result.returncode != 0:
-            print(f"[media] FFprobe 失败 (返回码 {result.returncode}): {result.stderr}")
+            logger.debug(f"[media] FFprobe 失败 (返回码 {result.returncode}): {result.stderr}")
             return 0.0
-            
+
         duration_str = result.stdout.strip()
         if not duration_str:
-            print(f"[media] FFprobe 返回空时长，视频路径: {video_path}")
+            logger.debug(f"[media] FFprobe 返回空时长，视频路径: {video_path}")
             return 0.0
 
         logger.debug(f"FFprobe 成功获取时长: {duration_str}秒")
         return float(duration_str)
     except subprocess.TimeoutExpired:
-        print(f"[media] FFprobe 超时，视频路径: {video_path}")
+        logger.debug(f"[media] FFprobe 超时，视频路径: {video_path}")
         return 0.0
     except Exception as e:
-        print(f"[media] 获取视频时长异常: {e}, 路径: {video_path}")
+        logger.debug(f"[media] 获取视频时长异常: {e}, 路径: {video_path}")
         return 0.0
 
 
@@ -1540,6 +1541,144 @@ async def save_srt_content(job_id: str, request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"保存SRT文件失败: {str(e)}")
+
+
+@router.get("/{job_id}/ass")
+async def get_ass_content(job_id: str):
+    """
+    获取 ASS 字幕文件内容
+
+    Returns:
+        JSON: { job_id, filename, content, encoding }
+    """
+    job_dir = config.JOBS_DIR / job_id
+
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    ass_file = None
+    for file in job_dir.iterdir():
+        if file.suffix.lower() == '.ass':
+            ass_file = file
+            break
+
+    if not ass_file:
+        raise HTTPException(status_code=404, detail="ASS文件不存在")
+
+    try:
+        with open(ass_file, 'r', encoding='utf-8-sig') as f:
+            content = f.read()
+
+        return JSONResponse({
+            "job_id": job_id,
+            "filename": ass_file.name,
+            "content": content,
+            "encoding": "utf-8"
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取ASS文件失败: {str(e)}")
+
+
+@router.post("/{job_id}/ass/generate")
+async def generate_ass_from_srt(job_id: str, request: Request):
+    """
+    从 SRT 文件生成 ASS 字幕文件
+
+    Request Body:
+        {
+            "style_preset": "default" | "movie" | "news" | "danmaku",
+            "title": "字幕标题",
+            "video_width": 1920,
+            "video_height": 1080
+        }
+
+    Returns:
+        JSON: { job_id, filename, message }
+    """
+    job_dir = config.JOBS_DIR / job_id
+
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    # 查找 SRT 文件
+    srt_file = None
+    for file in job_dir.iterdir():
+        if file.suffix.lower() == '.srt':
+            srt_file = file
+            break
+
+    if not srt_file:
+        raise HTTPException(status_code=404, detail="SRT文件不存在")
+
+    try:
+        # 解析请求参数
+        body = await request.json()
+        style_preset = body.get("style_preset", "default")
+        title = body.get("title", srt_file.stem)
+        video_width = body.get("video_width", 1920)
+        video_height = body.get("video_height", 1080)
+
+        # 读取 SRT 文件并解析为字幕数据
+        subtitles = []
+        with open(srt_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # 简单的 SRT 解析
+        blocks = content.strip().split('\n\n')
+        for block in blocks:
+            lines = block.strip().split('\n')
+            if len(lines) >= 3:
+                # 解析时间戳行
+                time_line = lines[1]
+                if ' --> ' in time_line:
+                    start_str, end_str = time_line.split(' --> ')
+                    start = _parse_srt_timestamp(start_str.strip())
+                    end = _parse_srt_timestamp(end_str.strip())
+                    text = '\n'.join(lines[2:])
+                    subtitles.append({
+                        "start": start,
+                        "end": end,
+                        "text": text
+                    })
+
+        # 生成 ASS 文件
+        ass_file = job_dir / f"{srt_file.stem}.ass"
+        ASSConverter.convert_from_subtitles(
+            subtitles=subtitles,
+            output_path=ass_file,
+            style_preset=style_preset,
+            title=title,
+            video_width=video_width,
+            video_height=video_height
+        )
+
+        logger.info(f"ASS 文件已生成: {ass_file}")
+
+        return JSONResponse({
+            "job_id": job_id,
+            "filename": ass_file.name,
+            "message": "ASS文件生成成功"
+        })
+
+    except Exception as e:
+        logger.error(f"生成ASS文件失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"生成ASS文件失败: {str(e)}")
+
+
+def _parse_srt_timestamp(timestamp: str) -> float:
+    """
+    解析 SRT 时间戳为秒数
+
+    Args:
+        timestamp: SRT 时间戳 (HH:MM:SS,mmm)
+
+    Returns:
+        秒数
+    """
+    time_part, ms_part = timestamp.replace(',', '.').split('.')
+    h, m, s = map(int, time_part.split(':'))
+    ms = int(ms_part)
+    return h * 3600 + m * 60 + s + ms / 1000
 
 
 @router.get("/{job_id}/info")

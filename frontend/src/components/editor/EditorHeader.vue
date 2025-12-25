@@ -184,6 +184,7 @@
         <template #dropdown>
           <el-dropdown-menu>
             <el-dropdown-item command="srt">SRT 格式</el-dropdown-item>
+            <el-dropdown-item command="ass">ASS 格式</el-dropdown-item>
             <el-dropdown-item command="vtt">WebVTT 格式</el-dropdown-item>
             <el-dropdown-item command="txt">纯文本</el-dropdown-item>
             <el-dropdown-item command="json">JSON 格式</el-dropdown-item>

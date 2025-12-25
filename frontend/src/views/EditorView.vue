@@ -1117,6 +1117,9 @@ function handleExport(format) {
       content = projectStore.generateSRT()
       filename += '.srt'
       break
+    case 'ass':
+      handleASSExport()
+      return
     case 'vtt':
       content = generateVTT()
       filename += '.vtt'
@@ -1132,6 +1135,31 @@ function handleExport(format) {
   }
 
   downloadFile(content, filename)
+}
+
+async function handleASSExport() {
+  try {
+    console.log('[EditorView] 开始生成 ASS 字幕文件')
+
+    // 调用后端 API 生成 ASS 文件
+    await transcriptionApi.generateASS(props.jobId, {
+      style_preset: 'default',
+      title: projectName.value.replace(/\.[^/.]+$/, ''),
+      video_width: 1920,
+      video_height: 1080
+    })
+
+    // 获取生成的 ASS 文件内容
+    const assData = await transcriptionApi.getASSContent(props.jobId)
+
+    // 下载文件
+    downloadFile(assData.content, assData.filename)
+
+    console.log('[EditorView] ASS 字幕文件导出成功:', assData.filename)
+  } catch (error) {
+    console.error('[EditorView] 导出 ASS 文件失败:', error)
+    alert('导出 ASS 文件失败: ' + (error.message || '未知错误'))
+  }
 }
 
 function generateVTT() {

@@ -77,7 +77,7 @@ import { ref } from 'vue'
 const visible = defineModel({ type: Boolean, default: false })
 
 // 版本号
-const version = ref('3.1.0')
+const version = ref('3.1.0-beta')
 
 // 日志级别设置已禁用（控制台固定INFO，文件固定DEBUG）
 // const logLevel = ref('INFO')

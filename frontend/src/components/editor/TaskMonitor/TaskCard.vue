@@ -95,12 +95,25 @@
 
       <el-tooltip content="取消" placement="left" :show-after="500">
         <button
-          v-if="['processing', 'queued', 'paused'].includes(task.status)"
+          v-if="['processing', 'queued', 'paused'].includes(task.status) && task.status !== 'canceling'"
           class="action-btn action-btn--danger"
           @click="cancelTask"
         >
           <svg viewBox="0 0 24 24" fill="currentColor">
             <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+          </svg>
+        </button>
+      </el-tooltip>
+
+      <!-- V3.8.2: 正在取消状态显示加载动画 -->
+      <el-tooltip content="正在取消..." placement="left" :show-after="500">
+        <button
+          v-if="task.status === 'canceling'"
+          class="action-btn action-btn--danger"
+          disabled
+        >
+          <svg viewBox="0 0 24 24" fill="currentColor" class="spin">
+            <path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/>
           </svg>
         </button>
       </el-tooltip>
@@ -129,7 +142,7 @@ const lastOperationTime = ref(0)
 const DEBOUNCE_DELAY = 2000 // 2秒防抖
 
 const showProgress = computed(() =>
-  ['processing', 'queued', 'paused'].includes(props.task.status)
+  ['processing', 'queued', 'paused', 'canceling'].includes(props.task.status)
 )
 
 // 处理卡片点击事件
@@ -416,6 +429,26 @@ function formatTime(timestamp) {
   &--danger:hover {
     background: rgba(248, 81, 73, 0.15);
     color: var(--danger);
+  }
+
+  // V3.8.2: 禁用状态
+  &:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+}
+
+// V3.8.2: 旋转动画
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
   }
 }
 
