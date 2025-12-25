@@ -18,7 +18,9 @@
         >
           <span class="item-icon" v-if="item.icon">{{ item.icon }}</span>
           <span class="item-label">{{ item.label }}</span>
-          <span class="item-shortcut" v-if="item.shortcut">{{ item.shortcut }}</span>
+          <span class="item-shortcut" v-if="item.shortcut">{{
+            item.shortcut
+          }}</span>
         </div>
       </div>
     </Transition>
@@ -31,7 +33,7 @@
  *
  * 用于字幕切分等右键操作
  */
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
 
 const props = defineProps({
   // 菜单项列表
@@ -40,96 +42,96 @@ const props = defineProps({
     default: () => [],
     // 每项格式: { key: string, label: string, icon?: string, shortcut?: string, disabled?: boolean }
   },
-})
+});
 
-const emit = defineEmits(['select', 'close'])
+const emit = defineEmits(["select", "close"]);
 
-const visible = ref(false)
-const position = ref({ x: 0, y: 0 })
-const menuRef = ref(null)
+const visible = ref(false);
+const position = ref({ x: 0, y: 0 });
+const menuRef = ref(null);
 
 // 计算菜单位置样式，确保不超出视口
 const menuStyle = computed(() => {
   return {
     left: `${position.value.x}px`,
     top: `${position.value.y}px`,
-  }
-})
+  };
+});
 
 // 显示菜单
 function show(x, y) {
-  position.value = { x, y }
-  visible.value = true
+  position.value = { x, y };
+  visible.value = true;
 
   // 下一帧调整位置，防止超出视口
   nextTick(() => {
     if (menuRef.value) {
-      const rect = menuRef.value.getBoundingClientRect()
-      const viewportWidth = window.innerWidth
-      const viewportHeight = window.innerHeight
+      const rect = menuRef.value.getBoundingClientRect();
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
 
-      let newX = x
-      let newY = y
+      let newX = x;
+      let newY = y;
 
       if (x + rect.width > viewportWidth) {
-        newX = viewportWidth - rect.width - 8
+        newX = viewportWidth - rect.width - 8;
       }
       if (y + rect.height > viewportHeight) {
-        newY = viewportHeight - rect.height - 8
+        newY = viewportHeight - rect.height - 8;
       }
 
-      position.value = { x: newX, y: newY }
+      position.value = { x: newX, y: newY };
     }
-  })
+  });
 }
 
 // 隐藏菜单
 function hide() {
-  visible.value = false
-  emit('close')
+  visible.value = false;
+  emit("close");
 }
 
 // 处理菜单项点击
 function handleClick(item) {
-  console.log('[ContextMenu] 菜单项被点击:', item)
+  console.log("[ContextMenu] 菜单项被点击:", item);
   if (item.disabled) {
-    console.log('[ContextMenu] 菜单项被禁用，忽略点击')
-    return
+    console.log("[ContextMenu] 菜单项被禁用，忽略点击");
+    return;
   }
-  console.log('[ContextMenu] 发送 select 事件:', item.key)
-  emit('select', item.key)
-  console.log('[ContextMenu] 隐藏菜单')
-  hide()
+  console.log("[ContextMenu] 发送 select 事件:", item.key);
+  emit("select", item.key);
+  console.log("[ContextMenu] 隐藏菜单");
+  hide();
 }
 
 // 点击外部关闭菜单
 function handleClickOutside(e) {
   if (visible.value && menuRef.value && !menuRef.value.contains(e.target)) {
-    hide()
+    hide();
   }
 }
 
 // ESC 键关闭菜单
 function handleKeydown(e) {
-  if (e.key === 'Escape' && visible.value) {
-    hide()
+  if (e.key === "Escape" && visible.value) {
+    hide();
   }
 }
 
 onMounted(() => {
-  document.addEventListener('click', handleClickOutside)
-  document.addEventListener('contextmenu', handleClickOutside)
-  document.addEventListener('keydown', handleKeydown)
-})
+  document.addEventListener("click", handleClickOutside);
+  document.addEventListener("contextmenu", handleClickOutside);
+  document.addEventListener("keydown", handleKeydown);
+});
 
 onUnmounted(() => {
-  document.removeEventListener('click', handleClickOutside)
-  document.removeEventListener('contextmenu', handleClickOutside)
-  document.removeEventListener('keydown', handleKeydown)
-})
+  document.removeEventListener("click", handleClickOutside);
+  document.removeEventListener("contextmenu", handleClickOutside);
+  document.removeEventListener("keydown", handleKeydown);
+});
 
 // 暴露方法给父组件
-defineExpose({ show, hide })
+defineExpose({ show, hide });
 </script>
 
 <style scoped>
@@ -141,18 +143,22 @@ defineExpose({ show, hide })
   border: 1px solid var(--border-color, #404040);
   border-radius: 6px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-  padding: 4px 0;
+  padding: 0;
   user-select: none;
+  overflow: hidden;
 }
 
 .context-menu-item {
   display: flex;
   align-items: center;
+  width: 100%;
   padding: 8px 12px;
+  margin: 0px;
   cursor: pointer;
   color: var(--text-primary, #e0e0e0);
   font-size: 13px;
   transition: background-color 0.15s;
+  box-sizing: border-box;
 }
 
 .context-menu-item:hover:not(.disabled) {
