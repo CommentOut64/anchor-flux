@@ -817,9 +817,14 @@ class TranscriptionService:
             def extract_audio_for_waveform():
                 """后台提取音频供波形图使用"""
                 try:
+                    import warnings
                     import librosa
                     import soundfile as sf
-                    audio_array, sr = librosa.load(str(dest_path), sr=16000, mono=True)
+                    # 抑制 librosa 的 PySoundFile/audioread 警告
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", message="PySoundFile failed")
+                        warnings.filterwarnings("ignore", message="audioread")
+                        audio_array, sr = librosa.load(str(dest_path), sr=16000, mono=True)
                     sf.write(str(audio_path), audio_array, sr)
                     self.logger.info(f"[{job_id}] 音频提取完成: {audio_path}")
                 except Exception as e:

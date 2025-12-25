@@ -411,10 +411,8 @@ class FastWorker:
         # Layer 1: 分句（根据语言选择分句器）
         if is_chinese:
             sentences = self.chinese_splitter.split(words, text_clean)
-            self.logger.warning(f"[分句器选择] 中文模式: {len(sentences)} 个句子, language={detected_language}")
         else:
             sentences = self.draft_splitter.split(words, text_clean)
-            self.logger.warning(f"[分句器选择] 默认模式: {len(sentences)} 个句子, language={detected_language}")
 
         # Layer 2: 语义分组（如果启用）
         if self.enable_semantic_grouping:

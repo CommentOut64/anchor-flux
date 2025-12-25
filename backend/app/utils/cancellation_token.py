@@ -224,7 +224,7 @@ class CancellationToken:
         """
         with self._lock:
             if self._in_atomic_region:
-                logger.warning(
+                logger.debug(
                     f"[CancellationToken] 嵌套进入原子区域: "
                     f"{self._atomic_region_name} -> {region_name}"
                 )

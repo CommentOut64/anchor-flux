@@ -344,7 +344,7 @@ class ProgressEventEmitter:
         channel_id = f"job:{self.job.job_id}"
         event_type = f"progress.{phase}"
 
-        logger.info(f"[ProgressEmitter] 推送进度: {phase}={data.get('percent', 0):.1f}%")
+        logger.debug(f"[ProgressEmitter] 推送进度: {phase}={data.get('percent', 0):.1f}%")
         self.sse_manager.broadcast_sync(channel_id, event_type, data)
 
     def _push_overall(self, force: bool = False):
@@ -376,7 +376,7 @@ class ProgressEventEmitter:
             }
         }
 
-        logger.info(f"[ProgressEmitter] 推送总体进度: {self.detail.total:.1f}% (fast={self.detail.fast:.1f}%, slow={self.detail.slow:.1f}%)")
+        logger.debug(f"[ProgressEmitter] 推送总体进度: {self.detail.total:.1f}% (fast={self.detail.fast:.1f}%, slow={self.detail.slow:.1f}%)")
         # 推送到任务频道
         self.sse_manager.broadcast_sync(channel_id, "progress.overall", overall_data)
 
