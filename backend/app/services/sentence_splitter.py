@@ -77,6 +77,101 @@ class LanguageStrategy(ABC):
 class ChineseStrategy(LanguageStrategy):
     """中文语言策略"""
 
+    # 完整词排除列表 - 这些词虽然以不完整字结尾，但本身是完整的
+    COMPLETE_WORDS = {
+        # 以"件"结尾的完整名词
+        '事件', '案件', '文件', '物件', '零件', '邮件', '软件', '硬件', '条件', '事项',
+        # 以"为"结尾的完整词
+        '行为', '因为', '作为', '认为', '以为', '成为',
+        # 以"罐"结尾的完整名词
+        '易拉罐', '水罐', '茶罐', '油罐', '煤气罐',
+        # 以"的"结尾但完整的词（较少）
+        '目的', '有的',
+        # 以"是"结尾的完整词
+        '但是', '可是', '于是', '凡是', '总是', '还是', '或是',
+    }
+
+    # 中文不完整结尾词集合 - 这些词结尾的句子语义不完整，不应在此处切分
+    INCOMPLETE_ENDINGS = {
+        # ---------------------------------------------------------
+        # 1. 结构助词 (Structural Particles) - 绝对不能在结尾
+        # ---------------------------------------------------------
+        '的', '地', '得', '之', '所',
+
+        # ---------------------------------------------------------
+        # 2. 介词 (Prepositions) - 后必须接宾语
+        # ---------------------------------------------------------
+        # 强介词
+        '在', '从', '自', '当', '于', '对', '向', '往', '朝',
+        '离', '距', '经', '由', '被', '把', '将', '给', '让', '替', '为',
+        # 复合介词
+        '对于', '关于', '至于', '依据', '按照', '根据', '鉴于', '除了',
+        '为了', '以便', '趁着', '随着', '沿着', '顺着', '针对', '有关',
+        '基于', '本着', '通过', '作为', '直到', '截止', '截至',
+
+        # ---------------------------------------------------------
+        # 3. 连词 (Conjunctions) - 强逻辑引导词
+        # ---------------------------------------------------------
+        # 原因/条件/假设
+        '因为', '由于', '虽然', '尽管', '即使', '假如', '如果', '若是', '一旦',
+        '只要', '只有', '除非', '无论', '不管', '既然', '以免', '以防',
+        # 承接/递进/选择
+        '并且', '而且', '以及', '或是', '或者', '还是', '甚至', '尤其',
+        '不但', '不仅', '不光', '从而', '进而', '继而', '因此', '因而', '所以',
+        '不过', '但是', '可是', '然而', '否则', '不然', '反之',
+        '也就是说', '换句话说', '正因为', '之所以',
+
+        # ---------------------------------------------------------
+        # 4. 量词 (Classifiers) - 必须接名词
+        # ---------------------------------------------------------
+        # 通用/常见
+        '个', '位', '只', '条', '件', '张', '本', '支', '块', '颗', '粒',
+        '双', '对', '副', '套', '批', '群', '些', '点', '段', '截',
+        '种', '类', '样', '型', '届', '次', '回', '遍', '趟', '顿',
+        '层', '栋', '幢', '座', '台', '架', '艘', '辆', '列', '部',
+        '名', '口', '盏', '壶', '杯', '瓶', '罐', '包', '袋', '盒',
+
+        # ---------------------------------------------------------
+        # 5. 代词/指示词 (Pronouns/Demonstratives) - 指代未完
+        # ---------------------------------------------------------
+        '这', '那', '某', '其', '本', '该', '各', '每', '全', '诸',
+        '这些', '那些', '某些', '其它', '其他', '任何', '一切', '所有',
+
+        # ---------------------------------------------------------
+        # 6. 特殊动词 (Verbs) - 强及物/系动词
+        # ---------------------------------------------------------
+        # 系动词/判断
+        '是', '若', '像', '如', '同', '似', '等于', '属于',
+        '有', '无', '没', '包含', '包括',
+        '姓', '叫', '称', '名为',
+        # 强动作/状态（后必须跟对象）
+        '进行', '加以', '予以', '给予', '给以', '作出', '提出',
+        '使得', '令', '导致', '造成', '引起', '引发', '成为', '变成',
+        '位于', '处于', '面临', '遭受', '具有', '具备',
+
+        # ---------------------------------------------------------
+        # 7. 副词 (Adverbs) - 程度/时间/否定（通常修饰后词）
+        # ---------------------------------------------------------
+        # 程度
+        '很', '挺', '太', '更', '最', '极', '极其', '非常', '十分',
+        '格外', '分外', '稍微', '略微', '比较', '相当', '过于',
+        # 时间/状态
+        '正在', '正', '将', '将要', '刚', '刚刚', '曾经', '已经', '也许',
+        '大约', '大概', '几乎', '差点', '即将', '马上',
+        # 否定 (除了单独回答"不"以外，句中通常不以否定词结尾)
+        '不', '未', '别', '非', '毋', '莫', '没有',
+
+        # ---------------------------------------------------------
+        # 8. 数词/前缀 (Numerals/Prefixes)
+        # ---------------------------------------------------------
+        '第', '初', '老', '小', '大', '阿', '数', '几',
+
+        # ---------------------------------------------------------
+        # 9. 标点符号 (Punctuation) - 绝对不能作为断句点
+        # ---------------------------------------------------------
+        '、', '，', '：', '；', '——', '……', '（', '【', '《', '"', "'"
+    }
+
     def get_sentence_end_chars(self) -> Set[str]:
         return {'。', '？', '！', '.', '?', '!'}
 
@@ -89,6 +184,94 @@ class ChineseStrategy(LanguageStrategy):
 
     def is_continuation(self, text: str) -> bool:
         return any(text.strip().startswith(word) for word in self.get_continuation_words())
+
+    def is_incomplete_ending(self, word: str) -> bool:
+        """
+        检查单个词是否为不完整结尾词
+
+        Args:
+            word: 单个词（token），可能包含标点
+
+        Returns:
+            True 表示该词是不完整结尾词，不应在此处切分
+        """
+        # 清理词：去除标点和空格标记
+        clean_word = word.strip().rstrip('.,;:!?。，；：！？、').lstrip('▁')
+
+        if not clean_word:
+            return False
+
+        # V3.9: 先检查完整词排除列表（避免误判）
+        # 检查最后2-4个字是否在完整词列表中
+        for length in [4, 3, 2]:
+            if len(clean_word) >= length:
+                last_n = clean_word[-length:]
+                if last_n in self.COMPLETE_WORDS:
+                    return False  # 是完整词，不算不完整结尾
+
+        # 检查是否以不完整词结尾
+        for incomplete_word in self.INCOMPLETE_ENDINGS:
+            if clean_word.endswith(incomplete_word):
+                logger.warning(f"[中文语义检查] '{clean_word[-20:]}...' 以 '{incomplete_word}' 结尾 → 不完整")
+                return True
+
+        return False
+
+    def is_semantically_complete(self, text: str) -> bool:
+        """
+        检查文本是否语义完整，避免在不完整位置切分
+
+        Args:
+            text: 待检查的文本
+
+        Returns:
+            True 表示语义完整可以切分，False 表示语义不完整不应切分
+        """
+        if not text or not text.strip():
+            return True
+
+        # 去除标点和空格
+        normalized_text = text.strip().rstrip('.,;:!?。，；：！？、')
+
+        # 中文通常没有空格，直接取最后一个字符或词
+        if len(normalized_text) == 0:
+            return True
+
+        # V3.9: 单字保护逻辑 - 避免行尾只剩一个单汉字（特别是虚词）
+        # 如果整句去除标点后只有1个字符，且该字符在不完整词表中，则认为语义不完整
+        if len(normalized_text) == 1 and normalized_text in self.INCOMPLETE_ENDINGS:
+            return False
+
+        # 检查最后一个字符
+        last_char = normalized_text[-1]
+        if last_char in self.INCOMPLETE_ENDINGS:
+            return False
+
+        # 检查最后两个字符（双字词）
+        if len(normalized_text) >= 2:
+            last_two = normalized_text[-2:]
+            if last_two in self.INCOMPLETE_ENDINGS:
+                return False
+
+        # 检查最后三个字符（三字词）
+        if len(normalized_text) >= 3:
+            last_three = normalized_text[-3:]
+            if last_three in self.INCOMPLETE_ENDINGS:
+                return False
+
+        # 检查最后四个字符（四字词，如"也就是说"）
+        if len(normalized_text) >= 4:
+            last_four = normalized_text[-4:]
+            if last_four in self.INCOMPLETE_ENDINGS:
+                return False
+
+        # 检查最后五个字符（五字词，如"换句话说"）
+        if len(normalized_text) >= 5:
+            last_five = normalized_text[-5:]
+            if last_five in self.INCOMPLETE_ENDINGS:
+                return False
+
+        return True
 
 
 class EnglishStrategy(LanguageStrategy):
@@ -379,8 +562,16 @@ class SentenceSplitter:
 
             # 1. 句末标点切分
             if word.word in self.config.sentence_end_punctuation:
-                should_split = True
-                split_reason = "punctuation"
+                # V3.9: 标点切分也要检查语义完整性
+                strategy = self.config.get_strategy()
+                # 构建当前累积的文本
+                current_text = "".join(w.word for w in current_words)
+                if not strategy.is_incomplete_ending(current_text):
+                    should_split = True
+                    split_reason = "punctuation"
+                    logger.warning(f"[标点切分] 语义完整")
+                else:
+                    logger.warning(f"[标点跳过] 语义不完整，跳过切分")
 
             # 2. 停顿切分（检查与下一个词的间隔）
             # Layer 1 优化: 使用动态停顿阈值
@@ -392,8 +583,15 @@ class SentenceSplitter:
                 dynamic_threshold = self._calculate_dynamic_pause_threshold(words, i)
 
                 if pause >= self.config.long_pause_threshold:
-                    should_split = True
-                    split_reason = "long_pause"
+                    # V3.9: 长停顿也要检查语义完整性
+                    strategy = self.config.get_strategy()
+                    last_word = current_words[-1].word if current_words else ''
+                    if not strategy.is_incomplete_ending(last_word):
+                        should_split = True
+                        split_reason = "long_pause"
+                        logger.debug(f"[长停顿切分] pause={pause:.2f}s, 语义完整")
+                    else:
+                        logger.debug(f"[长停顿跳过] pause={pause:.2f}s, 语义不完整，跳过切分")
                 elif pause >= dynamic_threshold:
                     # 动态停顿 + 分句标点
                     if word.word in self.config.clause_punctuation:
@@ -415,10 +613,24 @@ class SentenceSplitter:
 
             # 检查硬上限（异常保护，仅在启用时生效）
             if self.config.enable_hard_limit and current_duration >= self.config.hard_limit_duration:
-                # 超过硬上限，无论如何都要切分（异常保护）
-                should_split = True
-                split_reason = "hard_limit_protection"
-                logger.warning(f"触发硬上限保护: {current_duration:.2f}s >= {self.config.hard_limit_duration:.2f}s")
+                # V3.9: 硬上限也要检查语义完整性（除非超过绝对硬上限）
+                absolute_hard_limit = self.config.hard_limit_duration * 1.5  # 绝对硬上限 = 硬上限 * 1.5
+
+                if current_duration >= absolute_hard_limit:
+                    # 超过绝对硬上限，强制切分
+                    should_split = True
+                    split_reason = "absolute_hard_limit"
+                    logger.warning(f"触发绝对硬上限: {current_duration:.2f}s >= {absolute_hard_limit:.2f}s，强制切分")
+                else:
+                    # 检查语义完整性
+                    strategy = self.config.get_strategy()
+                    last_word = current_words[-1].word if current_words else ''
+                    if not strategy.is_incomplete_ending(last_word):
+                        should_split = True
+                        split_reason = "hard_limit_protection"
+                        logger.warning(f"触发硬上限保护: {current_duration:.2f}s >= {self.config.hard_limit_duration:.2f}s")
+                    else:
+                        logger.warning(f"硬上限但语义不完整: {current_duration:.2f}s, last_word末尾, 延迟切分")
             elif current_duration >= self.config.max_duration:
                 # 超过软上限，检查是否应该延迟切分
                 strategy = self.config.get_strategy()
@@ -478,10 +690,16 @@ class SentenceSplitter:
 
             # 执行切分
             if should_split and current_words:
-                sentence = self._create_sentence(current_words)
+                # 硬上限保护或最后一个词时强制保留，跳过 min_chars 检查
+                force_create = (split_reason == "hard_limit_protection" or
+                                split_reason == "end_of_input")
+                sentence = self._create_sentence(current_words, force_create=force_create)
                 if sentence:
                     sentences.append(sentence)
                     logger.debug(f"分句: '{sentence.text[-50:]}' (原因: {split_reason}, 时长: {current_duration:.2f}s)")
+                elif force_create:
+                    # 如果强制创建仍然返回 None（words为空），记录警告
+                    logger.warning(f"强制创建句子失败: split_reason={split_reason}, words数={len(current_words)}")
 
                 # 重置
                 current_words = []
@@ -770,8 +988,21 @@ class SentenceSplitter:
 
         return result
 
-    def _create_sentence(self, words: List['WordTimestamp']) -> Optional['SentenceSegment']:
-        """创建句子对象 (集成边界修剪)"""
+    def _create_sentence(
+        self,
+        words: List['WordTimestamp'],
+        force_create: bool = False
+    ) -> Optional['SentenceSegment']:
+        """
+        创建句子对象 (集成边界修剪)
+
+        Args:
+            words: 词列表
+            force_create: 强制创建句子，跳过 min_chars 检查（用于硬上限后的尾部保留）
+
+        Returns:
+            SentenceSegment 或 None
+        """
         from ..models.sensevoice_models import SentenceSegment
         from ..services.text_normalizer import get_text_normalizer
 
@@ -805,11 +1036,18 @@ class SentenceSplitter:
             logger.debug(f"文本清洗: 清洗前={text_raw[:50]}, 清洗后={text_clean[:50]}")
 
         # 过滤过短句子（基于清洗后的文本）
-        if len(text_clean.strip()) < self.config.min_chars:
+        # force_create=True 时跳过此检查（硬上限后的尾部强制保留）
+        if not force_create and len(text_clean.strip()) < self.config.min_chars:
             return None
 
         # 计算平均置信度
         avg_confidence = sum(w.confidence for w in words) / len(words)
+
+        # V3.9: 中文字幕句末标点处理（移除句末句号）
+        strategy = self.config.get_strategy()
+        if isinstance(strategy, ChineseStrategy):
+            # 中文字幕规范：句末不使用句号，只在句中使用
+            text_clean = text_clean.rstrip('。.')
 
         sentence = SentenceSegment(
             text=text_raw,  # 保留原始文本用于调试
@@ -830,11 +1068,16 @@ class SentenceSplitter:
         sentences: List['SentenceSegment']
     ) -> List['SentenceSegment']:
         """
-        合并过短句子（增强版：同时检查字符数和时长）
+        合并过短句子（修复版：向前合并）
 
         合并条件：
         1. 字符数 <= short_sentence_threshold（默认8个字符）
         2. 或 时长 < min_duration_threshold（默认0.5秒）
+
+        策略：
+        - 短句优先与前一句合并（更符合语义）
+        - 如果是第一句，则与下一句合并
+        - 极短句子（<0.2s）强制合并
 
         Args:
             sentences: 句子列表
@@ -857,13 +1100,56 @@ class SentenceSplitter:
             # 检查是否为短句（字符数或时长）
             is_short_by_chars = len(current.text) <= self.config.short_sentence_threshold
             is_short_by_duration = current_duration < self.config.min_duration_threshold
+            is_very_short = current_duration < 0.2  # 极短句子（如0.10s）
 
-            if is_short_by_chars or is_short_by_duration:
-                # 尝试与下一句合并
+            if is_short_by_chars or is_short_by_duration or is_very_short:
+                # 策略1：优先与前一句合并（更符合语义）
+                if merged:
+                    prev = merged[-1]
+
+                    # 检查合并后是否超限
+                    merged_duration = current.end - prev.start
+                    max_chars = self.config.max_chars if self.config.max_chars > 0 else 1000
+                    merged_text = prev.text.rstrip() + ' ' + current.text.lstrip()
+
+                    # 极短句子强制合并，普通短句检查超限
+                    should_merge = is_very_short or (
+                        merged_duration <= self.config.max_duration and
+                        len(merged_text) <= max_chars
+                    )
+
+                    if should_merge:
+                        # 合并到前一句
+                        merged_text_clean = (prev.text_clean or prev.text).rstrip() + ' ' + (current.text_clean or current.text).lstrip()
+                        merged_words = prev.words + current.words
+
+                        avg_confidence = (
+                            (prev.confidence * len(prev.words) +
+                             current.confidence * len(current.words)) /
+                            len(merged_words)
+                        ) if merged_words else prev.confidence
+
+                        # 更新前一句
+                        prev.text = merged_text
+                        prev.text_clean = merged_text_clean
+                        prev.end = current.end
+                        prev.words = merged_words
+                        prev.confidence = avg_confidence
+
+                        logger.info(
+                            f"向前合并短句: [{current_duration:.2f}s, {len(current.text)}字符] "
+                            f"\"{current.text}\" → 前句 (合并后{merged_duration:.2f}s)"
+                        )
+
+                        i += 1
+                        continue
+
+                # 策略2：如果向前合并失败，尝试与下一句合并
+                # 修复: 移除 "not merged" 条件，允许在向前合并失败时尝试向后合并
                 if i + 1 < len(sentences):
                     next_sent = sentences[i + 1]
-                    merged_text = current.text + next_sent.text
-                    merged_text_clean = (current.text_clean or current.text) + (next_sent.text_clean or next_sent.text)
+                    merged_text = current.text.rstrip() + ' ' + next_sent.text.lstrip()
+                    merged_text_clean = (current.text_clean or current.text).rstrip() + ' ' + (next_sent.text_clean or next_sent.text).lstrip()
                     merged_words = current.words + next_sent.words
 
                     # 检查合并后是否超限
@@ -877,7 +1163,7 @@ class SentenceSplitter:
                             (current.confidence * len(current.words) +
                              next_sent.confidence * len(next_sent.words)) /
                             len(merged_words)
-                        )
+                        ) if merged_words else current.confidence
 
                         merged_sentence = SentenceSegment(
                             text=merged_text,
@@ -893,9 +1179,9 @@ class SentenceSplitter:
                         merged_sentence.is_finalized = current.is_finalized
                         merged_sentence.source = current.source
 
-                        logger.debug(
-                            f"合并短句: '{current.text[:20]}...' (chars={len(current.text)}, "
-                            f"dur={current_duration:.2f}s) + '{next_sent.text[:20]}...'"
+                        logger.info(
+                            f"向后合并短句: [{current_duration:.2f}s, {len(current.text)}字符] "
+                            f"\"{current.text}\" + 下句 (合并后{merged_duration:.2f}s)"
                         )
 
                         merged.append(merged_sentence)

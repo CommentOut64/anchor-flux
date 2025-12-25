@@ -28,7 +28,7 @@ class ClientInfo:
 class ClientRegistry:
     """客户端注册表，追踪活跃的浏览器标签页"""
 
-    def __init__(self, heartbeat_timeout: int = 15):
+    def __init__(self, heartbeat_timeout: int = 10):
         """
         初始化客户端注册表
 

@@ -71,21 +71,23 @@ class ConfigAdapter:
     @staticmethod
     def needs_dual_alignment(settings: "JobSettings") -> bool:
         """
-        判断是否需要双流对齐流水线
+        判断是否需要双流对齐流水线（新架构）
 
-        双流对齐条件:
-        - 新版: transcription_profile 为 sv_whisper_patch 或 sv_whisper_dual
-        - 旧版: sensevoice.preset_id 不是 'default' 且 engine 是 'sensevoice'
+        V3.8.1: 所有 SenseVoice 模式都走新架构（支持 ProgressEmitter）
+        - sensevoice_only (极速模式)
+        - sv_whisper_patch (智能补刀)
+        - sv_whisper_dual (双流精校)
 
         Returns:
-            bool: 是否需要双流对齐
+            bool: 是否使用新架构流水线
         """
         engine = getattr(settings, 'engine', 'sensevoice')
         if engine != 'sensevoice':
             return False
 
         profile = ConfigAdapter.get_transcription_profile(settings)
-        return profile in ('sv_whisper_patch', 'sv_whisper_dual')
+        # V3.8.1: 所有 SenseVoice 模式都走新架构
+        return profile in ['sensevoice_only', 'sv_whisper_patch', 'sv_whisper_dual']
 
     @staticmethod
     def get_preset_id(settings: "JobSettings") -> str:

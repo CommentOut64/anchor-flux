@@ -78,6 +78,13 @@ class MediaPrepService:
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
 
+        # 待检查的 720p 任务 { job_id: Timer }
+        self.pending_720p_checks: Dict[str, threading.Timer] = {}
+
+        # 活跃的 FFmpeg 子进程追踪 { process_id: subprocess.Popen }
+        self._active_processes: Dict[int, subprocess.Popen] = {}
+        self._process_lock = threading.Lock()
+
         # 启动消费线程
         self.consumer_thread = threading.Thread(
             target=self._consumer_loop,
@@ -443,11 +450,15 @@ class MediaPrepService:
             include_audio = preview_config.get('audio', False)
             audio_bitrate = preview_config.get('audio_bitrate', '64k')
 
+            # 获取 CPU 线程数配置（延迟计算，避免循环导入）
+            cpu_threads = config.get_ffmpeg_cpu_threads()
+
             # 构建 FFmpeg 命令 - 360p 快速预览（参数从配置读取）
             ffmpeg_cmd = config.get_ffmpeg_command()
             cmd = [
                 ffmpeg_cmd,
                 '-i', str(video_path),
+                '-threads', str(cpu_threads),      # 限制 CPU 线程数
                 '-vf', f'scale=-2:{scale}',       # 分辨率
                 '-c:v', 'libx264',
                 '-preset', preset,                 # 编码预设
@@ -482,31 +493,44 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
+            
+            # 注册进程以便在关闭时能够终止
+            self._register_process(process)
 
             # 解析进度
             last_logged_progress = 0  # 记录上次日志输出的进度
-            for line in process.stdout:
-                line_str = line.decode().strip()
-                if line_str.startswith('out_time_ms='):
-                    try:
-                        out_time_ms = int(line_str.split('=')[1])
-                        if duration > 0:
-                            progress = min(100, (out_time_ms / 1000000) / duration * 100)
-                            progress = round(progress, 1)
+            try:
+                for line in process.stdout:
+                    # 检查是否需要停止
+                    if self.stop_event.is_set():
+                        process.terminate()
+                        logger.info(f"[MediaPrep] 360p 转码被中断: {job_id}")
+                        break
+                    
+                    line_str = line.decode().strip()
+                    if line_str.startswith('out_time_ms='):
+                        try:
+                            out_time_ms = int(line_str.split('=')[1])
+                            if duration > 0:
+                                progress = min(100, (out_time_ms / 1000000) / duration * 100)
+                                progress = round(progress, 1)
 
-                            # 更新状态
-                            with self.lock:
-                                self.task_status[job_id]["preview_360p"]["progress"] = progress
+                                # 更新状态
+                                with self.lock:
+                                    self.task_status[job_id]["preview_360p"]["progress"] = progress
 
-                            # 推送 SSE 进度
-                            self._push_preview_progress(job_id, progress)
+                                # 推送 SSE 进度
+                                self._push_preview_progress(job_id, progress)
 
-                            # 每10%输出一次日志
-                            if progress >= last_logged_progress + 10:
-                                logger.info(f"[MediaPrep] 360p 转码进度: {job_id} - {progress:.1f}%")
-                                last_logged_progress = int(progress / 10) * 10
-                    except:
-                        pass
+                                # 每10%输出一次日志
+                                if progress >= last_logged_progress + 10:
+                                    logger.info(f"[MediaPrep] 360p 转码进度: {job_id} - {progress:.1f}%")
+                                    last_logged_progress = int(progress / 10) * 10
+                        except:
+                            pass
+            finally:
+                # 注销进程
+                self._unregister_process(process)
 
             process.wait()
 
@@ -519,29 +543,9 @@ class MediaPrepService:
                 logger.info(f"[MediaPrep] 360p预览转码完成: {output_path}")
                 self._push_preview_progress(job_id, 100, completed=True)
 
-                # 【新增】360p完成后，延迟10秒检查队列是否空闲，如果空闲则自动启动720p
-                # 使用独立线程避免阻塞当前任务
-                import threading
-                def delayed_720p_check():
-                    import time
-                    time.sleep(10)  # 等待10秒
-
-                    # 检查队列是否空闲
-                    queue_idle = self._is_transcription_queue_idle()
-                    logger.info(f"[MediaPrep] 360p完成后10秒检查: 队列空闲={queue_idle}")
-
-                    if queue_idle:
-                        # 队列空闲，自动启动720p
-                        proxy_720p = output_path.parent / "proxy_720p.mp4"
-                        if not proxy_720p.exists():
-                            # 检查720p是否已在队列中
-                            proxy_status = self.get_proxy_status(job_id)
-                            if not proxy_status or proxy_status.get("status") not in ["queued", "processing"]:
-                                logger.info(f"[MediaPrep] 360p完成后队列空闲，自动启动720p: {job_id}")
-                                self.enqueue_proxy(job_id, video_path, proxy_720p, priority=10)
-
-                thread = threading.Thread(target=delayed_720p_check, daemon=True)
-                thread.start()
+                # 【优化】360p完成后，智能安排720p检查
+                # 策略：只有队列空闲时才安排延迟检查，避免频繁检测
+                self._schedule_720p_check_if_idle(job_id, video_path, output_path.parent / "proxy_720p.mp4")
             else:
                 # 失败
                 error_msg = f"FFmpeg 返回码: {process.returncode}"
@@ -561,7 +565,11 @@ class MediaPrepService:
     def _execute_proxy_task(self, task: dict):
         """
         执行 720p Proxy 转码任务（在独立线程中）
-        特点：检测转录队列状态，如有新任务则降低优先级，不阻塞转录
+
+        特点：
+        1. 转码前卸载所有模型，释放显存
+        2. 优先使用 GPU 加速（NVENC），回退到 CPU
+        3. 检测转录队列状态，如有新任务则降低优先级
         """
         job_id = task["job_id"]
         video_path = Path(task["video_path"])
@@ -572,48 +580,84 @@ class MediaPrepService:
             self.task_status[job_id]["proxy_720p"]["status"] = "processing"
 
         try:
-            # 获取视频时长
+            # 步骤1: 卸载所有模型，释放显存
+            self._unload_all_models_before_720p()
+
+            # 步骤2: 获取视频时长
             duration = self._get_video_duration(video_path)
 
-            # 检查转录队列是否繁忙（有新任务进入）
+            # 步骤3: 检查转录队列是否繁忙
             queue_busy = self._is_transcription_queue_busy()
 
-            # 从配置读取参数
+            # 步骤4: 检测 GPU 可用性
+            import torch
+            gpu_available = torch.cuda.is_available()
+
+            # 步骤5: 从配置读取参数
             proxy_config = config.PROXY_CONFIG.get('proxy_720p', {})
             scale = proxy_config.get('scale', 720)
-            preset = proxy_config.get('preset', 'fast')
             crf = proxy_config.get('crf', 23)
             gop = proxy_config.get('gop', 30)
             keyint_min = proxy_config.get('keyint_min', gop // 2)
             audio_bitrate = proxy_config.get('audio_bitrate', '128k')
             audio_sample_rate = proxy_config.get('audio_sample_rate', 44100)
 
-            # 构建 FFmpeg 命令 - 720p 高清（参数从配置读取）
+            # 步骤6: 构建 FFmpeg 命令（GPU 优先，CPU 回退）
             ffmpeg_cmd = config.get_ffmpeg_command()
-            cmd = [
-                ffmpeg_cmd,
-                '-i', str(video_path),
-                '-threads', '0',                   # 自动线程
-                '-vf', f'scale=-2:{scale}',        # 分辨率
-                '-c:v', 'libx264',
-                '-preset', preset,                  # 编码预设
-                '-crf', str(crf),                   # 质量
-                '-g', str(gop),                     # 关键帧间隔
-                '-keyint_min', str(keyint_min),     # 最小关键帧间隔
-                '-sc_threshold', '0',               # 禁用场景检测，保证 GOP 稳定
-                '-c:a', 'aac',                      # 音频编码
-                '-b:a', audio_bitrate,              # 音频码率
-                '-ar', str(audio_sample_rate),      # 音频采样率
-                '-movflags', '+faststart',          # 优化网络播放
-                '-progress', 'pipe:1',
-                '-y',
-                str(output_path)
-            ]
+
+            if gpu_available:
+                # GPU 加速配置（NVENC）
+                preset_nvenc = proxy_config.get('preset_nvenc', 'p4')  # p1-p7, p4 为质量和速度平衡
+                cmd = [
+                    ffmpeg_cmd,
+                    '-hwaccel', 'cuda',                # 硬件加速
+                    '-hwaccel_output_format', 'cuda',  # 输出格式
+                    '-i', str(video_path),
+                    '-vf', f'scale_cuda=-2:{scale}',   # GPU 缩放
+                    '-c:v', 'h264_nvenc',              # NVENC 编码器
+                    '-preset', preset_nvenc,           # NVENC preset
+                    '-cq', str(crf),                   # 恒定质量模式
+                    '-g', str(gop),
+                    '-keyint_min', str(keyint_min),
+                    '-c:a', 'aac',
+                    '-b:a', audio_bitrate,
+                    '-ar', str(audio_sample_rate),
+                    '-movflags', '+faststart',
+                    '-progress', 'pipe:1',
+                    '-y',
+                    str(output_path)
+                ]
+                encoder_type = "GPU (NVENC)"
+            else:
+                # CPU 编码配置（回退方案）
+                # 获取 CPU 线程数配置（延迟计算，避免循环导入）
+                cpu_threads = config.get_ffmpeg_cpu_threads()
+                preset_cpu = proxy_config.get('preset', 'fast')
+                cmd = [
+                    ffmpeg_cmd,
+                    '-i', str(video_path),
+                    '-threads', str(cpu_threads),  # 使用智能计算的线程数，而非 -threads 0
+                    '-vf', f'scale=-2:{scale}',
+                    '-c:v', 'libx264',
+                    '-preset', preset_cpu,
+                    '-crf', str(crf),
+                    '-g', str(gop),
+                    '-keyint_min', str(keyint_min),
+                    '-sc_threshold', '0',
+                    '-c:a', 'aac',
+                    '-b:a', audio_bitrate,
+                    '-ar', str(audio_sample_rate),
+                    '-movflags', '+faststart',
+                    '-progress', 'pipe:1',
+                    '-y',
+                    str(output_path)
+                ]
+                encoder_type = "CPU (libx264)"
 
             if queue_busy:
                 logger.info(f"[MediaPrep] 检测到队列繁忙，720p 转码将使用低优先级: {job_id}")
             else:
-                logger.info(f"[MediaPrep] 开始 720p 转码: {video_path.name} -> proxy.mp4")
+                logger.info(f"[MediaPrep] 开始 720p 转码 ({encoder_type}): {video_path.name} -> proxy_720p.mp4")
 
             # 启动 FFmpeg 进程
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
@@ -623,6 +667,9 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
+            
+            # 注册进程以便在关闭时能够终止
+            self._register_process(process)
 
             # 如果队列繁忙，降低 FFmpeg 进程优先级
             if queue_busy:
@@ -630,28 +677,38 @@ class MediaPrepService:
 
             # 解析进度
             last_logged_progress = 0  # 记录上次日志输出的进度
-            for line in process.stdout:
-                line_str = line.decode().strip()
-                if line_str.startswith('out_time_ms='):
-                    try:
-                        out_time_ms = int(line_str.split('=')[1])
-                        if duration > 0:
-                            progress = min(100, (out_time_ms / 1000000) / duration * 100)
-                            progress = round(progress, 1)
+            try:
+                for line in process.stdout:
+                    # 检查是否需要停止
+                    if self.stop_event.is_set():
+                        process.terminate()
+                        logger.info(f"[MediaPrep] 720p 转码被中断: {job_id}")
+                        break
+                    
+                    line_str = line.decode().strip()
+                    if line_str.startswith('out_time_ms='):
+                        try:
+                            out_time_ms = int(line_str.split('=')[1])
+                            if duration > 0:
+                                progress = min(100, (out_time_ms / 1000000) / duration * 100)
+                                progress = round(progress, 1)
 
-                            # 更新状态
-                            with self.lock:
-                                self.task_status[job_id]["proxy_720p"]["progress"] = progress
+                                # 更新状态
+                                with self.lock:
+                                    self.task_status[job_id]["proxy_720p"]["progress"] = progress
 
-                            # 推送 SSE 进度
-                            self._push_proxy_progress(job_id, progress)
+                                # 推送 SSE 进度
+                                self._push_proxy_progress(job_id, progress)
 
-                            # 每10%输出一次日志
-                            if progress >= last_logged_progress + 10:
-                                logger.info(f"[MediaPrep] 720p 转码进度: {job_id} - {progress:.1f}%")
-                                last_logged_progress = int(progress / 10) * 10
-                    except:
-                        pass
+                                # 每10%输出一次日志
+                                if progress >= last_logged_progress + 10:
+                                    logger.info(f"[MediaPrep] 720p 转码进度: {job_id} - {progress:.1f}%")
+                                    last_logged_progress = int(progress / 10) * 10
+                        except:
+                            pass
+            finally:
+                # 注销进程
+                self._unregister_process(process)
 
             process.wait()
 
@@ -680,25 +737,208 @@ class MediaPrepService:
             logger.error(f"[MediaPrep] 720p 转码异常: {e}", exc_info=True)
 
     def _is_transcription_queue_busy(self) -> bool:
-        """检查转录队列是否繁忙（有活跃任务）"""
-        try:
-            from app.services.job_queue_service import get_job_queue
+        """
+        检查转录队列是否繁忙（增强版，覆盖完整流水线）
 
-            job_queue = get_job_queue()
-            if not job_queue:
+        检查项：
+        1. 队列中是否有等待任务
+        2. 是否有正在执行的任务（running_job_id，覆盖所有预处理阶段）
+        3. 是否有活跃的进度追踪器（双重保险）
+        """
+        try:
+            from app.services.job_queue_service import get_queue_service
+
+            queue_service = get_queue_service()
+            if not queue_service:
                 return False
 
-            # 检查是否有正在处理或等待的任务
-            active_jobs = [
-                j for j in job_queue.jobs.values()
-                if j.status in ['pending', 'processing', 'queued']
-            ]
+            # 检查1: 队列中有等待任务
+            if len(queue_service.queue) > 0:
+                logger.debug(f"[MediaPrep] 队列繁忙: 有 {len(queue_service.queue)} 个等待任务")
+                return True
 
-            return len(active_jobs) > 0
+            # 检查2: 有正在执行的任务（覆盖整个流水线生命周期）
+            if queue_service.running_job_id is not None:
+                logger.debug(f"[MediaPrep] 队列繁忙: 正在执行任务 {queue_service.running_job_id}")
+                return True
+
+            # 检查3: 有活跃的进度追踪器（双重保险，防止边界情况）
+            from app.services.progress_tracker import get_all_trackers
+            active_trackers = get_all_trackers()
+            if len(active_trackers) > 0:
+                logger.debug(f"[MediaPrep] 队列繁忙: 有 {len(active_trackers)} 个活跃的进度追踪器")
+                return True
+
+            logger.debug("[MediaPrep] 队列空闲: 所有检查项均通过")
+            return False
 
         except Exception as e:
             logger.debug(f"[MediaPrep] 检查队列状态失败: {e}")
             return False
+
+    def _schedule_720p_check_if_idle(self, job_id: str, video_path: Path, output_path: Path, delay: int = 10):
+        """
+        智能安排 720p 检查（事件驱动 + 延迟检查）
+
+        策略：
+        1. 立即检查队列状态
+        2. 如果队列繁忙：不安排任何检查，避免频繁检测
+        3. 如果队列空闲：安排延迟检查（默认 10 秒）
+        4. 延迟检查时再次确认队列是否空闲
+
+        Args:
+            job_id: 任务ID
+            video_path: 源视频路径
+            output_path: 720p 输出路径
+            delay: 延迟时间（秒）
+        """
+        # 步骤1: 立即检查队列状态
+        queue_busy = self._is_transcription_queue_busy()
+
+        if queue_busy:
+            # 队列繁忙，不安排检查
+            logger.info(f"[MediaPrep] 360p完成，但队列繁忙，不安排720p检查: {job_id}")
+            return
+
+        # 步骤2: 队列空闲，安排延迟检查
+        logger.info(f"[MediaPrep] 360p完成且队列空闲，安排{delay}秒后检查720p: {job_id}")
+
+        # 取消之前的检查（如果有）
+        self._cancel_720p_check(job_id)
+
+        # 创建延迟检查 Timer
+        timer = threading.Timer(
+            delay,
+            self._delayed_720p_check,
+            args=(job_id, video_path, output_path)
+        )
+        self.pending_720p_checks[job_id] = timer
+        timer.start()
+
+    def _cancel_720p_check(self, job_id: str):
+        """
+        取消待检查的 720p 任务
+
+        Args:
+            job_id: 任务ID
+        """
+        if job_id in self.pending_720p_checks:
+            self.pending_720p_checks[job_id].cancel()
+            del self.pending_720p_checks[job_id]
+            logger.debug(f"[MediaPrep] 已取消720p检查: {job_id}")
+
+    def _delayed_720p_check(self, job_id: str, video_path: Path, output_path: Path):
+        """
+        延迟检查并启动 720p（在 Timer 线程中执行）
+
+        Args:
+            job_id: 任务ID
+            video_path: 源视频路径
+            output_path: 720p 输出路径
+        """
+        try:
+            # 步骤1: 再次检查队列是否空闲
+            queue_busy = self._is_transcription_queue_busy()
+            logger.info(f"[MediaPrep] 延迟检查触发: {job_id}, 队列繁忙={queue_busy}")
+
+            if queue_busy:
+                # 队列仍然繁忙，不启动 720p
+                logger.info(f"[MediaPrep] 延迟检查时队列仍繁忙，取消720p启动: {job_id}")
+                return
+
+            # 步骤2: 检查 720p 是否已存在或已在队列中
+            if output_path.exists():
+                logger.info(f"[MediaPrep] 720p文件已存在，跳过: {job_id}")
+                return
+
+            proxy_status = self.get_proxy_status(job_id)
+            if proxy_status and proxy_status.get("status") in ["queued", "processing"]:
+                logger.info(f"[MediaPrep] 720p任务已在队列中，跳过: {job_id}")
+                return
+
+            # 步骤3: 队列空闲且 720p 不存在，启动 720p
+            logger.info(f"[MediaPrep] 延迟检查通过，自动启动720p: {job_id}")
+            self.enqueue_proxy(job_id, video_path, output_path, priority=10)
+
+        except Exception as e:
+            logger.error(f"[MediaPrep] 延迟检查异常: {job_id}, {e}", exc_info=True)
+
+        finally:
+            # 清理 Timer 记录
+            if job_id in self.pending_720p_checks:
+                del self.pending_720p_checks[job_id]
+
+    def _unload_all_models_before_720p(self):
+        """
+        720p 生成前卸载所有模型，释放显存
+
+        卸载顺序：
+        1. Whisper 模型（1-3GB 显存）
+        2. SenseVoice 模型（~500MB 显存）
+        3. Demucs 模型（~1GB 显存）
+        4. 清理 CUDA 缓存
+        5. 等待资源释放
+        """
+        try:
+            import torch
+            import gc
+
+            logger.info("[MediaPrep] 开始卸载模型以释放显存...")
+
+            # 1. 卸载 Whisper 模型
+            try:
+                from app.services.whisper_service import get_whisper_service
+                whisper_service = get_whisper_service()
+                if hasattr(whisper_service, 'is_loaded') and whisper_service.is_loaded:
+                    whisper_service.unload_model()
+                    logger.info("[MediaPrep] 已卸载 Whisper 模型")
+            except Exception as e:
+                logger.debug(f"[MediaPrep] 卸载 Whisper 模型失败（可能未加载）: {e}")
+
+            # 2. 卸载 SenseVoice 模型
+            try:
+                from app.services.sensevoice_onnx_service import get_sensevoice_service
+                sensevoice_service = get_sensevoice_service()
+                if hasattr(sensevoice_service, 'is_loaded') and sensevoice_service.is_loaded:
+                    sensevoice_service.unload_model()
+                    logger.info("[MediaPrep] 已卸载 SenseVoice 模型")
+            except Exception as e:
+                logger.debug(f"[MediaPrep] 卸载 SenseVoice 模型失败（可能未加载）: {e}")
+
+            # 3. 卸载 Demucs 模型
+            try:
+                from app.services.demucs_service import get_demucs_service
+                demucs_service = get_demucs_service()
+                demucs_service.unload_model()
+                logger.info("[MediaPrep] 已卸载 Demucs 模型")
+            except Exception as e:
+                logger.debug(f"[MediaPrep] 卸载 Demucs 模型失败（可能未加载）: {e}")
+
+            # 4. 清理 CUDA 缓存
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+                # 记录显存状态
+                try:
+                    memory_allocated = torch.cuda.memory_allocated() / 1024**3
+                    memory_reserved = torch.cuda.memory_reserved() / 1024**3
+                    logger.info(
+                        f"[MediaPrep] CUDA 缓存已清理 - "
+                        f"已分配: {memory_allocated:.2f}GB, 已保留: {memory_reserved:.2f}GB"
+                    )
+                except:
+                    pass
+
+            # 5. 等待资源释放
+            import time
+            time.sleep(1)
+
+            logger.info("[MediaPrep] 模型卸载完成")
+
+        except Exception as e:
+            logger.warning(f"[MediaPrep] 模型卸载失败（非致命错误）: {e}")
 
     def _set_low_priority(self, pid: int):
         """设置进程为低优先级（Windows 和 Linux）"""
@@ -890,24 +1130,37 @@ class MediaPrepService:
                 stderr=subprocess.DEVNULL,  # 丢弃 stderr，避免缓冲区阻塞
                 creationflags=creationflags
             )
+            
+            # 注册进程以便在关闭时能够终止
+            self._register_process(process)
 
             # 解析进度
-            for line in process.stdout:
-                line_str = line.decode().strip()
-                if line_str.startswith('out_time_ms='):
-                    try:
-                        out_time_ms = int(line_str.split('=')[1])
-                        if duration > 0:
-                            progress = min(100, (out_time_ms / 1000000) / duration * 100)
-                            progress = round(progress, 1)
+            try:
+                for line in process.stdout:
+                    # 检查是否需要停止
+                    if self.stop_event.is_set():
+                        process.terminate()
+                        logger.info(f"[MediaPrep] 重封装被中断: {job_id}")
+                        break
+                    
+                    line_str = line.decode().strip()
+                    if line_str.startswith('out_time_ms='):
+                        try:
+                            out_time_ms = int(line_str.split('=')[1])
+                            if duration > 0:
+                                progress = min(100, (out_time_ms / 1000000) / duration * 100)
+                                progress = round(progress, 1)
 
-                            with self.lock:
-                                self.task_status[job_id]["remux"]["progress"] = progress
+                                with self.lock:
+                                    self.task_status[job_id]["remux"]["progress"] = progress
 
-                            # 推送进度
-                            self._push_remux_progress(job_id, progress)
-                    except:
-                        pass
+                                # 推送进度
+                                self._push_remux_progress(job_id, progress)
+                        except:
+                            pass
+            finally:
+                # 注销进程
+                self._unregister_process(process)
 
             process.wait()
 
@@ -947,9 +1200,58 @@ class MediaPrepService:
                 "type": "remux"
             })
 
+    def _register_process(self, process: subprocess.Popen):
+        """注册活跃的子进程"""
+        with self._process_lock:
+            self._active_processes[process.pid] = process
+            logger.debug(f"[MediaPrep] 注册进程: PID={process.pid}")
+
+    def _unregister_process(self, process: subprocess.Popen):
+        """注销子进程"""
+        with self._process_lock:
+            if process.pid in self._active_processes:
+                del self._active_processes[process.pid]
+                logger.debug(f"[MediaPrep] 注销进程: PID={process.pid}")
+
+    def kill_all_subprocesses(self) -> int:
+        """
+        终止所有活跃的 FFmpeg 子进程
+        
+        Returns:
+            int: 被终止的进程数
+        """
+        killed_count = 0
+        with self._process_lock:
+            for pid, process in list(self._active_processes.items()):
+                try:
+                    if process.poll() is None:  # 进程仍在运行
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()  # 强制终止
+                        killed_count += 1
+                        logger.info(f"[MediaPrep] 已终止进程: PID={pid}")
+                except Exception as e:
+                    logger.warning(f"[MediaPrep] 终止进程失败 PID={pid}: {e}")
+            self._active_processes.clear()
+        return killed_count
+
     def shutdown(self):
         """关闭服务"""
         logger.info("[MediaPrep] 正在关闭...")
+        
+        # 1. 终止所有活跃的子进程
+        killed = self.kill_all_subprocesses()
+        if killed > 0:
+            logger.info(f"[MediaPrep] 已终止 {killed} 个子进程")
+        
+        # 2. 取消所有待检查的 720p 任务定时器
+        for job_id, timer in list(self.pending_720p_checks.items()):
+            timer.cancel()
+        self.pending_720p_checks.clear()
+        
+        # 3. 停止消费线程
         self.stop_event.set()
         self.consumer_thread.join(timeout=5)
         self.executor.shutdown(wait=False)

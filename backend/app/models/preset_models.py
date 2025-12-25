@@ -117,6 +117,9 @@ class PreprocessingSettings:
     # 分离预测次数: 1-5, 数值越高效果越好但速度越慢
     demucs_shifts: int = 1
 
+    # 是否启用频谱分诊（直通模式应设为 false）
+    enable_spectral_triage: bool = True
+
     # 分诊灵敏度: 0.0-1.0, 值越低越容易触发分离
     # 默认值从 spectrum_thresholds.py 获取: 0.35
     spectrum_threshold: float = 0.35
@@ -129,6 +132,7 @@ class PreprocessingSettings:
             "demucs_strategy": self.demucs_strategy,
             "demucs_model": self.demucs_model,
             "demucs_shifts": self.demucs_shifts,
+            "enable_spectral_triage": self.enable_spectral_triage,
             "spectrum_threshold": self.spectrum_threshold,
             "vad_filter": self.vad_filter,
         }
@@ -275,6 +279,7 @@ PRESET_FAST = MacroPreset(
         demucs_strategy="off",          # 强制关闭人声分离
         demucs_model="htdemucs",
         demucs_shifts=1,
+        enable_spectral_triage=False,   # 直通模式: 跳过频谱分诊
         spectrum_threshold=0.35,
         vad_filter=True,
     ),
@@ -313,6 +318,7 @@ PRESET_BALANCED = MacroPreset(
         demucs_strategy="auto",         # 智能分诊
         demucs_model="htdemucs",
         demucs_shifts=1,
+        enable_spectral_triage=True,    # 智能模式: 启用频谱分诊
         spectrum_threshold=0.35,
         vad_filter=True,
     ),
@@ -351,6 +357,7 @@ PRESET_QUALITY = MacroPreset(
         demucs_strategy="force_on",     # 强制开启人声分离
         demucs_model="mdx_extra",       # 使用 mdx_extra 高质量模型
         demucs_shifts=1,                # 增加预测次数
+        enable_spectral_triage=False,   # 强制分离模式: 跳过频谱分诊
         spectrum_threshold=0.35,
         vad_filter=True,
     ),

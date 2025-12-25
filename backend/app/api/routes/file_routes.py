@@ -34,5 +34,17 @@ def create_file_router(file_service: FileManagementService):
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"删除文件失败: {str(e)}")
-    
+
+    @router.post("/files/open-input-folder")
+    async def open_input_folder():
+        """使用系统文件管理器打开input目录"""
+        try:
+            success = file_service.open_input_folder()
+            if success:
+                return {"success": True, "message": "已打开input目录"}
+            else:
+                raise HTTPException(status_code=500, detail="打开文件夹失败")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"打开文件夹失败: {str(e)}")
+
     return router

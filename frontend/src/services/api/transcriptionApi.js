@@ -231,6 +231,34 @@ class TranscriptionAPI {
   }
 
   /**
+   * 生成 ASS 字幕文件
+   * @param {string} jobId - 任务ID
+   * @param {Object} options - 生成选项
+   * @param {string} options.style_preset - 样式预设 (default/movie/news/danmaku)
+   * @param {string} options.title - 字幕标题
+   * @param {number} options.video_width - 视频宽度
+   * @param {number} options.video_height - 视频高度
+   * @returns {Promise<{job_id: string, filename: string, message: string}>}
+   */
+  async generateASS(jobId, options = {}) {
+    return apiClient.post(`/api/media/${jobId}/ass/generate`, {
+      style_preset: options.style_preset || 'default',
+      title: options.title || 'Untitled',
+      video_width: options.video_width || 1920,
+      video_height: options.video_height || 1080
+    })
+  }
+
+  /**
+   * 获取 ASS 字幕文件内容
+   * @param {string} jobId - 任务ID
+   * @returns {Promise<{job_id: string, filename: string, content: string, encoding: string}>}
+   */
+  async getASSContent(jobId) {
+    return apiClient.get(`/api/media/${jobId}/ass`)
+  }
+
+  /**
    * 同步所有任务（第一阶段修复：数据同步）
    *
    * 从后端获取所有实际存在的任务列表（处理中 + 已完成）

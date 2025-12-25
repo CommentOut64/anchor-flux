@@ -12,18 +12,22 @@
     @click="handleCardClick"
   >
     <!-- 拖动手柄 -->
-    <div v-if="draggable" class="drag-handle" title="拖动排序" @click.stop>
-      <svg viewBox="0 0 24 24" fill="currentColor">
-        <path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/>
-      </svg>
-    </div>
+    <el-tooltip content="拖动排序" placement="right" :show-after="500">
+      <div v-if="draggable" class="drag-handle" @click.stop>
+        <svg viewBox="0 0 24 24" fill="currentColor">
+          <path d="M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/>
+        </svg>
+      </div>
+    </el-tooltip>
 
     <!-- 任务信息 -->
     <div class="task-info">
       <div class="task-header">
-        <span class="task-name" :title="task.title || task.filename">
-          {{ task.title || task.filename }}
-        </span>
+        <el-tooltip :content="task.title || task.filename" placement="top" :show-after="500">
+          <span class="task-name">
+            {{ task.title || task.filename }}
+          </span>
+        </el-tooltip>
         <span
           class="task-phase"
           :style="{
@@ -65,45 +69,62 @@
 
     <!-- 操作按钮 -->
     <div class="task-actions" @click.stop>
-      <button
-        v-if="task.status === 'processing'"
-        class="action-btn"
-        @click="pauseTask"
-        title="暂停"
-      >
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
-        </svg>
-      </button>
+      <el-tooltip content="暂停" placement="left" :show-after="500">
+        <button
+          v-if="task.status === 'processing'"
+          class="action-btn"
+          @click="pauseTask"
+        >
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+          </svg>
+        </button>
+      </el-tooltip>
 
-      <button
-        v-if="task.status === 'paused'"
-        class="action-btn action-btn--success"
-        @click="resumeTask"
-        title="恢复"
-      >
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M8 5v14l11-7z"/>
-        </svg>
-      </button>
+      <el-tooltip content="恢复" placement="left" :show-after="500">
+        <button
+          v-if="task.status === 'paused'"
+          class="action-btn action-btn--success"
+          @click="resumeTask"
+        >
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M8 5v14l11-7z"/>
+          </svg>
+        </button>
+      </el-tooltip>
 
-      <button
-        v-if="['processing', 'queued', 'paused'].includes(task.status)"
-        class="action-btn action-btn--danger"
-        @click="cancelTask"
-        title="取消"
-      >
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
-        </svg>
-      </button>
+      <el-tooltip content="取消" placement="left" :show-after="500">
+        <button
+          v-if="['processing', 'queued', 'paused'].includes(task.status) && task.status !== 'canceling'"
+          class="action-btn action-btn--danger"
+          @click="cancelTask"
+        >
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+          </svg>
+        </button>
+      </el-tooltip>
+
+      <!-- V3.8.2: 正在取消状态显示加载动画 -->
+      <el-tooltip content="正在取消..." placement="left" :show-after="500">
+        <button
+          v-if="task.status === 'canceling'"
+          class="action-btn action-btn--danger"
+          disabled
+        >
+          <svg viewBox="0 0 24 24" fill="currentColor" class="spin">
+            <path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/>
+          </svg>
+        </button>
+      </el-tooltip>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { transcriptionApi } from '@/services/api'
 import { PHASE_CONFIG, STATUS_CONFIG, formatProgress } from '@/constants/taskPhases'
 
@@ -116,8 +137,12 @@ const props = defineProps({
 
 const router = useRouter()
 
+// V3.7.4: 防抖控制 - 防止频繁切换暂停/恢复
+const lastOperationTime = ref(0)
+const DEBOUNCE_DELAY = 2000 // 2秒防抖
+
 const showProgress = computed(() =>
-  ['processing', 'queued', 'paused'].includes(props.task.status)
+  ['processing', 'queued', 'paused', 'canceling'].includes(props.task.status)
 )
 
 // 处理卡片点击事件
@@ -146,11 +171,27 @@ function getPhaseLabel(task) {
 
 // 暂停任务
 async function pauseTask() {
+  // V3.7.4: 防抖检查
+  const now = Date.now()
+  if (now - lastOperationTime.value < DEBOUNCE_DELAY) {
+    ElMessage.warning('操作过于频繁，请稍后再试')
+    return
+  }
+
+  lastOperationTime.value = now
   await transcriptionApi.pauseJob(props.task.job_id)
 }
 
 // 恢复任务
 async function resumeTask() {
+  // V3.7.4: 防抖检查
+  const now = Date.now()
+  if (now - lastOperationTime.value < DEBOUNCE_DELAY) {
+    ElMessage.warning('操作过于频繁，请稍后再试')
+    return
+  }
+
+  lastOperationTime.value = now
   await transcriptionApi.resumeJob(props.task.job_id)
 }
 
@@ -388,6 +429,26 @@ function formatTime(timestamp) {
   &--danger:hover {
     background: rgba(248, 81, 73, 0.15);
     color: var(--danger);
+  }
+
+  // V3.8.2: 禁用状态
+  &:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+}
+
+// V3.8.2: 旋转动画
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
   }
 }
 

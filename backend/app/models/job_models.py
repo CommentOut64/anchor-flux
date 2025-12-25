@@ -44,14 +44,14 @@ class PreprocessingConfig:
     # 是否启用熔断回溯
     enable_fuse_breaker: bool = True
 
-    # 最大重试次数
-    fuse_max_retry: int = 2
+    # 最大重试次数（默认1，只升级到 HTDEMUCS）
+    fuse_max_retry: int = 1
 
     # 置信度阈值
     fuse_confidence_threshold: float = 0.5
 
-    # 第二次重试是否自动升级到最强模型
-    fuse_auto_upgrade: bool = True
+    # 是否启用第二次自动升级到 MDX_EXTRA（默认False，可选配置）
+    fuse_auto_upgrade: bool = False
 
     # ========== VAD配置 ==========
     # VAD 静音过滤开关

@@ -15,12 +15,16 @@ import struct
 import asyncio
 import subprocess
 import time
+import logging
 from pathlib import Path
 from typing import Optional, Tuple
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.core.config import config
+from app.utils.ass_converter import ASSConverter
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/media", tags=["media"])
 
@@ -177,7 +181,7 @@ async def _get_video_duration(video_path: Path) -> float:
 
     # 检查视频文件是否存在
     if not video_path.exists():
-        print(f"[media] 视频文件不存在: {video_path}")
+        logger.debug(f"[media] 视频文件不存在: {video_path}")
         return 0.0
 
     cmd = [
@@ -186,8 +190,8 @@ async def _get_video_duration(video_path: Path) -> float:
         '-of', 'default=noprint_wrappers=1:nokey=1',
         str(video_path)
     ]
-    
-    print(f"[media] FFprobe 命令: {' '.join(cmd)}")
+
+    logger.debug(f"[media] FFprobe 命令: {' '.join(cmd)}")
 
     try:
         # 使用同步 subprocess 来避免异步事件循环问题
@@ -198,23 +202,23 @@ async def _get_video_duration(video_path: Path) -> float:
             timeout=30,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
-        
+
         if result.returncode != 0:
-            print(f"[media] FFprobe 失败 (返回码 {result.returncode}): {result.stderr}")
+            logger.debug(f"[media] FFprobe 失败 (返回码 {result.returncode}): {result.stderr}")
             return 0.0
-            
+
         duration_str = result.stdout.strip()
         if not duration_str:
-            print(f"[media] FFprobe 返回空时长，视频路径: {video_path}")
+            logger.debug(f"[media] FFprobe 返回空时长，视频路径: {video_path}")
             return 0.0
-        
-        print(f"[media] FFprobe 成功获取时长: {duration_str}秒")
+
+        logger.debug(f"FFprobe 成功获取时长: {duration_str}秒")
         return float(duration_str)
     except subprocess.TimeoutExpired:
-        print(f"[media] FFprobe 超时，视频路径: {video_path}")
+        logger.debug(f"[media] FFprobe 超时，视频路径: {video_path}")
         return 0.0
     except Exception as e:
-        print(f"[media] 获取视频时长异常: {e}, 路径: {video_path}")
+        logger.debug(f"[media] 获取视频时长异常: {e}, 路径: {video_path}")
         return 0.0
 
 
@@ -223,6 +227,8 @@ def _generate_peaks_with_ffmpeg(audio_path: Path, samples: int = 2000) -> Tuple[
     """
     使用FFmpeg生成波形峰值数据（比Python wave更高效）
     适用于大文件（>100MB）
+    
+    【关键修复】基于时间位置计算峰值，确保波形与时间轴严格对齐
     """
     ffmpeg_cmd = config.get_ffmpeg_command()
     ffprobe_cmd = config.get_ffprobe_command()
@@ -248,11 +254,12 @@ def _generate_peaks_with_ffmpeg(audio_path: Path, samples: int = 2000) -> Tuple[
         return [], 0
 
     # 使用FFmpeg提取原始PCM数据（降采样到8kHz单声道以减少数据量）
+    SAMPLE_RATE = 8000  # 采样率常量
     cmd = [
         ffmpeg_cmd,
         '-i', str(audio_path),
         '-ac', '1',           # 单声道
-        '-ar', '8000',        # 8kHz采样率
+        '-ar', str(SAMPLE_RATE),  # 8kHz采样率
         '-f', 's16le',        # 16-bit PCM
         '-acodec', 'pcm_s16le',
         '-'
@@ -269,17 +276,40 @@ def _generate_peaks_with_ffmpeg(audio_path: Path, samples: int = 2000) -> Tuple[
 
         # 解析PCM数据
         pcm_data = result.stdout
-        sample_count = len(pcm_data) // 2  # 16-bit = 2 bytes
+        actual_sample_count = len(pcm_data) // 2  # 16-bit = 2 bytes
 
-        if sample_count < samples:
-            samples = sample_count
+        if actual_sample_count == 0:
+            return [], duration
 
-        chunk_size = sample_count // samples
+        # 限制峰值数量不超过实际采样数
+        if actual_sample_count < samples:
+            samples = actual_sample_count
+
+        # 【关键修复】基于时间位置计算每个峰值对应的采样范围
+        # 这样确保第 i 个峰值严格对应时间轴上的 [i/samples * duration, (i+1)/samples * duration]
+        # 而不是依赖 PCM 数据量（可能与 duration 不精确匹配）
         peaks = []
+        time_per_peak = duration / samples  # 每个峰值代表的时间长度
 
         for i in range(samples):
-            start_idx = i * chunk_size * 2
-            end_idx = min(start_idx + chunk_size * 2, len(pcm_data))
+            # 基于时间计算采样范围
+            start_time = i * time_per_peak
+            end_time = (i + 1) * time_per_peak
+            
+            # 转换为采样点索引（基于实际采样率）
+            start_sample = int(start_time * SAMPLE_RATE)
+            end_sample = int(end_time * SAMPLE_RATE)
+            
+            # 确保不越界（PCM 数据可能比理论值稍短或稍长）
+            start_sample = min(start_sample, actual_sample_count - 1)
+            end_sample = min(end_sample, actual_sample_count)
+            
+            if start_sample >= end_sample:
+                peaks.extend([0.0, 0.0])
+                continue
+            
+            start_idx = start_sample * 2  # 16-bit = 2 bytes
+            end_idx = end_sample * 2
             chunk_bytes = pcm_data[start_idx:end_idx]
 
             if len(chunk_bytes) < 2:
@@ -306,6 +336,8 @@ def _generate_peaks_with_ffmpeg(audio_path: Path, samples: int = 2000) -> Tuple[
 def _generate_peaks_with_wave(audio_path: Path, samples: int = 2000) -> Tuple[list, float]:
     """
     使用Python wave模块生成波形峰值数据（流式读取，低内存占用）
+    
+    【关键修复】基于时间位置计算峰值，确保波形与时间轴严格对齐
     """
     try:
         with wave.open(str(audio_path), 'rb') as wav:
@@ -315,12 +347,37 @@ def _generate_peaks_with_wave(audio_path: Path, samples: int = 2000) -> Tuple[li
             sample_width = wav.getsampwidth()
             duration = n_frames / frame_rate
 
+            if duration <= 0:
+                return [], 0
+
             if n_frames < samples:
                 samples = n_frames
-            chunk_frames = n_frames // samples
+            
+            # 【关键修复】基于时间位置计算每个峰值的帧范围
+            # 确保第 i 个峰值严格对应时间轴上的 [i/samples * duration, (i+1)/samples * duration]
+            time_per_peak = duration / samples
             peaks = []
 
             for i in range(samples):
+                # 基于时间计算帧范围
+                start_time = i * time_per_peak
+                end_time = (i + 1) * time_per_peak
+                
+                # 转换为帧索引
+                start_frame = int(start_time * frame_rate)
+                end_frame = int(end_time * frame_rate)
+                
+                # 确保不越界
+                start_frame = min(start_frame, n_frames - 1)
+                end_frame = min(end_frame, n_frames)
+                chunk_frames = end_frame - start_frame
+                
+                if chunk_frames <= 0:
+                    peaks.extend([0.0, 0.0])
+                    continue
+                
+                # 定位到精确位置
+                wav.setpos(start_frame)
                 frames_data = wav.readframes(chunk_frames)
 
                 if not frames_data:
@@ -499,7 +556,7 @@ async def get_video(job_id: str, request: Request):
     对于不兼容的格式或编码（如HEVC/H.265），会触发异步生成Proxy
     """
     job_dir = config.JOBS_DIR / job_id
-    print(f"[media] 收到视频请求: {job_id}")
+    logger.debug(f"[media] 收到视频请求: {job_id}")
 
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -511,7 +568,7 @@ async def get_video(job_id: str, request: Request):
     preview_360p = job_dir / "preview_360p.mp4"
 
     if proxy_720p.exists():
-        print(f"[media] 返回720p高清视频")
+        logger.debug(f"[media] 返回720p高清视频")
         return _serve_file_with_range(proxy_720p, request, 'video/mp4')
 
     if remux_video.exists():
@@ -528,7 +585,7 @@ async def get_video(job_id: str, request: Request):
         print(f"[media] 视频文件不存在: {job_id}")
         raise HTTPException(status_code=404, detail="视频文件不存在")
 
-    print(f"[media] 找到源视频: {video_file.name}, 扩展名: {video_file.suffix.lower()}")
+    logger.debug(f"找到源视频: {video_file.name}, 扩展名: {video_file.suffix.lower()}")
 
     # 3. 检查是否需要生成Proxy（先检查扩展名，再检查编码）
     needs_transcode = False
@@ -541,15 +598,14 @@ async def get_video(job_id: str, request: Request):
         print(f"[media] 扩展名需要转码: {video_file.suffix.lower()} 属于 {NEED_TRANSCODE_FORMATS}")
     # 3.2 即使是 .mp4/.webm，也需检查实际编码是否兼容
     elif video_file.suffix.lower() in BROWSER_COMPATIBLE_FORMATS:
-        print(f"[media] 扩展名兼容，检查视频编码...")
         codec = _get_video_codec(video_file)
-        print(f"[media] 检测到视频编码: {codec}")
         if codec and codec in NEED_TRANSCODE_CODECS:
             needs_transcode = True
             transcode_reason = f"编码不兼容 ({codec.upper()})"
-            print(f"[media] 编码需要转码: {codec} 属于 {NEED_TRANSCODE_CODECS}")
+            logger.debug(f"视频编码检测: {codec} (不兼容，需转码)")
         else:
-            print(f"[media] 编码兼容，无需转码")
+            # 编码兼容，无需转码
+            logger.debug(f"视频编码检测: {codec} (兼容)")
 
     if needs_transcode:
         print(f"[media] 视频需要转码: {transcode_reason}")
@@ -618,7 +674,7 @@ async def get_video(job_id: str, request: Request):
         )
 
     # 4. 返回兼容格式的源视频
-    print(f"[media] 无需转码，直接返回源视频")
+    # 日志已在编码检测时输出，此处不再重复
     return _serve_file_with_range(video_file, request, 'video/mp4')
 
 
@@ -675,15 +731,22 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
         # 上限100k（约800KB JSON），下限4k
         target_samples = int(duration * 20)
         samples = max(4000, min(target_samples, 100000))
-        print(f"[media] 动态采样：时长{duration:.1f}s → {samples}个采样点")
+        logger.debug(f"动态采样：时长{duration:.1f}s → {samples}个采样点")
 
-    peaks_cache_file = job_dir / f"peaks_{samples}.json"
+    # 【修复】使用版本号标识缓存，算法更新后自动使旧缓存失效
+    # v2: 修复了采样位置计算的累积误差问题
+    # v3: 改用基于时间位置的精确计算，确保波形与时间轴严格对齐
+    PEAKS_CACHE_VERSION = 3
+    peaks_cache_file = job_dir / f"peaks_{samples}_v{PEAKS_CACHE_VERSION}.json"
 
     # 检查缓存
     if peaks_cache_file.exists():
         try:
             with open(peaks_cache_file, 'r') as f:
-                return JSONResponse(json.load(f))
+                cached_data = json.load(f)
+                # 验证缓存版本
+                if cached_data.get("cache_version") == PEAKS_CACHE_VERSION:
+                    return JSONResponse(cached_data)
         except:
             pass
 
@@ -718,7 +781,8 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
             "peaks": peaks,
             "duration": duration,
             "method": used_method,
-            "samples": len(peaks) // 2
+            "samples": len(peaks) // 2,
+            "cache_version": PEAKS_CACHE_VERSION  # 添加版本号到缓存
         }
 
         # 缓存结果
@@ -1477,6 +1541,144 @@ async def save_srt_content(job_id: str, request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"保存SRT文件失败: {str(e)}")
+
+
+@router.get("/{job_id}/ass")
+async def get_ass_content(job_id: str):
+    """
+    获取 ASS 字幕文件内容
+
+    Returns:
+        JSON: { job_id, filename, content, encoding }
+    """
+    job_dir = config.JOBS_DIR / job_id
+
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    ass_file = None
+    for file in job_dir.iterdir():
+        if file.suffix.lower() == '.ass':
+            ass_file = file
+            break
+
+    if not ass_file:
+        raise HTTPException(status_code=404, detail="ASS文件不存在")
+
+    try:
+        with open(ass_file, 'r', encoding='utf-8-sig') as f:
+            content = f.read()
+
+        return JSONResponse({
+            "job_id": job_id,
+            "filename": ass_file.name,
+            "content": content,
+            "encoding": "utf-8"
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取ASS文件失败: {str(e)}")
+
+
+@router.post("/{job_id}/ass/generate")
+async def generate_ass_from_srt(job_id: str, request: Request):
+    """
+    从 SRT 文件生成 ASS 字幕文件
+
+    Request Body:
+        {
+            "style_preset": "default" | "movie" | "news" | "danmaku",
+            "title": "字幕标题",
+            "video_width": 1920,
+            "video_height": 1080
+        }
+
+    Returns:
+        JSON: { job_id, filename, message }
+    """
+    job_dir = config.JOBS_DIR / job_id
+
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    # 查找 SRT 文件
+    srt_file = None
+    for file in job_dir.iterdir():
+        if file.suffix.lower() == '.srt':
+            srt_file = file
+            break
+
+    if not srt_file:
+        raise HTTPException(status_code=404, detail="SRT文件不存在")
+
+    try:
+        # 解析请求参数
+        body = await request.json()
+        style_preset = body.get("style_preset", "default")
+        title = body.get("title", srt_file.stem)
+        video_width = body.get("video_width", 1920)
+        video_height = body.get("video_height", 1080)
+
+        # 读取 SRT 文件并解析为字幕数据
+        subtitles = []
+        with open(srt_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # 简单的 SRT 解析
+        blocks = content.strip().split('\n\n')
+        for block in blocks:
+            lines = block.strip().split('\n')
+            if len(lines) >= 3:
+                # 解析时间戳行
+                time_line = lines[1]
+                if ' --> ' in time_line:
+                    start_str, end_str = time_line.split(' --> ')
+                    start = _parse_srt_timestamp(start_str.strip())
+                    end = _parse_srt_timestamp(end_str.strip())
+                    text = '\n'.join(lines[2:])
+                    subtitles.append({
+                        "start": start,
+                        "end": end,
+                        "text": text
+                    })
+
+        # 生成 ASS 文件
+        ass_file = job_dir / f"{srt_file.stem}.ass"
+        ASSConverter.convert_from_subtitles(
+            subtitles=subtitles,
+            output_path=ass_file,
+            style_preset=style_preset,
+            title=title,
+            video_width=video_width,
+            video_height=video_height
+        )
+
+        logger.info(f"ASS 文件已生成: {ass_file}")
+
+        return JSONResponse({
+            "job_id": job_id,
+            "filename": ass_file.name,
+            "message": "ASS文件生成成功"
+        })
+
+    except Exception as e:
+        logger.error(f"生成ASS文件失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"生成ASS文件失败: {str(e)}")
+
+
+def _parse_srt_timestamp(timestamp: str) -> float:
+    """
+    解析 SRT 时间戳为秒数
+
+    Args:
+        timestamp: SRT 时间戳 (HH:MM:SS,mmm)
+
+    Returns:
+        秒数
+    """
+    time_part, ms_part = timestamp.replace(',', '.').split('.')
+    h, m, s = map(int, time_part.split(':'))
+    ms = int(ms_part)
+    return h * 3600 + m * 60 + s + ms / 1000
 
 
 @router.get("/{job_id}/info")

@@ -163,6 +163,33 @@ class ProgressTracker:
             self.current_phase = phase
             logger.info(f"[{self.job_id}] 开始阶段: {phase.value} (共 {total_items} 项)")
 
+    def resume_phase(self, phase: ProcessPhase, total_items: int, completed_items: int, message: str = ""):
+        """
+        V3.7.4: 恢复某个阶段（用于断点续传）
+
+        与 start_phase 的区别：
+        - start_phase: 从 0 开始，completed_items = 0
+        - resume_phase: 从已完成数量开始，completed_items = 已完成数量
+
+        Args:
+            phase: 阶段枚举
+            total_items: 总项目数
+            completed_items: 已完成项目数
+            message: 进度消息
+        """
+        if phase in self.phases:
+            pp = self.phases[phase]
+            pp.is_active = True
+            pp.total_items = total_items
+            pp.completed_items = completed_items  # 保留已完成数量
+            pp.message = message
+            pp.start_time = time.time()
+            self.current_phase = phase
+            logger.info(
+                f"[{self.job_id}] 恢复阶段: {phase.value} "
+                f"(已完成 {completed_items}/{total_items} 项)"
+            )
+
     def update_phase(
         self,
         phase: ProcessPhase,

@@ -8,9 +8,10 @@ import logging
 import subprocess
 import os
 import gc
+import signal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,11 @@ class ShutdownRequest(BaseModel):
     """系统关闭请求"""
     cleanup_temp: bool = False
     force: bool = False
+
+
+class LogLevelRequest(BaseModel):
+    """日志级别设置请求"""
+    level: str
 
 
 # ========== 客户端心跳管理 ==========
@@ -103,18 +109,91 @@ async def has_active_clients():
 
 @router.post("/api/system/shutdown")
 async def shutdown_system(req: ShutdownRequest):
-    """安全关闭系统"""
+    """
+    安全关闭系统
+    
+    执行顺序:
+    1. 保存所有运行中任务的断点
+    2. 停止任务队列服务
+    3. 终止所有 FFmpeg 子进程
+    4. 卸载 GPU 模型并清理显存
+    5. 清理临时文件（可选，保留断点数据）
+    6. 终止所有相关进程和命令行窗口
+    """
     cleanup_report = {}
 
     try:
-        logger.info("="  * 60)
+        logger.info("=" * 60)
         logger.info("收到系统关闭请求")
-        logger.info("="  * 60)
+        logger.info("=" * 60)
 
-        # Phase 1: 清理 GPU 资源
-        logger.info("Phase 1: 清理GPU资源...")
+        # ========== Phase 1: 保存断点数据 ==========
+        logger.info("Phase 1: 保存断点数据...")
+        
+        # 1.1 保存所有运行中任务的状态
+        try:
+            from app.services.job_queue_service import get_queue_service
+            queue_service = get_queue_service()
+            
+            # 获取当前运行的任务
+            running_job_id = queue_service.running_job_id
+            if running_job_id:
+                job = queue_service.get_job(running_job_id)
+                if job:
+                    # 设置暂停标志，让流水线保存 checkpoint
+                    job.paused = True
+                    job.message = "系统关闭，自动保存进度"
+                    # 保存任务元信息
+                    queue_service.transcription_service.save_job_meta(job)
+                    logger.info(f"已保存运行中任务状态: {running_job_id}")
+            
+            # 保存队列状态
+            queue_service._save_state()
+            cleanup_report["checkpoint_saved"] = True
+            logger.info("断点数据已保存")
+        except Exception as e:
+            logger.warning(f"保存断点数据失败: {e}")
+            cleanup_report["checkpoint_saved"] = False
 
-        # 1.1 卸载所有模型
+        # ========== Phase 2: 停止服务 ==========
+        logger.info("Phase 2: 停止后台服务...")
+        
+        # 2.1 停止媒体准备服务（包括终止其 FFmpeg 子进程）
+        try:
+            from app.services.media_prep_service import get_media_prep_service
+            media_prep = get_media_prep_service()
+            killed_media = media_prep.kill_all_subprocesses()
+            media_prep.shutdown()
+            cleanup_report["media_prep_stopped"] = True
+            cleanup_report["media_prep_killed"] = killed_media
+            logger.info(f"媒体准备服务已停止 (终止 {killed_media} 个进程)")
+        except Exception as e:
+            logger.warning(f"停止媒体准备服务失败: {e}")
+            cleanup_report["media_prep_stopped"] = False
+
+        # 2.2 停止任务队列服务
+        try:
+            from app.services.job_queue_service import get_queue_service
+            queue_service = get_queue_service()
+            queue_service.shutdown()
+            cleanup_report["queue_service_stopped"] = True
+            logger.info("任务队列服务已停止")
+        except Exception as e:
+            logger.warning(f"停止任务队列服务失败: {e}")
+            cleanup_report["queue_service_stopped"] = False
+
+        # ========== Phase 3: 终止所有 FFmpeg 进程 ==========
+        logger.info("Phase 3: 终止所有FFmpeg进程...")
+        
+        killed_ffmpeg = _kill_all_ffmpeg_processes()
+        cleanup_report["ffmpeg_killed"] = killed_ffmpeg
+        if killed_ffmpeg > 0:
+            logger.info(f"已终止 {killed_ffmpeg} 个 FFmpeg 进程")
+
+        # ========== Phase 4: 清理 GPU 资源 ==========
+        logger.info("Phase 4: 清理GPU资源...")
+
+        # 4.1 卸载所有模型
         try:
             from app.services.model_preload_manager import get_model_manager
             model_manager = get_model_manager()
@@ -126,13 +205,14 @@ async def shutdown_system(req: ShutdownRequest):
             logger.warning(f"卸载模型失败: {e}")
             cleanup_report["models_unloaded"] = False
 
-        # 1.2 清理 GPU 缓存
+        # 4.2 清理 GPU 缓存
         try:
             gc.collect()
             try:
                 import torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
                     logger.info("GPU缓存已清理")
                     cleanup_report["gpu_cache_cleared"] = True
             except ImportError:
@@ -141,34 +221,13 @@ async def shutdown_system(req: ShutdownRequest):
             logger.warning(f"清理GPU缓存失败: {e}")
             cleanup_report["gpu_cache_cleared"] = False
 
-        # 1.3 终止 FFmpeg 子进程
-        try:
-            from app.services.ffmpeg_manager import get_ffmpeg_manager
-            ffmpeg_mgr = get_ffmpeg_manager()
-            # 这里假设有 kill_all 方法，如果没有则跳过
-            if hasattr(ffmpeg_mgr, 'kill_all_subprocesses'):
-                killed = ffmpeg_mgr.kill_all_subprocesses()
-                cleanup_report["subprocesses_killed"] = killed
-                logger.info(f"FFmpeg子进程已终止: {killed}个")
-            else:
-                cleanup_report["subprocesses_killed"] = 0
-        except Exception as e:
-            logger.warning(f"终止子进程失败: {e}")
-            cleanup_report["subprocesses_killed"] = 0
-
-        # 1.4 清理临时文件（可选）
+        # ========== Phase 5: 清理临时文件（可选） ==========
         if req.cleanup_temp:
-            try:
-                from app.core.config import config
-                import shutil
-                if config.TEMP_DIR.exists():
-                    shutil.rmtree(config.TEMP_DIR, ignore_errors=True)
-                    config.TEMP_DIR.mkdir(exist_ok=True)
-                    cleanup_report["temp_files_cleaned"] = True
-                    logger.info("临时文件已清理")
-            except Exception as e:
-                logger.warning(f"清理临时文件失败: {e}")
-                cleanup_report["temp_files_cleaned"] = False
+            logger.info("Phase 5: 清理临时文件...")
+            cleaned = _cleanup_temp_files_safely()
+            cleanup_report["temp_files_cleaned"] = cleaned
+        else:
+            cleanup_report["temp_files_cleaned"] = False
 
         # 发送成功响应
         response = {
@@ -178,6 +237,7 @@ async def shutdown_system(req: ShutdownRequest):
         }
 
         logger.info("资源清理完成，准备关闭进程")
+        logger.info(f"清理报告: {cleanup_report}")
 
     except Exception as e:
         logger.error(f"关闭系统失败: {str(e)}", exc_info=True)
@@ -186,49 +246,314 @@ async def shutdown_system(req: ShutdownRequest):
             "message": f"关闭系统失败: {str(e)}"
         }
 
-    # Phase 2: 异步执行进程终止（响应发送后执行）
+    # Phase 6: 异步执行进程终止（响应发送后执行）
     asyncio.create_task(_terminate_processes())
 
     return response
 
 
+def _kill_all_ffmpeg_processes() -> int:
+    """
+    终止所有 FFmpeg 相关进程
+    
+    Returns:
+        int: 被终止的进程数
+    """
+    killed_count = 0
+    
+    try:
+        import psutil
+        
+        current_pid = os.getpid()
+        ffmpeg_names = {'ffmpeg.exe', 'ffprobe.exe', 'ffmpeg', 'ffprobe'}
+        
+        for proc in psutil.process_iter(['pid', 'name', 'ppid']):
+            try:
+                proc_name = proc.info['name'].lower() if proc.info['name'] else ''
+                
+                # 检查是否是 FFmpeg 相关进程
+                if proc_name in ffmpeg_names:
+                    # 终止进程
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                    killed_count += 1
+                    logger.debug(f"已终止 FFmpeg 进程: PID={proc.info['pid']}")
+                    
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+                
+    except ImportError:
+        logger.warning("psutil 未安装，使用 taskkill 回退方案")
+        # 回退方案：使用 taskkill
+        try:
+            result = subprocess.run(
+                ['taskkill', '/F', '/IM', 'ffmpeg.exe'],
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                killed_count += 1
+        except:
+            pass
+            
+    except Exception as e:
+        logger.warning(f"终止 FFmpeg 进程失败: {e}")
+        
+    return killed_count
+
+
+def _cleanup_temp_files_safely() -> bool:
+    """
+    安全清理临时文件
+    
+    注意：保留以下关键数据：
+    - jobs/ 目录下的所有数据（断点、元信息、输出文件）- 永不清理
+    - models/ 目录下的模型文件
+    - output/ 目录下的输出文件
+    
+    只清理：
+    - temp/ 目录下的临时文件（排除包含断点数据的目录）
+    
+    Returns:
+        bool: 是否清理成功
+    """
+    try:
+        from app.core.config import config
+        import shutil
+        
+        cleaned = False
+        
+        # 只清理 temp 目录，绝对不清理 jobs 目录
+        if config.TEMP_DIR.exists():
+            # 遍历 temp 目录，只删除确定可以清理的临时文件
+            for item in config.TEMP_DIR.iterdir():
+                try:
+                    if item.is_file():
+                        # 只删除临时文件（如 .tmp, .part 等）
+                        safe_extensions = {'.tmp', '.part', '.temp', '.log'}
+                        if item.suffix.lower() in safe_extensions:
+                            item.unlink()
+                            cleaned = True
+                    elif item.is_dir():
+                        # 检查是否是需要保留的目录
+                        # 保留包含任何重要数据的目录
+                        should_keep = False
+                        important_files = {
+                            'checkpoint.json', 'meta.json', 'progress.json',
+                            'job_meta.json', 'subtitles.json', '.srt', '.vtt'
+                        }
+                        
+                        for sub_item in item.rglob('*'):
+                            if sub_item.name in important_files or sub_item.suffix in {'.srt', '.vtt', '.json'}:
+                                should_keep = True
+                                break
+                        
+                        if not should_keep:
+                            shutil.rmtree(item, ignore_errors=True)
+                            cleaned = True
+                except Exception as e:
+                    logger.debug(f"清理临时文件失败: {item} - {e}")
+        
+        if cleaned:
+            logger.info("临时文件已清理（保留所有任务数据）")
+        
+        return cleaned
+        
+    except Exception as e:
+        logger.warning(f"清理临时文件失败: {e}")
+        return False
+
+
 async def _terminate_processes():
-    """终止所有相关进程"""
+    """
+    终止所有相关进程和命令行窗口
+    
+    使用多种策略确保进程被正确终止:
+    1. 使用 psutil 查找并终止子进程
+    2. 使用 taskkill 按进程名终止
+    3. 使用 taskkill 按窗口标题终止
+    """
     await asyncio.sleep(0.5)  # 等待响应发送完成
 
-    logger.info("="  * 60)
-    logger.info("Phase 2: 终止所有进程")
-    logger.info("="  * 60)
+    logger.info("=" * 60)
+    logger.info("Phase 6: 终止所有进程")
+    logger.info("=" * 60)
 
     try:
-        # 关闭 Vite 进程（按窗口标题）
-        logger.info("关闭前端进程...")
-        subprocess.run(
-            'taskkill /F /FI "WINDOWTITLE eq 前端服务*"',
-            shell=True,
-            capture_output=True,
-            timeout=5
-        )
+        # 方法1: 使用 psutil 终止当前进程的所有子进程
+        try:
+            import psutil
+            current_process = psutil.Process(os.getpid())
+            children = current_process.children(recursive=True)
+            
+            for child in children:
+                try:
+                    child.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            
+            # 等待子进程结束
+            gone, alive = psutil.wait_procs(children, timeout=3)
+            
+            # 强制终止仍存活的进程
+            for proc in alive:
+                try:
+                    proc.kill()
+                except psutil.NoSuchProcess:
+                    pass
+                    
+            logger.info(f"已终止 {len(children)} 个子进程")
+        except ImportError:
+            logger.debug("psutil 不可用，使用备选方案")
+        except Exception as e:
+            logger.debug(f"psutil 终止子进程失败: {e}")
 
-        # 关闭 cmd 窗口
-        logger.info("关闭命令行窗口...")
-        subprocess.run(
-            'taskkill /F /FI "WINDOWTITLE eq 后端服务*"',
-            shell=True,
-            capture_output=True,
-            timeout=5
-        )
-        subprocess.run(
-            'taskkill /F /FI "WINDOWTITLE eq 前端服务*"',
-            shell=True,
-            capture_output=True,
-            timeout=5
-        )
+        # 方法2: 使用 psutil 精确终止占用端口 5173 的进程（前端）
+        if os.name == 'nt':
+            try:
+                import psutil
+                for conn in psutil.net_connections(kind='inet'):
+                    if conn.laddr.port == 5173 and conn.status == 'LISTEN':
+                        try:
+                            proc = psutil.Process(conn.pid)
+                            logger.info(f"终止前端进程: PID={conn.pid}")
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=3)
+                            except psutil.TimeoutExpired:
+                                proc.kill()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+            except Exception as e:
+                logger.debug(f"psutil 终止前端进程失败: {e}")
+                # 备选方案：使用 netstat + taskkill
+                try:
+                    result = subprocess.run(
+                        'netstat -ano | findstr ":5173" | findstr "LISTENING"',
+                        shell=True,
+                        capture_output=True,
+                        timeout=5
+                    )
+                    if result.returncode == 0 and result.stdout:
+                        for line in result.stdout.decode().strip().split('\n'):
+                            parts = line.split()
+                            if len(parts) >= 5:
+                                pid = parts[-1]
+                                subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True, timeout=3)
+                                logger.info(f"已终止前端进程 (PID: {pid})")
+                except Exception:
+                    pass
+
+        # 终止主窗口（run.bat 的 cmd 窗口）和子窗口
+        # 使用 taskkill 终止所有相关的 cmd.exe 进程
+        # 注意：taskkill 使用 /FI 过滤器时必须同时指定 /IM 参数
+        if os.name == 'nt':
+            try:
+                # 终止标题包含 Video2SRT 的 cmd 窗口（Backend/Frontend 子窗口）
+                subprocess.run(
+                    'taskkill /F /IM cmd.exe /FI "WINDOWTITLE eq Video2SRT*"',
+                    shell=True,
+                    capture_output=True,
+                    timeout=3
+                )
+                # 终止主窗口（标题是 "Video to SRT GPU"，精确匹配）
+                subprocess.run(
+                    'taskkill /F /IM cmd.exe /FI "WINDOWTITLE eq Video to SRT GPU"',
+                    shell=True,
+                    capture_output=True,
+                    timeout=3
+                )
+                # 备用：匹配 "Video to SRT*" 模式
+                subprocess.run(
+                    'taskkill /F /IM cmd.exe /FI "WINDOWTITLE eq Video to SRT*"',
+                    shell=True,
+                    capture_output=True,
+                    timeout=3
+                )
+                logger.info("主窗口终止命令已发送")
+            except Exception as e:
+                logger.debug(f"终止主窗口失败: {e}")
+
+        logger.info("相关进程终止命令已发送")
 
     except Exception as e:
         logger.error(f"终止进程失败: {e}")
 
     # 自我终止
     logger.info("后端进程即将退出...")
-    logger.info("="  * 60)
+    logger.info("=" * 60)
+
+    # 使用 os._exit 确保立即退出，不执行 cleanup handlers
     os._exit(0)
+
+
+# ========== 日志级别管理 ==========
+
+@router.get("/api/system/log-level")
+async def get_log_level():
+    """获取当前日志级别"""
+    try:
+        # 根logger设置为DEBUG，实际级别由处理器控制
+        root_logger = logging.getLogger()
+        level_name = "INFO"  # 默认值
+
+        # 从控制台处理器获取实际的日志级别
+        for handler in root_logger.handlers:
+            if isinstance(handler, logging.StreamHandler):
+                level_name = logging.getLevelName(handler.level)
+                break
+
+        return {
+            "success": True,
+            "level": level_name,
+            "message": "日志级别获取成功"
+        }
+    except Exception as e:
+        logger.error(f"获取日志级别失败: {e}")
+        return {
+            "success": False,
+            "level": "INFO",
+            "message": f"获取日志级别失败: {str(e)}"
+        }
+
+
+@router.post("/api/system/log-level")
+async def set_log_level(req: LogLevelRequest):
+    """设置日志级别"""
+    try:
+        # 验证日志级别
+        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        level = req.level.upper()
+
+        if level not in valid_levels:
+            return {
+                "success": False,
+                "message": f"无效的日志级别: {req.level}，有效值: {', '.join(valid_levels)}"
+            }
+
+        # 设置根日志记录器的级别
+        root_logger = logging.getLogger()
+        root_logger.setLevel(getattr(logging, level))
+
+        # 同时更新所有已存在的日志记录器
+        for name in logging.Logger.manager.loggerDict:
+            logger_obj = logging.getLogger(name)
+            if isinstance(logger_obj, logging.Logger):
+                logger_obj.setLevel(getattr(logging, level))
+
+        logger.info(f"日志级别已更新为: {level}")
+
+        return {
+            "success": True,
+            "level": level,
+            "message": f"日志级别已更新为 {level}，重启系统后永久生效"
+        }
+    except Exception as e:
+        logger.error(f"设置日志级别失败: {e}")
+        return {
+            "success": False,
+            "message": f"设置日志级别失败: {str(e)}"
+        }

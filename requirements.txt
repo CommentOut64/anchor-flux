@@ -17,9 +17,9 @@ sympy
 
 # --- PyTorch (CUDA 11.8) ---
 # 包含 CUDA 11 运行库
+# 注意: torchvision 已移除以减小安装包体积 (~800MB)
 torch==2.4.0+cu118
 torchaudio==2.4.0+cu118
-torchvision==0.19.0+cu118
 
 # --- AI 推理引擎 (混合 CUDA 环境) ---
 # Faster-Whisper 1.2.1 需要 CTranslate2 4.x
@@ -36,7 +36,14 @@ nvidia-cublas-cu12==12.1.3.1
 nvidia-cudnn-cu12==8.9.7.29
 
 # --- ONNX (兼容性配置) ---
+# 强制排除 CPU 版本，只使用 GPU 版本
+# onnxruntime-gpu 完全兼容 CPU 推理，可满足 funasr-onnx 的依赖
 onnxruntime-gpu==1.18.0
+
+# --- FunASR (语音识别) ---
+# 注意：funasr-onnx 依赖 onnxruntime，但我们用 onnxruntime-gpu 替代
+# 安装后必须执行：pip uninstall onnxruntime -y
+funasr-onnx==0.4.1
 
 # --- 音频处理 ---
 librosa

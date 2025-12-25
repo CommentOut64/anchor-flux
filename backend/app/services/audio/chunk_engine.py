@@ -8,12 +8,17 @@ Phase 2 实现 - 2025-12-10
 """
 
 import logging
+import warnings
 from typing import List, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass
 
 import numpy as np
-import librosa
+# 抑制 librosa 的 PySoundFile/audioread 警告
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", message="PySoundFile failed")
+    warnings.filterwarnings("ignore", message="audioread")
+    import librosa
 
 from app.services.audio.vad_service import VADService, VADConfig, VADMethod
 from app.services.demucs_service import DemucsService, BGMLevel

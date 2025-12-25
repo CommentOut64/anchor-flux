@@ -5,9 +5,11 @@ import shutil
 import logging
 import asyncio
 import time
+import subprocess
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import json
 from typing import Optional, List
@@ -39,6 +41,7 @@ from app.api.routes import model_routes
 from app.api.routes import media_routes  # 新增：媒体资源路由
 from app.api.routes.transcription_routes import create_transcription_router
 from app.api.routes.demucs_routes import create_demucs_router  # 新增：Demucs配置路由
+from app.api.routes.file_routes import create_file_router  # 新增：文件管理路由
 from app.api.routes import system_routes  # 新增：系统管理路由
 from app.api.routes import config_routes  # 新增：用户配置路由
 from app.services.file_service import FileManagementService
@@ -48,6 +51,146 @@ from app.services.ffmpeg_manager import get_ffmpeg_manager
 
 # 配置日志（在其他初始化之前）
 logger = setup_logging()
+
+
+def cleanup_old_processes():
+    """
+    启动时清理可能残留的旧进程
+    
+    清理对象：
+    1. 占用端口 8000 的旧后端进程（排除自身）
+    2. 占用端口 5173 的旧前端进程
+    3. 旧的 FFmpeg 进程
+    
+    使用 psutil 进行更可靠的进程管理
+    """
+    logger.info("=" * 40)
+    logger.info("检查并清理残留的旧进程...")
+    logger.info("=" * 40)
+    cleaned_count = 0
+    current_pid = os.getpid()
+    
+    if os.name != 'nt':
+        logger.info("非 Windows 系统，跳过旧进程清理")
+        return cleaned_count
+    
+    try:
+        import psutil
+        
+        # 1. 查找并清理占用端口 8000 的进程（排除自身）
+        logger.info("检查端口 8000...")
+        for conn in psutil.net_connections(kind='inet'):
+            if conn.laddr.port == 8000 and conn.status == 'LISTEN':
+                try:
+                    proc = psutil.Process(conn.pid)
+                    if proc.pid != current_pid:
+                        logger.info(f"发现占用端口 8000 的旧进程: PID={proc.pid}, Name={proc.name()}")
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=3)
+                        except psutil.TimeoutExpired:
+                            proc.kill()
+                        cleaned_count += 1
+                        logger.info(f"已终止旧后端进程 (PID: {proc.pid})")
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    logger.debug(f"无法处理进程: {e}")
+        
+        # 2. 查找并清理占用端口 5173 的进程
+        logger.info("检查端口 5173...")
+        for conn in psutil.net_connections(kind='inet'):
+            if conn.laddr.port == 5173 and conn.status == 'LISTEN':
+                try:
+                    proc = psutil.Process(conn.pid)
+                    logger.info(f"发现占用端口 5173 的旧进程: PID={proc.pid}, Name={proc.name()}")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                    cleaned_count += 1
+                    logger.info(f"已终止旧前端进程 (PID: {proc.pid})")
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    logger.debug(f"无法处理进程: {e}")
+        
+        # 3. 清理所有 FFmpeg 进程
+        logger.info("检查 FFmpeg 进程...")
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                if proc.info['name'] and proc.info['name'].lower() in ['ffmpeg.exe', 'ffprobe.exe']:
+                    logger.info(f"发现 FFmpeg 进程: PID={proc.info['pid']}")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                    cleaned_count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        
+        # 4. 清理可能残留的 Python uvicorn 进程（按命令行参数匹配）
+        logger.info("检查残留的 uvicorn 进程...")
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if proc.info['pid'] == current_pid:
+                    continue  # 跳过自身
+                    
+                cmdline = proc.info.get('cmdline') or []
+                cmdline_str = ' '.join(cmdline).lower()
+                
+                # 匹配 uvicorn 且运行 app.main:app
+                if 'uvicorn' in cmdline_str and 'app.main:app' in cmdline_str:
+                    logger.info(f"发现残留的 uvicorn 进程: PID={proc.info['pid']}")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                    cleaned_count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+                
+    except ImportError:
+        logger.warning("psutil 未安装，使用备选方案清理进程")
+        # 回退到 taskkill 方案
+        try:
+            # 使用 netstat 和 taskkill
+            result = subprocess.run(
+                'netstat -ano | findstr ":8000" | findstr "LISTENING"',
+                shell=True,
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout:
+                lines = result.stdout.decode().strip().split('\n')
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) >= 5:
+                        pid = parts[-1]
+                        if pid != str(current_pid):
+                            subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True, timeout=3)
+                            cleaned_count += 1
+                            logger.info(f"已清理端口 8000 上的旧进程 (PID: {pid})")
+        except Exception as e:
+            logger.warning(f"备选清理方案失败: {e}")
+    
+    except Exception as e:
+        logger.warning(f"清理旧进程时发生错误: {e}")
+    
+    if cleaned_count > 0:
+        logger.info(f"共清理 {cleaned_count} 个残留进程")
+        # 等待进程完全退出
+        time.sleep(2)
+    else:
+        logger.info("未发现需要清理的残留进程")
+    
+    logger.info("=" * 40)
+    return cleaned_count
+
+
+# 注意：不再在模块加载时自动执行清理
+# run.bat 会在启动前进行清理，避免这里阻塞启动
+# 如需手动清理，可以调用 cleanup_old_processes()
+
 
 app = FastAPI(title="Video To SRT API", version="0.3.0")
 
@@ -186,6 +329,10 @@ transcription_service = get_transcription_service(JOBS_DIR)
 
 # 初始化文件管理服务
 file_service = FileManagementService(INPUT_DIR, OUTPUT_DIR)
+
+# 注册文件管理路由
+file_router = create_file_router(file_service)
+app.include_router(file_router)
 
 # 注册转录路由（包含暂停、恢复等新功能）
 # 注意：model_routes已在第59行注册，这里不再重复注册
@@ -750,34 +897,93 @@ async def delayed_shutdown():
 
 
 async def open_browser_if_needed():
-    """启动后检查是否需要打开浏览器"""
-    # 等待3秒，让可能存在的前端页面有时间发送心跳
-    await asyncio.sleep(3)
+    """
+    启动后智能打开浏览器
 
+    策略：
+    1. 等待前端服务启动完成
+    2. 多次检查是否有活跃的客户端（旧页面需要时间重新连接）
+    3. 如果有活跃客户端，跳过打开新页面（旧页面会自动刷新）
+    4. 如果没有活跃客户端，打开新的浏览器标签页
+
+    这种方式避免了每次启动都打开新页面导致多页面冲突的问题
+    """
     from app.services.client_registry import get_client_registry
-    from app.services.sse_service import get_sse_manager
 
-    client_registry = get_client_registry()
-    sse_manager = get_sse_manager()
+    # 等待前端服务启动（run.bat 中前端在后端之后启动）
+    logger.info("等待前端服务启动...")
+    await asyncio.sleep(5)
 
-    if not client_registry.has_active_clients():
-        # 没有活跃客户端，打开新标签页
-        logger.info("没有检测到活跃的浏览器标签页，正在打开新标签页...")
-        try:
+    # 多次检查活跃客户端，给旧页面足够时间重新连接
+    # 旧页面在检测到后端恢复后会立即发送心跳
+    registry = get_client_registry()
+
+    for i in range(3):  # 最多检查3次，每次间隔2秒
+        if registry.has_active_clients():
+            active_count = registry.get_active_count()
+            logger.info(f"检测到 {active_count} 个活跃客户端，跳过打开新浏览器（旧页面将自动刷新）")
+            return
+        if i < 2:  # 前两次检查后等待
+            logger.info(f"第 {i+1} 次检查无活跃客户端，等待2秒后重试...")
+            await asyncio.sleep(2)
+
+    # 没有活跃客户端，打开浏览器
+    logger.info("无活跃客户端，正在打开浏览器...")
+    try:
+        if os.name == 'nt':
+            # Windows: 使用 start 命令强制打开新窗口/标签页
+            subprocess.Popen(
+                ['cmd', '/c', 'start', '', 'http://localhost:8000'],
+                shell=False,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        else:
             import webbrowser
-            webbrowser.open("http://localhost:5173")
-            logger.info("浏览器标签页已打开: http://localhost:5173")
-        except Exception as e:
-            logger.error(f"打开浏览器失败: {e}")
-    else:
-        # 已有活跃客户端，通过 SSE 通知前端刷新（可选）
-        active_count = client_registry.get_active_count()
-        logger.info(f"检测到活跃的浏览器标签页: {active_count}个，复用现有标签页")
-        # 发送 SSE 事件通知前端后端已重启
-        try:
-            sse_manager.broadcast("system", {"type": "backend_restarted", "timestamp": time.time()})
-        except Exception as e:
-            logger.warning(f"发送SSE通知失败: {e}")
+            webbrowser.open("http://localhost:8000", new=2)
+        logger.info("浏览器标签页已打开: http://localhost:8000")
+    except Exception as e:
+        logger.error(f"打开浏览器失败: {e}")
+
+
+# ========== 静态文件托管 (生产模式) ==========
+# 检测前端 dist 目录并托管静态文件，实现开箱即用
+FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend", "dist")
+
+if os.path.exists(FRONTEND_DIST):
+    # 托管静态资源 (js, css, images等)
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="static-assets")
+
+    # 根路径返回 index.html
+    @app.get("/", response_class=HTMLResponse)
+    async def serve_index():
+        index_path = os.path.join(FRONTEND_DIST, "index.html")
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                return HTMLResponse(content=f.read())
+        return HTMLResponse(content="Frontend not found", status_code=404)
+
+    # SPA 路由支持: 所有非 API/media 路由都返回 index.html
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        # 排除 API 和 media 路由
+        if full_path.startswith(("api/", "media/", "docs", "openapi.json", "redoc")):
+            raise HTTPException(status_code=404, detail="Not Found")
+
+        # 检查是否是静态资源文件
+        static_file = os.path.join(FRONTEND_DIST, full_path)
+        if os.path.exists(static_file) and os.path.isfile(static_file):
+            return FileResponse(static_file)
+
+        # SPA 路由回退到 index.html
+        index_path = os.path.join(FRONTEND_DIST, "index.html")
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                return HTMLResponse(content=f.read())
+        return HTMLResponse(content="Frontend not found", status_code=404)
+
+    logger.info(f"前端静态文件托管已启用: {FRONTEND_DIST}")
+else:
+    logger.info("未检测到前端 dist 目录，静态文件托管未启用 (开发模式请使用 npm run dev)")
 
 
 if __name__ == "__main__":

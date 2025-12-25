@@ -512,8 +512,28 @@ class DualAlignmentPipeline:
         ]
 
         if not words:
-            self.logger.warning("SenseVoice 结果没有字级时间戳，无法分句")
-            return []
+            # V3.8 修复: words 为空但 text_clean 有值时，创建覆盖整个 chunk 的单句
+            # 避免"有文本但无字级时间戳"导致字幕丢失
+            if text_clean and text_clean.strip():
+                self.logger.warning(
+                    f"SenseVoice 没有字级时间戳但有文本，创建兜底单句: "
+                    f"text='{text_clean[:50]}...', chunk=[{chunk.start:.2f}s, {chunk.end:.2f}s]"
+                )
+                # 创建覆盖整个 chunk 的单句
+                fallback_sentence = SentenceSegment(
+                    text=text_clean.strip(),
+                    start=chunk.start,
+                    end=chunk.end,
+                    words=[],  # 无字级时间戳
+                    source=TextSource.SENSEVOICE,
+                    confidence=sv_result.get('confidence', 0.5),
+                    is_finalized=not is_draft,
+                    is_draft=is_draft
+                )
+                return [fallback_sentence]
+            else:
+                self.logger.warning("SenseVoice 结果没有字级时间戳且无文本，无法分句")
+                return []
 
         # Layer 1: 分句（根据是否为草稿选择不同的分句器）
         if is_draft:

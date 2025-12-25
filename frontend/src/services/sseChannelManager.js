@@ -54,11 +54,14 @@ class SSEChannelManager extends EventEmitter {
         handlers.onQueueUpdate?.(data.queue)
       },
       job_status: (data) => {
-        // 兼容处理：优先使用percent，fallback到progress
-        const percent = data.percent ?? data.progress ?? 0
+        // V3.7.4: 状态事件不应该包含进度信息，避免归零
+        // 只有当后端明确提供了 percent/progress 时才传递，否则不设置默认值
+        const percent = data.percent ?? data.progress
         console.log('[SSE Global] 任务状态:', data)
         // 使用 data.id 而非 data.job_id，兼容全局频道的字段名
-        handlers.onJobStatus?.(data.id || data.job_id, data.status, { ...data, percent })
+        // 只有当 percent 存在时才添加到 data 中
+        const statusData = percent !== undefined ? { ...data, percent } : data
+        handlers.onJobStatus?.(data.id || data.job_id, data.status, statusData)
       },
       job_progress: (data) => {
         // 兼容处理：优先使用percent，fallback到progress
@@ -66,6 +69,11 @@ class SSEChannelManager extends EventEmitter {
         console.log('[SSE Global] 任务进度:', data.id || data.job_id, percent)
         // 使用 data.id 而非 data.job_id，兼容全局频道的字段名
         handlers.onJobProgress?.(data.id || data.job_id, percent, { ...data, percent })
+      },
+      // [V3.6.3] 新增：任务删除事件，解决幽灵任务问题
+      job_removed: (data) => {
+        console.log('[SSE Global] 任务删除:', data.job_id)
+        handlers.onJobRemoved?.(data.job_id)
       },
       connected: (data) => {
         console.log('[SSE Global] 连接成功:', data)
@@ -98,11 +106,20 @@ class SSEChannelManager extends EventEmitter {
     const channelId = `job:${jobId}`
     const url = `${this.baseURL}/api/stream/${jobId}`
 
-    // 统一的进度处理函数
-    const handleProgress = (data) => {
+    // V3.7.2: 区分总体进度和阶段进度
+    // 总体进度处理函数 - 用于更新主进度条
+    const handleOverallProgress = (data) => {
       const percent = data.percent ?? data.progress ?? 0
-      console.log(`[SSE Job ${jobId}] 进度:`, percent)
+      console.log(`[SSE Job ${jobId}] 总体进度:`, percent, data.detail)
       handlers.onProgress?.({ ...data, percent })
+    }
+
+    // 阶段进度处理函数 - 仅用于日志和特定阶段处理，不更新主进度条
+    const handlePhaseProgress = (data) => {
+      const percent = data.percent ?? data.progress ?? 0
+      console.log(`[SSE Job ${jobId}] 阶段进度:`, data.phase || 'unknown', percent)
+      // 阶段进度不调用 onProgress，避免覆盖总体进度导致抖动
+      handlers.onPhaseProgress?.({ ...data, percent })
     }
 
     // 统一的信号处理函数
@@ -152,17 +169,21 @@ class SSEChannelManager extends EventEmitter {
       },
 
       // === 进度事件（新格式带命名空间前缀） ===
-      'progress.overall': handleProgress,
-      'progress.extract': handleProgress,
-      'progress.bgm_detect': handleProgress,
-      'progress.spectrum_analysis': handleProgress,
-      'progress.demucs': handleProgress,
-      'progress.vad': handleProgress,
-      'progress.sensevoice': handleProgress,
-      'progress.whisper': handleProgress,
-      'progress.llm_proof': handleProgress,
-      'progress.llm_trans': handleProgress,
-      'progress.srt': handleProgress,
+      // V3.7.2: 只有 progress.overall 更新主进度条，其他阶段进度单独处理
+      'progress.overall': handleOverallProgress,
+      'progress.extract': handlePhaseProgress,
+      'progress.bgm_detect': handlePhaseProgress,
+      'progress.spectrum_analysis': handlePhaseProgress,
+      'progress.demucs': handlePhaseProgress,
+      'progress.vad': handlePhaseProgress,
+      'progress.sensevoice': handlePhaseProgress,
+      'progress.whisper': handlePhaseProgress,
+      'progress.llm_proof': handlePhaseProgress,
+      'progress.llm_trans': handlePhaseProgress,
+      'progress.srt': handlePhaseProgress,
+      'progress.fast': handlePhaseProgress,   // V3.7.2: 新增 fast/slow 阶段
+      'progress.slow': handlePhaseProgress,   // V3.7.2: 新增 fast/slow 阶段
+      'progress.preprocess': handlePhaseProgress,  // V3.7.2: 新增预处理阶段
       'progress.align': handleAlignProgress,
 
       // === 信号事件（新格式带命名空间前缀） ===
@@ -208,6 +229,20 @@ class SSEChannelManager extends EventEmitter {
       'subtitle.replace_chunk': (data) => {
         console.log(`[SSE Job ${jobId}] 替换 Chunk:`, data)
         handlers.onReplaceChunk?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+
+      // V3.7.3: 字幕恢复事件（断点续传后恢复字幕）
+      'subtitle.restored': (data) => {
+        console.log(`[SSE Job ${jobId}] 恢复字幕:`, data)
+        handlers.onRestored?.(data)
+        handlers.onSubtitleUpdate?.(data)
+      },
+
+      // V3.5: 极速模式定稿事件
+      'subtitle.finalized': (data) => {
+        console.log(`[SSE Job ${jobId}] 定稿字幕:`, data)
+        handlers.onFinalized?.(data)
         handlers.onSubtitleUpdate?.(data)
       },
 

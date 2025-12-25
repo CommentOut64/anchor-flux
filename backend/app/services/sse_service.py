@@ -77,7 +77,7 @@ class SSEManager:
         connection_id = f"{channel_id}#{len(self.connections[channel_id])}"
 
         try:
-            logger.info(f"SSE连接已建立: {connection_id} (频道: {channel_id}, 总连接: {self._get_total_active_connections()})")
+            logger.debug(f"SSE连接已建立: {connection_id} (频道: {channel_id}, 总连接: {self._get_total_active_connections()})")
 
             # 1. 发送连接成功消息
             yield self._format_sse("connected", {
@@ -101,7 +101,7 @@ class SSEManager:
             while True:
                 # 检查客户端是否断开
                 if await request.is_disconnected():
-                    logger.info(f"客户端已断开: {connection_id}")
+                    logger.debug(f"客户端已断开: {connection_id}")
                     break
 
                 try:
@@ -125,7 +125,7 @@ class SSEManager:
                     })
 
         except asyncio.CancelledError:
-            logger.info(f"SSE连接被取消: {connection_id}")
+            logger.debug(f"SSE连接被取消: {connection_id}")
         except Exception as e:
             logger.error(f"SSE错误: {connection_id} - {e}")
         finally:
@@ -134,7 +134,7 @@ class SSEManager:
                 self.connections[channel_id].remove(event_queue)
                 if not self.connections[channel_id]:
                     del self.connections[channel_id]
-                logger.info(f"SSE连接已断开: {connection_id} (剩余连接: {self._get_total_active_connections()})")
+                logger.debug(f"SSE连接已断开: {connection_id} (剩余连接: {self._get_total_active_connections()})")
             except (ValueError, KeyError):
                 pass
 

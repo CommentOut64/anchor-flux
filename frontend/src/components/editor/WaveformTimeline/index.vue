@@ -48,6 +48,7 @@
       class="waveform-wrapper"
       ref="waveformWrapperRef"
       :style="{ cursor: currentMouseCursor }"
+      @contextmenu="handleWaveformContextMenu"
     >
       <!-- 上半部分交互层：只处理光标拖拽，阻止Region操作 -->
       <div
@@ -88,6 +89,13 @@
         <div class="scrollbar-thumb" :style="scrollbarThumbStyle"></div>
       </div>
     </div>
+
+    <!-- 右键菜单 -->
+    <ContextMenu
+      ref="contextMenuRef"
+      :items="contextMenuItems"
+      @select="handleContextMenuSelect"
+    />
   </div>
 </template>
 
@@ -95,6 +103,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, inject } from "vue";
 import { useProjectStore } from "@/stores/projectStore";
 import { usePlaybackManager } from "@/services/PlaybackManager";
+import ContextMenu from "@/components/editor/ContextMenu.vue";
 
 // ============ 缩放配置常量 ============
 const ZOOM_MIN = 20; // 最小缩放 20%
@@ -166,6 +175,11 @@ const isDraggingScrollbar = ref(false);
 let scrollbarDragStartX = 0;
 let scrollbarDragStartScroll = 0;
 
+// 右键菜单状态
+const contextMenuRef = ref(null);
+const contextMenuTarget = ref(null); // 右键点击的目标字幕ID
+const contextMenuTime = ref(0); // 右键点击的时间点
+
 // RAF节流状态
 let scrollbarRafId = null;
 let pendingScrollEvent = null;
@@ -221,19 +235,23 @@ function calculateWaveformConfig(videoDuration, containerWidth) {
   );
   const suggestedZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, idealFitZoom));
 
-  // 根据视频时长选择柱子配置
+  // 【修复】根据视频时长选择柱子配置，始终保持柱形外观
+  // 之前超过30分钟会使用线条模式，导致波形偶尔变成锯齿状
   let barConfig = {};
   if (videoDuration < 60) {
-    // 短视频（<1分钟）：细柱子
+    // 短视频（<1分钟）：粗柱子
     barConfig = { barWidth: 2, barGap: 1, barRadius: 2 };
   } else if (videoDuration < 300) {
-    // 中等视频（1-5分钟）：更细的柱子
+    // 中等视频（1-5分钟）：中等柱子
     barConfig = { barWidth: 1.5, barGap: 0.5, barRadius: 1 };
   } else if (videoDuration < 1800) {
-    // 较长视频（5-30分钟）：最细柱子
+    // 较长视频（5-30分钟）：细柱子
     barConfig = { barWidth: 1, barGap: 0.5, barRadius: 1 };
+  } else {
+    // 【修复】超过30分钟的视频也使用最细柱子，保持柱形外观
+    // 之前不设置 barWidth 会导致波形变成锯齿状线条
+    barConfig = { barWidth: 1, barGap: 0.3, barRadius: 0.5 };
   }
-  // 超过30分钟的视频使用线条模式（不设置 barWidth）
 
   return {
     basePxPerSec, // 固定基准（50px/s）
@@ -296,7 +314,8 @@ async function initWavesurfer() {
       minPxPerSec: basePxPerSec, // 使用固定基准50
       scrollParent: true,
       fillParent: false, // 改为 false，允许滚动
-      dragToSeek: false, // 【关键修改】禁用内置拖拽，自己实现分离交互
+      dragToSeek: false, // 禁用内置拖拽
+      interact: false,   // 【关键】禁用波形点击跳转，光标操作仅限上半区域
       autoScroll: false, // 禁用内置自动滚动，自己实现
       autoCenter: false, // 禁用内置居中，自己实现
       hideScrollbar: true, // 【修改】隐藏wavesurfer自带滚动条，使用自定义滚动条
@@ -319,9 +338,11 @@ async function initWavesurfer() {
     await loadAudioData();
   } catch (error) {
     console.error("初始化波形失败:", error);
-    hasError.value = true;
-    errorMessage.value = "波形组件加载失败";
-    isLoading.value = false;
+    // 不显示错误，保持加载状态
+    hasError.value = false;
+    isLoading.value = true;
+    // 启动定时检查
+    startPeaksPolling();
   }
 }
 
@@ -360,10 +381,8 @@ function setupWavesurferEvents() {
       const initialPxPerSec = basePxPerSec * (suggestedZoom / 100);
       wavesurfer.zoom(initialPxPerSec);
 
-      // 应用柱子配置
-      if (Object.keys(barConfig).length > 0) {
-        wavesurfer.setOptions(barConfig);
-      }
+      // 【修复】始终应用柱子配置，确保波形保持柱形外观
+      wavesurfer.setOptions(barConfig);
     }
 
     renderSubtitleRegions();
@@ -395,8 +414,9 @@ function setupWavesurferEvents() {
   // 不要监听 timeupdate 来更新 Store，保持单向数据流：Store → WaveSurfer
   // WaveSurfer 的时间由外部 watch 同步（见第588-614行）
 
-  // 【关键修改】移除 interaction 事件监听（因为已禁用 dragToSeek）
-  // 自定义交互逻辑见下方 handleWaveformMouseDown
+  // 【上下分离设计】波形下半部分已禁用所有光标交互（interact: false）
+  // 光标操作仅限上半区域（waveform-upper-zone），避免用户误操作
+  // Regions 插件有独立的事件系统，字幕块拖拽/调整不受影响
 
   wavesurfer.on("zoom", (minPxPerSec) => {
     const newZoom = Math.round((minPxPerSec / ZOOM_BASE_PX_PER_SEC) * 100);
@@ -412,26 +432,25 @@ function setupWavesurferEvents() {
 
   wavesurfer.on("error", (error) => {
     console.error("Wavesurfer error:", error);
-    hasError.value = true;
-    isLoading.value = false;
+    // 不显示错误，保持加载状态
+    hasError.value = false;
+    isLoading.value = true;
 
     // 自动重试机制
     if (retryCount.value < maxRetries) {
       retryCount.value++;
-      errorMessage.value = `波形加载失败，正在重试 (${retryCount.value}/${maxRetries})...`;
       console.log(
         `[WaveformTimeline] 自动重试 ${retryCount.value}/${maxRetries}`
       );
 
       // 延迟1秒后重试
       setTimeout(() => {
-        hasError.value = false;
-        isLoading.value = true;
         loadAudioData();
       }, 1000);
     } else {
-      errorMessage.value = "波形加载失败，请手动重试";
-      console.error("[WaveformTimeline] 达到最大重试次数");
+      // 达到最大重试次数，启动定时检查
+      console.log("[WaveformTimeline] 达到最大重试次数，启动定时检查");
+      startPeaksPolling();
     }
   });
 }
@@ -453,7 +472,8 @@ function setupRegionEvents() {
   regionsPlugin.on("region-clicked", (region, e) => {
     e.stopPropagation();
     projectStore.view.selectedSubtitleId = region.id;
-    projectStore.seekTo(region.start);
+    // 使用 PlaybackManager 进行跳转，确保视频和波形同步
+    playbackManager.seekTo(region.start);
     if (wavesurfer) wavesurfer.play();
     emit("region-click", region);
   });
@@ -494,14 +514,71 @@ async function loadAudioData() {
   }
 }
 
+// 定时检查波形数据是否可用
+let peaksCheckTimer = null;
+function startPeaksPolling() {
+  if (peaksCheckTimer) return; // 避免重复启动
+
+  console.log('[WaveformTimeline] 启动波形数据定时检查');
+  peaksCheckTimer = setInterval(async () => {
+    try {
+      // 直接尝试加载波形数据
+      if (peaksSource.value) {
+        const response = await fetch(peaksSource.value);
+        if (response.ok) {
+          console.log('[WaveformTimeline] 波形数据已可用，自动重新加载');
+          stopPeaksPolling();
+          retryCount.value = 0;
+          hasError.value = false;
+          isLoading.value = true;
+          await loadAudioData();
+        }
+      }
+    } catch (e) {
+      // 继续等待
+      console.debug('[WaveformTimeline] 波形数据尚未可用，继续等待...');
+    }
+  }, 2000); // 每2秒检查一次
+}
+
+function stopPeaksPolling() {
+  if (peaksCheckTimer) {
+    clearInterval(peaksCheckTimer);
+    peaksCheckTimer = null;
+  }
+}
+
 // 渲染字幕区域
+// V3.7.3: 增强日志，便于调试 regions 消失问题
 function renderSubtitleRegions() {
-  if (!isReady.value || !regionsPlugin) return;
+  // 前置检查
+  if (!isReady.value) {
+    console.warn('[WaveformTimeline] renderSubtitleRegions: 波形未就绪，跳过渲染');
+    return;
+  }
+  if (!regionsPlugin) {
+    console.warn('[WaveformTimeline] renderSubtitleRegions: regions 插件未加载，跳过渲染');
+    return;
+  }
+
+  const subtitleCount = projectStore.subtitles.length;
+  console.log(`[WaveformTimeline] renderSubtitleRegions: 开始渲染 ${subtitleCount} 个 regions`);
+
+  if (subtitleCount === 0) {
+    console.log('[WaveformTimeline] renderSubtitleRegions: 无字幕数据，清除 regions');
+    regionsPlugin.clearRegions();
+    return;
+  }
 
   isUpdatingRegions.value = true;
   regionsPlugin.clearRegions();
 
+  let addedCount = 0;
   projectStore.subtitles.forEach((subtitle) => {
+    if (subtitle.start === undefined || subtitle.end === undefined) {
+      console.warn(`[WaveformTimeline] 跳过无效字幕: id=${subtitle.id}, start=${subtitle.start}, end=${subtitle.end}`);
+      return;
+    }
     const isSelected = subtitle.id === projectStore.view.selectedSubtitleId;
     regionsPlugin.addRegion({
       id: subtitle.id,
@@ -511,22 +588,160 @@ function renderSubtitleRegions() {
       drag: props.dragEnabled,
       resize: props.resizeEnabled,
     });
+    addedCount++;
   });
+
+  console.log(`[WaveformTimeline] renderSubtitleRegions: 成功添加 ${addedCount}/${subtitleCount} 个 regions`);
 
   setTimeout(() => {
     isUpdatingRegions.value = false;
   }, 100);
 }
 
-// 缩放控制
-function handleZoomInput(e) {
-  const value = parseInt(e.target.value);
-  setZoom(value);
+// ============ 智能锚点缩放策略（性能优化版）============
+
+// 缓存 DOM 引用，避免重复查询
+let cachedWrapper = null;
+let cachedScrollContainer = null;
+
+/**
+ * 获取缓存的滚动容器（避免频繁 DOM 查询）
+ */
+function getScrollContainer() {
+  if (cachedScrollContainer && cachedScrollContainer.isConnected) {
+    return cachedScrollContainer;
+  }
+  if (!wavesurfer) return null;
+  cachedWrapper = wavesurfer.getWrapper();
+  if (!cachedWrapper) return null;
+  cachedScrollContainer = cachedWrapper.parentElement;
+  return cachedScrollContainer;
 }
 
+/**
+ * 判断播放头当前是否在可视范围内
+ */
+function isPlayheadInViewport() {
+  const scrollContainer = getScrollContainer();
+  if (!scrollContainer) return false;
+
+  const currentPxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC;
+  const playheadX = projectStore.player.currentTime * currentPxPerSec;
+  const { scrollLeft, clientWidth } = scrollContainer;
+
+  // 留一点边距容错 (10px)
+  return playheadX >= scrollLeft - 10 && playheadX <= scrollLeft + clientWidth + 10;
+}
+
+/**
+ * 获取光标相对于视口的坐标
+ */
+function getPlayheadRelativeX() {
+  const scrollContainer = getScrollContainer();
+  if (!scrollContainer) return 0;
+
+  const currentPxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC;
+  const playheadTotalX = projectStore.player.currentTime * currentPxPerSec;
+  return playheadTotalX - scrollContainer.scrollLeft;
+}
+
+// 滚动条更新防抖
+let scrollbarUpdateTimer = null;
+function debouncedUpdateScrollbar() {
+  if (scrollbarUpdateTimer) return;
+  scrollbarUpdateTimer = setTimeout(() => {
+    scrollbarUpdateTimer = null;
+    updateScrollbarThumb();
+  }, 16); // ~1帧
+}
+
+/**
+ * 锚点缩放核心算法（性能优化版）
+ * @param {number} targetZoom - 目标缩放比例 (ZOOM_MIN - ZOOM_MAX)
+ * @param {number} anchorPx - 锚点相对于视口左侧的像素位置
+ */
+function setZoomWithAnchor(targetZoom, anchorPx) {
+  if (!wavesurfer || !containerRef.value) return;
+
+  const scrollContainer = getScrollContainer();
+  if (!scrollContainer) return;
+  
+  // 1. 记录缩放前的状态（一次性读取，减少 reflow）
+  const oldPxPerSec = (zoomLevel.value / 100) * ZOOM_BASE_PX_PER_SEC;
+  const oldScroll = scrollContainer.scrollLeft;
+  
+  // 计算锚点对应的"绝对时间点"
+  const anchorTime = (oldScroll + anchorPx) / oldPxPerSec;
+
+  // 2. 应用新的缩放
+  const clampedZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, targetZoom));
+  
+  // 如果缩放值没变，直接返回
+  if (clampedZoom === zoomLevel.value) return;
+  
+  zoomLevel.value = clampedZoom;
+  const newPxPerSec = (clampedZoom / 100) * ZOOM_BASE_PX_PER_SEC;
+  
+  // 调用 wavesurfer 进行缩放
+  wavesurfer.zoom(newPxPerSec);
+  projectStore.view.zoomLevel = clampedZoom;
+
+  // 3. 计算新的滚动位置
+  const newScroll = Math.max(0, (anchorTime * newPxPerSec) - anchorPx);
+
+  // 4. 使用 RAF 确保在下一帧设置滚动位置（避免 nextTick 开销）
+  requestAnimationFrame(() => {
+    scrollContainer.scrollLeft = newScroll;
+    // 延迟更新滚动条，降低优先级
+    debouncedUpdateScrollbar();
+  });
+}
+
+/**
+ * 统一的缩放处理函数 (按钮/滑块通用)
+ * 策略：
+ * - 播放中：始终跟随光标
+ * - 暂停且光标可见：锚定光标
+ * - 暂停且光标不可见：锚定视口中心
+ */
+function handleZoomWithSmartAnchor(targetZoom) {
+  const scrollContainer = getScrollContainer();
+  if (!scrollContainer) return;
+
+  let anchorPx; // 相对于视口左侧的像素位置
+
+  // 策略判断（使用缓存的 scrollContainer）
+  if (projectStore.player.isPlaying) {
+    // A. 播放中：始终跟随光标
+    anchorPx = getPlayheadRelativeX();
+  } else if (isPlayheadInViewport()) {
+    // B. 暂停且光标可见：锚定光标
+    anchorPx = getPlayheadRelativeX();
+  } else {
+    // C. 暂停且光标不可见：锚定视口中心
+    anchorPx = scrollContainer.clientWidth / 2;
+  }
+
+  // 执行锚点缩放
+  setZoomWithAnchor(targetZoom, anchorPx);
+}
+
+// 缩放控制 - 绑定到滑块输入事件（添加节流）
+let lastSliderZoomTime = 0;
+const SLIDER_THROTTLE_MS = 16; // ~60fps
+
+function handleZoomInput(e) {
+  const now = performance.now();
+  if (now - lastSliderZoomTime < SLIDER_THROTTLE_MS) return;
+  lastSliderZoomTime = now;
+  
+  const value = parseInt(e.target.value);
+  handleZoomWithSmartAnchor(value);
+}
+
+// 保留原有的 setZoom 供内部使用（如初始化、fitToScreen等）
 function setZoom(value) {
   if (!wavesurfer) return;
-  // 使用全局常量限制范围
   const clampedValue = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, value));
   zoomLevel.value = clampedValue;
   const minPxPerSec = (clampedValue / 100) * ZOOM_BASE_PX_PER_SEC;
@@ -534,12 +749,16 @@ function setZoom(value) {
   projectStore.view.zoomLevel = clampedValue;
 }
 
+// 绑定到放大按钮
 function zoomIn() {
-  setZoom(zoomLevel.value + ZOOM_BUTTON_STEP);
+  const newValue = Math.min(ZOOM_MAX, zoomLevel.value + ZOOM_BUTTON_STEP);
+  handleZoomWithSmartAnchor(newValue);
 }
 
+// 绑定到缩小按钮
 function zoomOut() {
-  setZoom(zoomLevel.value - ZOOM_BUTTON_STEP);
+  const newValue = Math.max(ZOOM_MIN, zoomLevel.value - ZOOM_BUTTON_STEP);
+  handleZoomWithSmartAnchor(newValue);
 }
 
 function fitToScreen() {
@@ -554,19 +773,16 @@ function fitToScreen() {
     // 限制在全局范围内
     const fitZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, idealZoom));
 
+    // fitToScreen 使用原始 setZoom（不需要锚点，因为是全局适配）
     setZoom(fitZoom);
 
-    // 根据时长动态调整柱子配置
+    // 【修复】根据时长动态调整柱子配置，始终保持柱形外观
     const { barConfig } = calculateWaveformConfig(
       audioDuration,
       containerWidth
     );
-    if (Object.keys(barConfig).length > 0) {
-      wavesurfer.setOptions(barConfig);
-    } else {
-      // 长视频使用线条模式
-      wavesurfer.setOptions({ barWidth: 0, barGap: 0 });
-    }
+    // barConfig 现在始终非空，直接应用
+    wavesurfer.setOptions(barConfig);
   }
 }
 
@@ -832,6 +1048,69 @@ function handleWaveformMouseLeave() {
   currentMouseCursor.value = "default";
 }
 
+// ============ 右键菜单逻辑 ============
+
+/**
+ * 右键菜单项配置
+ */
+const contextMenuItems = computed(() => {
+  const items = [];
+
+  if (contextMenuTarget.value) {
+    items.push({
+      key: 'split',
+      label: '从此处切分',
+    });
+  }
+
+  return items;
+});
+
+/**
+ * 波形区域右键事件处理
+ */
+function handleWaveformContextMenu(e) {
+  e.preventDefault();
+  e.stopPropagation();
+
+  if (!wavesurfer || !isReady.value) return;
+
+  const clickTime = getTimeFromClientX(e.clientX);
+
+  // 查找点击位置对应的字幕
+  const targetSubtitle = projectStore.subtitles.find(
+    s => clickTime >= s.start && clickTime < s.end
+  );
+
+  // 只有在字幕范围内才显示菜单
+  if (targetSubtitle && !targetSubtitle.isDraft) {
+    contextMenuTarget.value = targetSubtitle.id;
+    contextMenuTime.value = clickTime;
+    contextMenuRef.value?.show(e.clientX, e.clientY);
+  }
+}
+
+/**
+ * 右键菜单项选择处理
+ */
+function handleContextMenuSelect(key) {
+  if (key === 'split' && contextMenuTarget.value) {
+    const result = projectStore.splitSubtitle(contextMenuTarget.value, {
+      splitTime: contextMenuTime.value
+    });
+
+    if (!result.success) {
+      console.error('[WaveformTimeline] 切分失败:', result.error);
+    } else {
+      console.log('[WaveformTimeline] 切分成功:', result);
+    }
+  }
+
+  // 清空状态
+  contextMenuTarget.value = null;
+  contextMenuTime.value = 0;
+}
+
 // ============ 自定义滚动条逻辑 ============
 
 /**
@@ -1007,14 +1286,28 @@ function formatTime(seconds) {
 }
 
 // 监听字幕变化
+// V3.7.3: 修复 watch 监听失效问题 - 同时监听数组长度确保 splice 操作也能触发
 watch(
-  () => [...projectStore.subtitles],
-  () => {
+  () => projectStore.subtitles,
+  (newVal, oldVal) => {
+    const lengthChanged = !oldVal || newVal.length !== oldVal.length;
+    console.log(`[WaveformTimeline] subtitles watch 触发: length=${newVal.length}, lengthChanged=${lengthChanged}, isReady=${isReady.value}, isUpdating=${isUpdatingRegions.value}`);
+
     if (isReady.value && !isUpdatingRegions.value) {
       clearTimeout(regionUpdateTimer);
       regionUpdateTimer = setTimeout(() => {
         renderSubtitleRegions();
       }, 100);
+    } else {
+      // V3.7.3: 如果当前条件不满足，延迟重试
+      if (!isReady.value) {
+        console.log('[WaveformTimeline] 波形未就绪，延迟 500ms 后重试渲染 regions');
+        setTimeout(() => {
+          if (isReady.value && projectStore.subtitles.length > 0) {
+            renderSubtitleRegions();
+          }
+        }, 500);
+      }
     }
   },
   { deep: true }
@@ -1093,6 +1386,7 @@ let pendingZoomDelta = 0;
 
 /**
  * 平滑缩放 - 使用 RAF 批量处理缩放请求
+ * 【优化】使用智能锚点策略
  */
 function smoothZoom() {
   if (pendingZoomDelta === 0) {
@@ -1103,19 +1397,8 @@ function smoothZoom() {
   const newZoom = zoomLevel.value + pendingZoomDelta;
   pendingZoomDelta = 0; // 清空待处理的增量
 
-  // 实际执行缩放
-  if (wavesurfer) {
-    const clampedValue = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZoom));
-    zoomLevel.value = clampedValue;
-    const minPxPerSec = (clampedValue / 100) * ZOOM_BASE_PX_PER_SEC;
-    wavesurfer.zoom(minPxPerSec);
-    projectStore.view.zoomLevel = clampedValue;
-
-    // 更新滚动条
-    nextTick(() => {
-      updateScrollbarThumb();
-    });
-  }
+  // 使用智能锚点缩放
+  handleZoomWithSmartAnchor(newZoom);
 
   zoomRafId = null;
 }
@@ -1181,8 +1464,18 @@ onUnmounted(() => {
   // 清理滚动条拖拽RAF
   if (scrollbarRafId) cancelAnimationFrame(scrollbarRafId);
 
+  // 清理滚动条更新定时器
+  if (scrollbarUpdateTimer) clearTimeout(scrollbarUpdateTimer);
+
+  // 清理波形数据检查定时器
+  stopPeaksPolling();
+
   clearTimeout(regionUpdateTimer);
   stopSmartFollow(); // 清理智能跟随RAF循环
+
+  // 清理 DOM 缓存
+  cachedWrapper = null;
+  cachedScrollContainer = null;
 
   // 【关键】注销 WaveSurfer
   playbackManager.unregisterWaveSurfer();

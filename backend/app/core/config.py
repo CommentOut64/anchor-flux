@@ -122,7 +122,10 @@ class ProjectConfig:
         # ========== 日志配置 ==========
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
         self.LOG_DIR = self.BASE_DIR / "logs"
-        self.LOG_FILE = self.LOG_DIR / "app.log"
+        # 每次启动创建新的日志文件（带时间戳）
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.LOG_FILE = self.LOG_DIR / f"app_{timestamp}.log"
         self.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
         # ========== SSE配置 ==========
@@ -141,7 +144,12 @@ class ProjectConfig:
 
         # ========== Proxy 视频配置（重构新增）==========
         # 统一管理所有 Proxy 转码相关参数
+        # 注意: ffmpeg_cpu_threads 使用延迟计算，避免循环导入
+        self._ffmpeg_cpu_threads_cache = None  # 延迟计算缓存
         self.PROXY_CONFIG = {
+            # FFmpeg CPU 线程配置（避免使用全部核心导致降频）
+            # 注意: 实际值通过 get_ffmpeg_cpu_threads() 方法获取（延迟计算）
+            "ffmpeg_cpu_threads": None,  # 占位符，实际使用 get_ffmpeg_cpu_threads()
             # 360p 预览参数（极速模式）
             "preview_360p": {
                 "scale": 360,
@@ -156,7 +164,8 @@ class ProjectConfig:
             # 720p 高清参数（平衡质量和速度）
             "proxy_720p": {
                 "scale": 720,
-                "preset": "fast",
+                "preset": "fast",              # CPU 编码预设
+                "preset_nvenc": "p4",          # NVENC 编码预设 (p1-p7, p4 为质量和速度平衡)
                 "crf": 23,
                 "gop": 30,
                 "keyint_min": 15,
@@ -210,6 +219,50 @@ class ProjectConfig:
         else:
             self.PIPELINE_QUEUE_MAXSIZE = int(queue_size_config)
 
+    def _calculate_ffmpeg_threads(self) -> int:
+        """
+        计算 FFmpeg 转码使用的 CPU 线程数
+
+        使用 cpu_optimizer 模块的智能计算，避免全核心占用导致 CPU 降频
+
+        策略：
+        - Intel 混合架构：仅使用 P-Core 的 60%
+        - Intel 传统架构/AMD：使用物理核心的 60%
+        - 未知架构：使用物理核心的 50%
+
+        Returns:
+            int: 推荐的 FFmpeg 线程数
+        """
+        try:
+            from app.utils.cpu_optimizer import ONNXThreadOptimizer
+
+            # 使用 cpu_optimizer 计算最优线程数（与 ONNX 使用相同策略）
+            optimal_threads, info = ONNXThreadOptimizer.calculate_optimal_threads(
+                usage_ratio=0.6  # 使用 60% 的核心
+            )
+
+            logger.info(
+                f"FFmpeg CPU 线程配置: {optimal_threads} 线程 "
+                f"({info.get('strategy', 'unknown')})"
+            )
+            return optimal_threads
+
+        except Exception as e:
+            # 回退：使用 psutil 获取物理核心数的 60%
+            try:
+                import psutil
+                physical_cores = psutil.cpu_count(logical=False) or 4
+                threads = max(1, int(physical_cores * 0.6))
+                logger.warning(
+                    f"cpu_optimizer 不可用，回退计算: {threads} 线程 "
+                    f"(物理核心 {physical_cores} × 60%): {e}"
+                )
+                return threads
+            except:
+                # 最终回退
+                logger.warning(f"无法检测 CPU 核心数，使用默认值 4 线程: {e}")
+                return 4
+
     def _calculate_adaptive_queue_size(self) -> int:
         """
         根据系统可用内存自适应计算队列大小
@@ -257,6 +310,17 @@ class ProjectConfig:
             # psutil 不可用或出错，回退到保守默认值
             logger.warning(f"无法检测系统内存，使用默认队列大小 10: {e}")
             return 10
+
+    def get_ffmpeg_cpu_threads(self) -> int:
+        """
+        获取 FFmpeg CPU 线程数（延迟计算，避免循环导入）
+
+        Returns:
+            int: FFmpeg 线程数
+        """
+        if self._ffmpeg_cpu_threads_cache is None:
+            self._ffmpeg_cpu_threads_cache = self._calculate_ffmpeg_threads()
+        return self._ffmpeg_cpu_threads_cache
 
     def get_ffmpeg_command(self) -> str:
         """

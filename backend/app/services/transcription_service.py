@@ -432,16 +432,12 @@ class TranscriptionService:
                 auto_strategy=True
             )
             self.audio_pipeline = AudioProcessingPipeline(
-                config=audio_config,
                 logger=self.logger
             )
 
-            # 初始化转录流水线
-            self.transcription_pipeline = AsyncDualPipeline(
-                job_id="",  # 每次处理时动态设置
-                sse_manager=self.sse_manager,
-                logger=self.logger
-            )
+            # V3.5: 转录流水线在每次任务执行时动态创建（根据 transcription_profile 配置）
+            # 不再在这里初始化 self.transcription_pipeline
+            self.transcription_pipeline = None
 
             self.logger.info("Pipeline 初始化完成")
         except Exception as e:
@@ -468,9 +464,8 @@ class TranscriptionService:
             job: 任务状态对象
         """
         try:
-            # 检查 Pipeline 是否初始化
-            if not self.transcription_pipeline:
-                raise RuntimeError("Pipeline 未初始化")
+            from app.pipelines.async_dual_pipeline import AsyncDualPipeline
+            from app.services.config_adapter import ConfigAdapter
 
             job_dir = Path(job.dir)
             input_path = job_dir / job.filename
@@ -506,17 +501,37 @@ class TranscriptionService:
 
             # ==========================================
             # 阶段 2: 异步双流转录（AsyncDualPipeline）
+            # V3.5: 根据 transcription_profile 动态创建流水线
             # ==========================================
             self._update_progress(job, 'transcription', 0, '转录中...')
 
-            # 更新 Pipeline 的 job_id
-            self.transcription_pipeline.job_id = job.job_id
+            # 获取转录模式配置
+            transcription_profile = ConfigAdapter.get_transcription_profile(job.settings)
+            self.logger.info(f"转录模式: {transcription_profile}")
+
+            # 动态创建转录流水线
+            self.transcription_pipeline = AsyncDualPipeline(
+                job_id=job.job_id,
+                transcription_profile=transcription_profile,
+                logger=self.logger
+            )
 
             # 调用转录流水线
-            final_sentences = await self.transcription_pipeline.run(
-                chunks=chunks,
-                job_settings=job.settings
+            results = await self.transcription_pipeline.run(
+                audio_chunks=chunks
             )
+
+            # 从 ProcessingContext 中提取句子
+            final_sentences = []
+            for ctx in results:
+                if hasattr(ctx, 'sv_result') and ctx.sv_result:
+                    # 从 streaming_subtitle 获取句子
+                    from app.services.streaming_subtitle import get_streaming_subtitle_manager
+                    subtitle_manager = get_streaming_subtitle_manager(job.job_id)
+                    chunk_indices = subtitle_manager.chunk_sentences.get(ctx.chunk_index, [])
+                    for idx in chunk_indices:
+                        if idx in subtitle_manager.sentences:
+                            final_sentences.append(subtitle_manager.sentences[idx])
 
             self.logger.info(f"转录完成: {len(final_sentences)} 个句子")
 
@@ -628,10 +643,42 @@ class TranscriptionService:
             List[AudioChunk]: 预处理完成的 Chunk 列表
         """
         from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
+        from app.services.audio.chunk_engine import ChunkEngine
+        from app.services.audio.vad_service import VADConfig
+
+        # V3.9: 根据引擎类型选择 VAD 配置
+        # 英语使用 Whisper，需要合并 VAD（避免幻觉）
+        # 其他语言使用 SenseVoice，需要保留停顿信息
+        language = getattr(job.settings, 'language', 'auto')
+        is_english = language in {'en', 'english'}
+
+        if is_english:
+            # Whisper 模式：合并 VAD，避免幻觉
+            vad_config = VADConfig(
+                merge_max_gap=1.0,
+                merge_max_duration=12.0,
+                smart_target_duration=12.0
+            )
+            self.logger.info("使用 Whisper VAD 配置（合并模式）")
+        else:
+            # SenseVoice 模式：保留停顿信息
+            vad_config = VADConfig(
+                merge_max_gap=0.3,           # 只合并极短停顿
+                merge_max_duration=8.0,      # 更短的 chunk
+                smart_target_duration=8.0    # 软上限降低
+            )
+            self.logger.info("使用 SenseVoice VAD 配置（保留停顿）")
+
+        # 创建自定义 ChunkEngine
+        chunk_engine = ChunkEngine(
+            vad_config=vad_config,
+            logger=self.logger
+        )
 
         # 创建 PreprocessingPipeline 实例
         preprocessing_pipeline = PreprocessingPipeline(
             config=job.settings.preprocessing,
+            chunk_engine=chunk_engine,
             logger=self.logger
         )
 
@@ -770,9 +817,14 @@ class TranscriptionService:
             def extract_audio_for_waveform():
                 """后台提取音频供波形图使用"""
                 try:
+                    import warnings
                     import librosa
                     import soundfile as sf
-                    audio_array, sr = librosa.load(str(dest_path), sr=16000, mono=True)
+                    # 抑制 librosa 的 PySoundFile/audioread 警告
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", message="PySoundFile failed")
+                        warnings.filterwarnings("ignore", message="audioread")
+                        audio_array, sr = librosa.load(str(dest_path), sr=16000, mono=True)
                     sf.write(str(audio_path), audio_array, sr)
                     self.logger.info(f"[{job_id}] 音频提取完成: {audio_path}")
                 except Exception as e:
@@ -1181,6 +1233,79 @@ class TranscriptionService:
         self.logger.info(f"⏸️ 任务暂停请求: {job_id}")
         return True
 
+    def _force_remove_directory(self, directory: Path, job_id: str, max_retries: int = 3):
+        """
+        V3.7.5: 强制删除目录，处理 Windows 文件占用问题
+
+        策略：
+        1. 先触发垃圾回收，释放可能的文件句柄
+        2. 尝试直接删除目录（最快）
+        3. 如果失败，等待后重试（处理延迟释放）
+        4. 如果仍失败，逐个删除文件，跳过无法删除的
+
+        Args:
+            directory: 要删除的目录路径
+            job_id: 任务ID（用于日志）
+            max_retries: 最大重试次数
+        """
+        import time
+        import stat
+
+        # 步骤1: 触发垃圾回收，释放可能的文件句柄
+        gc.collect()
+        time.sleep(0.1)  # 给系统一点时间释放资源
+
+        # 步骤2: 尝试直接删除（最快路径）
+        for attempt in range(max_retries):
+            try:
+                shutil.rmtree(directory)
+                self.logger.info(f"[强制删除] 成功删除目录: {job_id}, 尝试次数: {attempt + 1}")
+                return
+            except PermissionError as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(
+                        f"[强制删除] 删除失败 (尝试 {attempt + 1}/{max_retries}): {e}, "
+                        f"等待 {0.5 * (attempt + 1)}s 后重试"
+                    )
+                    time.sleep(0.5 * (attempt + 1))  # 指数退避
+                else:
+                    self.logger.warning(f"[强制删除] 直接删除失败，尝试逐个删除文件: {job_id}")
+
+        # 步骤3: 逐个删除文件（降级策略）
+        failed_files = []
+        for root, dirs, files in os.walk(directory, topdown=False):
+            # 删除文件
+            for name in files:
+                file_path = Path(root) / name
+                try:
+                    # 尝试修改文件权限（Windows 只读文件）
+                    os.chmod(file_path, stat.S_IWRITE)
+                    file_path.unlink()
+                except Exception as e:
+                    self.logger.warning(f"[强制删除] 无法删除文件: {file_path.name}, {e}")
+                    failed_files.append(str(file_path))
+
+            # 删除空目录
+            for name in dirs:
+                dir_path = Path(root) / name
+                try:
+                    dir_path.rmdir()
+                except Exception as e:
+                    self.logger.debug(f"[强制删除] 无法删除目录: {dir_path.name}, {e}")
+
+        # 尝试删除根目录
+        try:
+            directory.rmdir()
+            self.logger.info(f"[强制删除] 逐个删除完成: {job_id}")
+        except Exception as e:
+            if failed_files:
+                self.logger.error(
+                    f"[强制删除] 部分文件无法删除: {job_id}, "
+                    f"失败文件数: {len(failed_files)}, 错误: {e}"
+                )
+            else:
+                self.logger.warning(f"[强制删除] 根目录删除失败: {job_id}, {e}")
+
     def cancel_job(self, job_id: str, delete_data: bool = False) -> bool:
         """
         取消转录任务
@@ -1204,18 +1329,22 @@ class TranscriptionService:
         if delete_data:
             try:
                 job_dir = Path(job.dir)
+
+                # 先从内存中移除任务，避免删除失败时仍显示"未知文件"
+                with self.lock:
+                    if job_id in self.jobs:
+                        del self.jobs[job_id]
+                        self.logger.info(f"已从内存移除任务: {job_id}")
+
                 # 移除文件路径映射
                 if job.input_path:
                     self.job_index.remove_mapping(job.input_path)
 
+                # 最后删除任务目录
                 if job_dir.exists():
-                    # 删除整个任务目录
-                    shutil.rmtree(job_dir)
+                    # V3.7.5: 使用强制删除逻辑，处理 Windows 文件占用问题
+                    self._force_remove_directory(job_dir, job_id)
                     self.logger.info(f"已删除任务数据: {job_id}")
-                    # 从内存中移除任务
-                    with self.lock:
-                        if job_id in self.jobs:
-                            del self.jobs[job_id]
             except Exception as e:
                 self.logger.error(f"删除任务数据失败: {e}")
 
@@ -3779,17 +3908,36 @@ class TranscriptionService:
             WHISPER_ARBITRATION_CONF = 0.5  # Whisper 也必须有一定确信度
             MIN_TEXT_LENGTH = 1  # 最少文本长度
 
-            # 判死刑条件：Whisper 也听不清 OR 输出为空
-            if whisper_conf < WHISPER_ARBITRATION_CONF or len(whisper_text) < MIN_TEXT_LENGTH:
-                self.logger.info(
-                    f"仲裁结果: 删除垃圾片段 {sentence_index} - "
-                    f"SenseVoice({sentence.confidence:.2f}) + Whisper({whisper_conf:.2f}, '{whisper_text}')"
+            # V3.8 修复: Whisper 空输出时，保留 SenseVoice 而非删除
+            # 有音频却没有 Whisper 输出，说明 Whisper 幻觉，应回退到 SenseVoice
+            if len(whisper_text) < MIN_TEXT_LENGTH:
+                self.logger.warning(
+                    f"仲裁结果: Whisper 空输出，保留 SenseVoice 结果 {sentence_index} - "
+                    f"SenseVoice({sentence.confidence:.2f}): '{sensevoice_text[:50]}...'"
                 )
-                subtitle_manager.mark_for_deletion(
-                    index=sentence_index,
-                    reason=f"whisper_arbitration_failed_conf_{whisper_conf:.2f}"
-                )
+                # 不删除，直接返回原 SenseVoice 句子
                 return sentence
+
+            # 判死刑条件：Whisper 有输出但置信度极低（两者都不可靠）
+            if whisper_conf < WHISPER_ARBITRATION_CONF:
+                # V3.8: 如果 SenseVoice 有实质内容，优先保留而非删除
+                if sensevoice_text and len(sensevoice_text) >= 2:
+                    self.logger.warning(
+                        f"仲裁结果: Whisper 低置信度({whisper_conf:.2f})，保留 SenseVoice {sentence_index}: "
+                        f"'{sensevoice_text[:50]}...'"
+                    )
+                    return sentence
+                else:
+                    # SenseVoice 也为空或单字符，且 Whisper 低置信度，才删除
+                    self.logger.info(
+                        f"仲裁结果: 删除垃圾片段 {sentence_index} - "
+                        f"SenseVoice({sentence.confidence:.2f}, '{sensevoice_text}') + Whisper({whisper_conf:.2f}, '{whisper_text}')"
+                    )
+                    subtitle_manager.mark_for_deletion(
+                        index=sentence_index,
+                        reason=f"whisper_arbitration_failed_conf_{whisper_conf:.2f}"
+                    )
+                    return sentence
             else:
                 # 挽救成功！
                 self.logger.info(
@@ -4202,8 +4350,24 @@ class TranscriptionService:
 
         progress_tracker = get_progress_tracker(job.job_id, solution_config.preset_id)
 
+        # 检查任务是否已取消
+        if job.canceled:
+            self.logger.info(f"任务已取消，跳过后处理增强: {job.job_id}")
+            return sentences
+
         # 调试日志：确认方法被调用
         self.logger.debug(f"开始后处理增强: {len(sentences)} 句, enhancement={solution_config.enhancement.value}")
+
+        # V3.5.2: 极速模式（sensevoice_only）完全跳过 Whisper 补刀
+        # 极速模式的设计目标是纯 SenseVoice 输出，不加载 Whisper 模型
+        if solution_config.enhancement == EnhancementMode.OFF:
+            self.logger.info("极速模式: 跳过所有 Whisper 补刀和仲裁")
+            # 仍然执行 LLM 校对/翻译（如果配置了）
+            if solution_config.proofread != ProofreadMode.OFF:
+                self.logger.info("LLM 校对功能待实现")
+            if solution_config.translate != TranslateMode.OFF:
+                self.logger.info("LLM 翻译功能待实现")
+            return sentences
 
         # 1. 收集需要 Whisper 补刀的句子（含强制补刀、常规补刀、垃圾核查）
         patch_queue = []
@@ -4347,6 +4511,11 @@ class TranscriptionService:
             else:
                 # === SMART_PATCH 模式: 逐句处理 ===
                 for idx, item in enumerate(patch_queue):
+                    # 检查任务是否已取消
+                    if job.canceled:
+                        self.logger.info(f"任务已取消，停止 Whisper 补刀: {job.job_id}")
+                        break
+
                     sent_idx = item["index"]
                     sentence = item["sentence"]
                     is_trash_suspect = item["is_trash_suspect"]
@@ -4398,6 +4567,11 @@ class TranscriptionService:
         from app.services.sse_service import get_sse_manager
         from pathlib import Path
 
+        # 检查任务是否已取消
+        if job.canceled:
+            self.logger.info(f"任务已取消，停止执行: {job.job_id}")
+            return
+
         def push_signal_event(sse_manager, job_id: str, signal_code: str, message: str = ""):
             """推送信号事件（使用统一命名空间格式）"""
             sse_manager.broadcast_sync(
@@ -4428,13 +4602,38 @@ class TranscriptionService:
             # ========== 新架构：使用 PreprocessingPipeline ==========
             # 统一执行：音频提取 + VAD切分 + 频谱分诊 + 按需分离
             from app.pipelines.preprocessing_pipeline import PreprocessingPipeline
+            from app.services.audio.vad_service import VADConfig
             import soundfile as sf
 
             self.logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
 
-            # 创建预处理流水线
+            # V3.9.1: 根据语言选择 VAD 配置
+            # 英语使用 Whisper，需要合并 VAD（避免幻觉）
+            # 其他语言使用 SenseVoice，需要保留停顿信息以获得更好的断句
+            language = getattr(job.settings, 'language', 'auto')
+            is_english = language in {'en', 'english'}
+
+            if is_english:
+                # Whisper 模式：合并 VAD，避免幻觉
+                vad_config = VADConfig(
+                    merge_max_gap=1.0,
+                    merge_max_duration=12.0,
+                    smart_target_duration=12.0
+                )
+                self.logger.info(f"VAD配置: Whisper模式（合并），language={language}")
+            else:
+                # SenseVoice 模式：保留停顿信息，获得更自然的断句
+                vad_config = VADConfig(
+                    merge_max_gap=0.3,           # 只合并极短停顿（保留自然停顿）
+                    merge_max_duration=8.0,      # 更短的 chunk（避免强制切分）
+                    smart_target_duration=8.0    # 软上限降低
+                )
+                self.logger.info(f"VAD配置: SenseVoice模式（保留停顿），language={language}")
+
+            # 创建预处理流水线（传入 VAD 配置）
             preprocessing_pipeline = PreprocessingPipeline(
                 config=job.settings.preprocessing,
+                vad_config=vad_config,
                 logger=self.logger
             )
 
@@ -4477,6 +4676,11 @@ class TranscriptionService:
             all_sentences = []
 
             for chunk_state in chunk_states:
+                # 检查任务是否已取消
+                if job.canceled:
+                    self.logger.info(f"任务已取消，停止转录: {job.job_id}")
+                    break
+
                 # 单个 Chunk 转录（含熔断回溯循环）
                 sentences = await self._transcribe_chunk_with_fusing(
                     chunk_state=chunk_state,

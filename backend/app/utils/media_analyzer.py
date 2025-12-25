@@ -5,10 +5,13 @@
 import subprocess
 import json
 import os
+import logging
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 from app.core.config import config
+
+logger = logging.getLogger(__name__)
 
 
 # 需要转码的编码格式 (浏览器不兼容)
@@ -162,7 +165,7 @@ class MediaAnalyzer:
                 codec = result.stdout.strip().lower()
                 return codec if codec else None
         except Exception as e:
-            print(f"[MediaAnalyzer] 获取视频编码失败: {e}")
+            logger.debug(f"[MediaAnalyzer] 获取视频编码失败: {e}")
         return None
 
     def get_video_duration(self, video_path: Path) -> float:
@@ -182,7 +185,7 @@ class MediaAnalyzer:
             if result.returncode == 0:
                 return float(result.stdout.strip())
         except Exception as e:
-            print(f"[MediaAnalyzer] 获取视频时长失败: {e}")
+            logger.debug(f"[MediaAnalyzer] 获取视频时长失败: {e}")
         return 0.0
 
 

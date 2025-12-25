@@ -2,16 +2,40 @@
   <header class="editor-header">
     <!-- 左侧：返回 + 任务信息堆叠 -->
     <div class="header-left">
-      <router-link to="/tasks" class="nav-back" title="返回任务列表">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
-        </svg>
-      </router-link>
+      <el-tooltip content="返回任务列表" placement="bottom" :show-after="500">
+        <router-link to="/tasks" class="nav-back">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
+          </svg>
+        </router-link>
+      </el-tooltip>
 
       <div class="divider-vertical"></div>
 
       <div class="task-info-stack">
-        <h1 class="task-name" :title="taskName">{{ taskName }}</h1>
+        <!-- 任务名称：双击可编辑 -->
+        <div class="task-name-wrapper">
+          <input
+            v-if="isEditingTitle"
+            ref="titleInputRef"
+            v-model="editingTitleValue"
+            class="task-name-input"
+            @blur="finishEditTitle"
+            @keydown.enter="finishEditTitle"
+            @keydown.escape="cancelEditTitle"
+          />
+          <el-tooltip
+            v-else
+            :content="taskName + ' (双击重命名)'"
+            placement="bottom"
+            :show-after="500"
+          >
+            <h1
+              class="task-name"
+              @dblclick="startEditTitle"
+            >{{ taskName }}</h1>
+          </el-tooltip>
+        </div>
         <div class="task-meta">
           <span class="status-dot" :class="statusClass"></span>
           <span class="meta-text">{{ metaText }}</span>
@@ -54,8 +78,8 @@
               </span>
               <!-- Phase 5: 双流进度显示 -->
               <span v-if="showDualStreamProgress" class="progress-percent dual">
-                <span class="fast-label">S</span>{{ dualStreamProgress.fastStream }}%
-                <span class="slow-label">W</span>{{ dualStreamProgress.slowStream }}%
+                <span class="fast-label">S</span>{{ (dualStreamProgress.fastStream || 0).toFixed(1) }}%
+                <span class="slow-label">W</span>{{ (dualStreamProgress.slowStream || 0).toFixed(1) }}%
               </span>
               <span v-else class="progress-percent">{{ formatProgress(currentTaskProgress) }}%</span>
             </span>
@@ -113,11 +137,13 @@
       >
         <template #reference>
           <div class="monitor-trigger">
-            <button class="icon-btn" title="任务监控">
-              <svg viewBox="0 0 24 24" fill="currentColor">
-                <path d="M20 19V8H4v11h16m0-14a2 2 0 012 2v12a2 2 0 01-2 2H4a2 2 0 01-2-2V7a2 2 0 012-2h16M6 10h2v6H6v-6m4-1h2v7h-2V9m4 4h2v3h-2v-3z"/>
-              </svg>
-            </button>
+            <el-tooltip content="任务监控" placement="bottom" :show-after="500">
+              <button class="icon-btn">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M20 19V8H4v11h16m0-14a2 2 0 012 2v12a2 2 0 01-2 2H4a2 2 0 01-2-2V7a2 2 0 012-2h16M6 10h2v6H6v-6m4-1h2v7h-2V9m4 4h2v3h-2v-3z"/>
+                </svg>
+              </button>
+            </el-tooltip>
             <span v-if="activeTasks > 0" class="badge">{{ activeTasks }}</span>
           </div>
         </template>
@@ -158,6 +184,7 @@
         <template #dropdown>
           <el-dropdown-menu>
             <el-dropdown-item command="srt">SRT 格式</el-dropdown-item>
+            <el-dropdown-item command="ass">ASS 格式</el-dropdown-item>
             <el-dropdown-item command="vtt">WebVTT 格式</el-dropdown-item>
             <el-dropdown-item command="txt">纯文本</el-dropdown-item>
             <el-dropdown-item command="json">JSON 格式</el-dropdown-item>
@@ -177,10 +204,18 @@
  * - 任务信息展示（名称、状态）
  * - 动态进度显示（当前任务 / 队列总进度）
  * - 全局操作入口（任务监控、撤销/重做、导出）
+ * - 双击重命名任务
  */
-import { computed } from 'vue'
+import { computed, ref, nextTick } from 'vue'
+import { ElMessage } from 'element-plus'
 import TaskMonitor from './TaskMonitor/index.vue'
 import { PHASE_CONFIG, STATUS_CONFIG, formatProgress } from '@/constants/taskPhases'
+import transcriptionApi from '@/services/api/transcriptionApi'
+import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { useProjectStore } from '@/stores/projectStore'
+
+const taskStore = useUnifiedTaskStore()
+const projectStore = useProjectStore()
 
 const props = defineProps({
   jobId: { type: String, required: true },
@@ -201,14 +236,81 @@ const props = defineProps({
   }
 })
 
-defineEmits(['undo', 'redo', 'export', 'pause', 'resume', 'cancel'])
+const emit = defineEmits(['undo', 'redo', 'export', 'pause', 'resume', 'cancel', 'rename'])
 
-// 是否暂停状态
-const isPaused = computed(() => props.currentTaskStatus === 'paused')
+// ========== 任务名称编辑 ==========
+const isEditingTitle = ref(false)
+const editingTitleValue = ref('')
+const titleInputRef = ref(null)
 
-// 是否显示当前任务进度（转录中、排队中、或已暂停）
+// 开始编辑任务名称
+function startEditTitle() {
+  isEditingTitle.value = true
+  editingTitleValue.value = props.taskName
+  
+  nextTick(() => {
+    if (titleInputRef.value) {
+      titleInputRef.value.focus()
+      titleInputRef.value.select()
+    }
+  })
+}
+
+// 完成编辑任务名称
+async function finishEditTitle() {
+  if (!isEditingTitle.value) return
+  
+  const newTitle = editingTitleValue.value.trim()
+  
+  // 如果标题为空，提示并恢复原名称
+  if (!newTitle) {
+    ElMessage.warning('任务名称不能为空')
+    isEditingTitle.value = false
+    return
+  }
+  
+  // 如果没有变化，直接关闭编辑
+  if (newTitle === props.taskName) {
+    isEditingTitle.value = false
+    return
+  }
+  
+  try {
+    // 调用 API 重命名任务
+    await transcriptionApi.renameJob(props.jobId, newTitle)
+    
+    // 更新 unifiedTaskStore
+    taskStore.updateTask(props.jobId, { title: newTitle })
+    
+    // 更新 projectStore.meta.title
+    projectStore.meta.title = newTitle
+    
+    // 通知父组件
+    emit('rename', newTitle)
+    
+    ElMessage.success('重命名成功')
+  } catch (error) {
+    console.error('重命名任务失败:', error)
+    ElMessage.error(`重命名失败: ${error.message || '未知错误'}`)
+  } finally {
+    isEditingTitle.value = false
+  }
+}
+
+// 取消编辑
+function cancelEditTitle() {
+  isEditingTitle.value = false
+  editingTitleValue.value = props.taskName
+}
+
+// 是否暂停状态（包含正在暂停和已暂停两种状态）
+// V3.7.3: 'pausing' 状态表示正在等待当前原子操作完成，用户可以点击恢复取消暂停
+const isPaused = computed(() => ['pausing', 'paused'].includes(props.currentTaskStatus))
+
+// 是否显示当前任务进度（转录中、排队中、正在暂停、或已暂停）
+// V3.7.3: 新增 'pausing' 状态，表示任务正在暂停中（等待当前原子操作完成）
 const showCurrentTaskProgress = computed(() =>
-  ['processing', 'queued', 'paused'].includes(props.currentTaskStatus)
+  ['processing', 'queued', 'pausing', 'paused'].includes(props.currentTaskStatus)
 )
 
 // Phase 5: 是否显示双流进度（双模态对齐模式）
@@ -230,7 +332,11 @@ const statusClass = computed(() => {
 
 // 元信息文字
 const metaText = computed(() => {
-  if (isPaused.value) {
+  // V3.7.3: 区分"正在暂停"和"已暂停"状态
+  if (props.currentTaskStatus === 'pausing') {
+    return `正在暂停... ${props.currentTaskProgress}%`
+  }
+  if (props.currentTaskStatus === 'paused') {
     return `已暂停 ${props.currentTaskProgress}%`
   }
   if (showCurrentTaskProgress.value) {
@@ -264,8 +370,11 @@ const phaseStyle = computed(() => {
 
 // 阶段标签
 const phaseLabel = computed(() => {
-  // 如果任务暂停，显示"已暂停"
-  if (isPaused.value) {
+  // V3.7.3: 区分"正在暂停"和"已暂停"状态
+  if (props.currentTaskStatus === 'pausing') {
+    return '正在暂停...'
+  }
+  if (props.currentTaskStatus === 'paused') {
     return '已暂停'
   }
   // 如果任务正在处理且有阶段信息，显示阶段标签
@@ -332,6 +441,12 @@ $header-h: 56px;
     flex-direction: column;
     gap: 2px;
 
+    .task-name-wrapper {
+      display: flex;
+      align-items: center;
+      max-width: 300px;
+    }
+
     .task-name {
       margin: 0;
       font-size: 14px;
@@ -341,6 +456,31 @@ $header-h: 56px;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      cursor: pointer;
+      padding: 2px 4px;
+      border-radius: var(--radius-sm);
+      transition: background 0.2s;
+
+      &:hover {
+        background: var(--bg-tertiary);
+      }
+    }
+
+    .task-name-input {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-primary);
+      background: var(--bg-tertiary);
+      border: 1px solid var(--primary);
+      border-radius: var(--radius-sm);
+      padding: 2px 6px;
+      width: 200px;
+      max-width: 300px;
+      outline: none;
+
+      &:focus {
+        box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.3);
+      }
     }
 
     .task-meta {
@@ -665,4 +805,43 @@ $header-h: 56px;
     border-color: var(--border-default) !important;
   }
 }
+
+// 导出下拉菜单样式 - 与任务监控配色一致
+.el-dropdown__popper.el-popper {
+  background: var(--bg-secondary) !important;
+  border: 1px solid var(--border-default) !important;
+  border-radius: 6px !important;
+  box-shadow: var(--shadow-lg) !important;
+  padding: 4px 0 !important;
+
+  .el-popper__arrow::before {
+    background: var(--bg-secondary) !important;
+    border-color: var(--border-default) !important;
+  }
+
+  .el-dropdown-menu {
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+
+    .el-dropdown-menu__item {
+      padding: 8px 16px !important;
+      font-size: 13px !important;
+      color: var(--text-primary) !important;
+      background: transparent !important;
+      transition: all 0.2s !important;
+
+      &:hover {
+        background: rgba(255, 255, 255, 0.03) !important;
+        color: var(--text-primary) !important;
+      }
+
+      &:focus {
+        background: rgba(255, 255, 255, 0.03) !important;
+        color: var(--text-primary) !important;
+      }
+    }
+  }
+}
 </style>
+

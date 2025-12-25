@@ -64,6 +64,12 @@ onMounted(async () => {
       // 同步任务列表到 store（第二阶段修复：实时更新）
       if (state.jobs && Array.isArray(state.jobs)) {
         state.jobs.forEach(job => {
+          // V3.7.5: 过滤掉 filename 为空的任务，避免显示"未知任务"
+          if (!job.filename || job.filename.trim() === '') {
+            console.warn(`[App] 跳过 filename 为空的任务: ${job.id}`)
+            return
+          }
+
           // 检查 store 中是否已有此任务
           const existingTask = taskStore.getTask(job.id)
           if (!existingTask) {
@@ -113,10 +119,10 @@ onMounted(async () => {
       // 更新 store 中的任务状态
       const task = taskStore.getTask(jobId)
       if (task) {
-        taskStore.updateTask(jobId, {
-          status,
-          message: data.message || ''
-        })
+        // V3.7.4: onJobStatus 只更新 status 和 message，不更新 progress
+        // 避免后端推送的低进度（如恢复时的 0）覆盖前端已有的高进度
+        // progress 的更新由 onJobProgress 专门负责
+        taskStore.updateTaskStatus(jobId, status, data.message || '')
 
         // 转录完成自动跳转到编辑器
         if (status === 'finished' && task.phase === 'transcribing') {
@@ -151,6 +157,23 @@ onMounted(async () => {
         total: data.total,
         language: data.language
       })
+    },
+
+    // [V3.6.3] 新增：任务删除事件处理，解决幽灵任务问题
+    onJobRemoved(jobId) {
+      console.log(`[App] 收到任务删除事件: ${jobId}`)
+
+      // 更新心跳
+      taskStore.updateSSEHeartbeat()
+
+      // 从 store 中彻底移除任务
+      taskStore.deleteTask(jobId)
+
+      // 如果当前在该任务的编辑器页面，跳转回任务列表
+      if (route.path === `/editor/${jobId}`) {
+        console.log(`[App] 当前任务已删除，跳转回任务列表`)
+        router.push('/tasks')
+      }
     },
 
     onConnected(data) {

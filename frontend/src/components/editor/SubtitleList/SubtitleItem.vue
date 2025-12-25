@@ -41,14 +41,19 @@
         </span>
 
         <!-- 置信度徽章 -->
-        <span
-          v-else-if="showConfidenceBadge"
-          class="confidence-badge"
-          :class="confidenceBadgeClass"
-          :title="`置信度: ${(subtitle.confidence * 100).toFixed(0)}%`"
+        <el-tooltip
+          v-if="showConfidenceBadge"
+          :content="`置信度: ${(subtitle.confidence * 100).toFixed(0)}%`"
+          placement="top"
+          :show-after="500"
         >
-          {{ (subtitle.confidence * 100).toFixed(0) }}%
-        </span>
+          <span
+            class="confidence-badge"
+            :class="confidenceBadgeClass"
+          >
+            {{ (subtitle.confidence * 100).toFixed(0) }}%
+          </span>
+        </el-tooltip>
       </div>
 
       <!-- 文本行（三态视图） -->
@@ -80,6 +85,7 @@
           @blur="stopEditing"
           @keydown.enter.ctrl="stopEditing"
           @keydown.escape="cancelEditing"
+          @contextmenu="handleTextareaContextMenu"
           placeholder="输入字幕文本..."
           rows="2"
         ></textarea>
@@ -98,22 +104,52 @@
 
     <!-- 操作按钮 -->
     <div v-if="!subtitle.isDraft" class="item-actions" @click.stop>
-      <button class="action-btn" @click="$emit('insert-before')" title="在前面插入">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M7 14l5-5 5 5z"/>
+      <el-tooltip content="在前面插入" placement="left" :show-after="500">
+        <button class="action-btn" @click="$emit('insert-before')">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M7 14l5-5 5 5z"/>
+          </svg>
+        </button>
+      </el-tooltip>
+      <el-tooltip content="在后面插入" placement="left" :show-after="500">
+        <button class="action-btn" @click="$emit('insert-after')">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M7 10l5 5 5-5z"/>
+          </svg>
+        </button>
+      </el-tooltip>
+    </div>
+
+    <!-- 删除按钮 - 绝对定位在右下角 -->
+    <el-tooltip
+      :content="isDeleteConfirming ? '再次点击确认删除' : '删除'"
+      placement="left"
+      :show-after="500"
+    >
+      <button
+        v-if="!subtitle.isDraft"
+        class="delete-btn"
+        :class="{ 'delete-btn--confirming': isDeleteConfirming }"
+        @click.stop="handleDelete"
+      >
+        <!-- 正常状态：X图标 -->
+        <svg v-if="!isDeleteConfirming" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
         </svg>
-      </button>
-      <button class="action-btn" @click="$emit('insert-after')" title="在后面插入">
-        <svg viewBox="0 0 24 24" fill="currentColor">
-          <path d="M7 10l5 5 5-5z"/>
-        </svg>
-      </button>
-      <button class="action-btn action-btn--danger" @click="handleDelete" title="删除">
-        <svg viewBox="0 0 24 24" fill="currentColor">
+        <!-- 确认状态：垃圾桶图标 -->
+        <svg v-else viewBox="0 0 24 24" fill="currentColor">
           <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
         </svg>
       </button>
-    </div>
+    </el-tooltip>
+
+    <!-- 右键菜单 -->
+    <ContextMenu
+      ref="contextMenuRef"
+      :items="contextMenuItems"
+      @select="handleContextMenuSelect"
+      @close="handleContextMenuClose"
+    />
   </div>
 </template>
 
@@ -127,6 +163,8 @@
  * 3. 编辑模式: isDraft=false & 编辑中, 可编辑文本
  */
 import { ref, computed, nextTick, watch } from 'vue'
+import { useProjectStore } from '@/stores/projectStore'
+import ContextMenu from '@/components/editor/ContextMenu.vue'
 
 const props = defineProps({
   subtitle: { type: Object, required: true },
@@ -145,15 +183,30 @@ const emit = defineEmits([
   'insert-after'
 ])
 
+// Store
+const projectStore = useProjectStore()
+
 // 编辑状态
 const isEditing = ref(false)
 const editTextarea = ref(null)
 const originalText = ref('')
 
+// 删除确认状态
+const isDeleteConfirming = ref(false)
+
+// 右键菜单状态
+const contextMenuRef = ref(null)
+const cursorPosition = ref(0)
+const isContextMenuOpen = ref(false)  // 防止菜单打开时 blur 触发 stopEditing
+
+// 播放状态
+const isPlaying = computed(() => projectStore.player.isPlaying)
+
 // 计算属性
 const itemClasses = computed(() => ({
   'is-active': props.isActive,
   'is-current': props.isCurrent,
+  'is-current-paused': props.isCurrent && !isPlaying.value,
   'is-draft': props.subtitle.isDraft,
   'warning-low-confidence': props.subtitle.warning_type === 'low_confidence',
   'warning-high-perplexity': props.subtitle.warning_type === 'high_perplexity',
@@ -189,6 +242,8 @@ const warningMessage = computed(() => {
 
 // 点击处理
 function handleClick() {
+  // 点击字幕块时重置删除确认状态
+  resetDeleteConfirm()
   emit('click', props.subtitle)
 }
 
@@ -196,6 +251,16 @@ function handleClick() {
 function updateTime(field, value) {
   if (isNaN(value) || props.subtitle.isDraft) return
   emit('update-time', props.subtitle.id, field, value)
+}
+
+// 自动调整 textarea 高度
+function autoResizeTextarea() {
+  if (!editTextarea.value) return
+  // 重置高度以获取正确的 scrollHeight
+  editTextarea.value.style.height = 'auto'
+  // 设置高度为内容高度，但不小于 45px
+  const newHeight = Math.max(45, editTextarea.value.scrollHeight)
+  editTextarea.value.style.height = `${newHeight}px`
 }
 
 // 开始编辑
@@ -207,12 +272,18 @@ function startEditing() {
     if (editTextarea.value) {
       editTextarea.value.focus()
       editTextarea.value.select()
+      // 自动调整高度
+      autoResizeTextarea()
     }
   })
 }
 
 // 停止编辑
 function stopEditing() {
+  // 右键菜单打开时不触发停止编辑，防止菜单项消失
+  if (isContextMenuOpen.value) {
+    return
+  }
   isEditing.value = false
 }
 
@@ -227,11 +298,106 @@ function cancelEditing() {
 // 文本输入处理
 function handleTextInput(text) {
   emit('update-text', props.subtitle.id, text)
+  // 输入时自动调整高度
+  nextTick(() => {
+    autoResizeTextarea()
+  })
 }
 
 // 删除处理
 function handleDelete() {
-  emit('delete', props.subtitle.id)
+  if (!isDeleteConfirming.value) {
+    // 第一次点击：进入确认状态
+    isDeleteConfirming.value = true
+  } else {
+    // 第二次点击：执行删除
+    emit('delete', props.subtitle.id)
+    isDeleteConfirming.value = false
+  }
+}
+
+// 重置删除确认状态
+function resetDeleteConfirm() {
+  isDeleteConfirming.value = false
+}
+
+// ============ 右键菜单逻辑 ============
+
+// 右键菜单项配置
+const contextMenuItems = computed(() => {
+  if (!isEditing.value || props.subtitle.isDraft) {
+    return []
+  }
+
+  return [{
+    key: 'split',
+    label: '从此处切分',
+  }]
+})
+
+// 编辑区域右键事件处理
+function handleTextareaContextMenu(e) {
+  console.log('[SubtitleItem] 右键事件触发', {
+    isEditing: isEditing.value,
+    isDraft: props.subtitle.isDraft,
+    hasTextarea: !!editTextarea.value,
+    hasContextMenu: !!contextMenuRef.value
+  })
+
+  e.preventDefault()
+  e.stopPropagation()
+
+  if (!isEditing.value || props.subtitle.isDraft) {
+    console.log('[SubtitleItem] 右键菜单被阻止：不在编辑模式或是草稿')
+    return
+  }
+
+  // 获取光标位置
+  const textarea = editTextarea.value
+  if (!textarea) {
+    console.log('[SubtitleItem] 右键菜单被阻止：textarea不存在')
+    return
+  }
+
+  cursorPosition.value = textarea.selectionStart
+  console.log('[SubtitleItem] 显示右键菜单，光标位置:', cursorPosition.value)
+
+  // 标记菜单打开，防止 blur 触发 stopEditing
+  isContextMenuOpen.value = true
+
+  // 显示右键菜单
+  contextMenuRef.value?.show(e.clientX, e.clientY)
+}
+
+// 右键菜单项选择处理
+function handleContextMenuSelect(key) {
+  console.log('[SubtitleItem] 菜单项被选择:', key)
+
+  // 重置菜单打开标志
+  isContextMenuOpen.value = false
+
+  if (key === 'split') {
+    console.log('[SubtitleItem] 开始切分，光标位置:', cursorPosition.value)
+
+    const result = projectStore.splitSubtitle(props.subtitle.id, {
+      cursorPosition: cursorPosition.value
+    })
+
+    console.log('[SubtitleItem] 切分结果:', result)
+
+    if (!result.success) {
+      console.error('[SubtitleItem] 切分失败:', result.error)
+    } else {
+      console.log('[SubtitleItem] 切分成功:', result)
+      // 切分成功后退出编辑模式
+      isEditing.value = false
+    }
+  }
+}
+
+// 右键菜单关闭处理
+function handleContextMenuClose() {
+  isContextMenuOpen.value = false
 }
 
 // 渲染带置信度高亮的文本
@@ -314,6 +480,7 @@ function formatDuration(seconds) {
 <style lang="scss" scoped>
 // 字幕项
 .subtitle-item {
+  position: relative;
   display: flex;
   gap: 10px;
   padding: 10px;
@@ -338,6 +505,11 @@ function formatDuration(seconds) {
     border-color: var(--success);
     background: rgba(63, 185, 80, 0.08);
     .item-index { background: var(--success); color: white; }
+  }
+
+  // 暂停时显示呼吸灯动画
+  &.is-current-paused {
+    animation: breathing-border-green 3s ease-in-out infinite;
   }
 
   // 草稿状态样式
@@ -473,6 +645,17 @@ function formatDuration(seconds) {
   to { transform: rotate(360deg); }
 }
 
+// 绿色呼吸灯动画 - 边框颜色从透明到绿色再到透明
+@keyframes breathing-border-green {
+  0%, 100% {
+    border-color: transparent;
+  }
+  50% {
+    border-color: #3fb950;
+    box-shadow: 0 0 8px rgba(63, 185, 80, 0.5);
+  }
+}
+
 // 置信度徽章
 .confidence-badge {
   padding: 2px 6px;
@@ -513,6 +696,7 @@ function formatDuration(seconds) {
     line-height: 1.4;
     white-space: pre-wrap;
     word-break: break-word;
+    transition: border-color 0.3s ease, background 0.3s ease;
   }
 
   // 草稿文本样式
@@ -530,7 +714,7 @@ function formatDuration(seconds) {
     &.can-edit {
       cursor: text;
       &:hover {
-        border-color: var(--primary);
+        border-color: rgba(88, 166, 255, 0.8);
         background: var(--bg-secondary);
       }
     }
@@ -554,6 +738,7 @@ function formatDuration(seconds) {
 
   .text-input {
     width: 100%;
+    min-height: 45px;
     padding: 6px 8px;
     padding-right: 35px;
     background: var(--bg-tertiary);
@@ -564,8 +749,15 @@ function formatDuration(seconds) {
     resize: none;
     line-height: 1.4;
     outline: none;
+    overflow: hidden;
 
     &::placeholder { color: var(--text-muted); }
+
+    // 隐藏滚动条
+    &::-webkit-scrollbar {
+      display: none;
+    }
+    scrollbar-width: none;
   }
 
   .char-count {
@@ -624,6 +816,45 @@ function formatDuration(seconds) {
     &--danger:hover {
       background: rgba(248, 81, 73, 0.15);
       color: var(--danger);
+    }
+  }
+}
+
+// 删除按钮 - 绝对定位在右下角，与操作按钮垂直对齐
+.delete-btn {
+  position: absolute;
+  right: 12px;
+  bottom: 6px;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0.5;
+  transition: all 0.2s ease;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  &:hover {
+    opacity: 1;
+    background: var(--bg-tertiary);
+  }
+
+  // 确认状态 - 红色垃圾桶图标
+  &--confirming {
+    color: var(--danger);
+    opacity: 1;
+
+    &:hover {
+      background: rgba(248, 81, 73, 0.1);
     }
   }
 }

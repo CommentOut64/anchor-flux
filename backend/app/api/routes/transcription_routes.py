@@ -38,6 +38,8 @@ class PreprocessingSettingsAPI(BaseModel):
     demucs_model: str = Field(default="htdemucs", description="Demucs 模型")
     # 分离预测次数: 1-5
     demucs_shifts: int = Field(default=1, ge=1, le=5, description="分离预测次数")
+    # 是否启用频谱分诊（直通模式应设为 false）
+    enable_spectral_triage: bool = Field(default=True, description="是否启用频谱分诊")
     # 分诊灵敏度: 0.0-1.0
     spectrum_threshold: float = Field(default=0.35, ge=0.0, le=1.0, description="分诊灵敏度")
     # VAD 静音过滤
@@ -695,9 +697,11 @@ def create_transcription_router(
                     if file_path:
                         filename = os.path.basename(file_path)
                     else:
-                        # 从目录中找视频文件
+                        # 从目录中找视频文件（排除 proxy 视频）
                         for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
                             matches = list(job_dir.glob(f"*{ext}"))
+                            # 过滤掉 proxy 视频文件
+                            matches = [m for m in matches if m.name not in ['preview_360p.mp4', 'proxy_720p.mp4']]
                             if matches:
                                 filename = matches[0].name
                                 break
@@ -799,8 +803,16 @@ def create_transcription_router(
         all_tasks = {}  # 使用 dict 避免重复，key 为 job_id
 
         # 1. 队列中的任务（处理中或等待中）- 优先级最高
+        # [V3.6.3] 过滤幽灵任务：检测目录是否存在，不存在则从内存移除
+        ghost_job_ids = []
         with queue_service.lock:
-            for job_id, job in queue_service.jobs.items():
+            for job_id, job in list(queue_service.jobs.items()):
+                job_dir = jobs_root / job_id
+                if not job_dir.exists():
+                    # 检测到幽灵任务
+                    ghost_job_ids.append(job_id)
+                    continue
+
                 all_tasks[job_id] = {
                     "id": job.job_id,
                     "filename": job.filename,
@@ -811,6 +823,17 @@ def create_transcription_router(
                     "created_time": job.createdAt if hasattr(job, 'createdAt') else None,
                     "phase": job.phase if hasattr(job, 'phase') else 'unknown'
                 }
+
+        # [V3.6.3] 清理检测到的幽灵任务
+        if ghost_job_ids:
+            logger = logging.getLogger(__name__)
+            with queue_service.lock:
+                for ghost_id in ghost_job_ids:
+                    if ghost_id in queue_service.jobs:
+                        del queue_service.jobs[ghost_id]
+                    if ghost_id in queue_service.queue:
+                        queue_service.queue.remove(ghost_id)
+            logger.warning(f"[sync_tasks] 清理了 {len(ghost_job_ids)} 个幽灵任务: {ghost_job_ids}")
 
         # 2. 扫描 jobs 目录中的所有任务（包括已完成的）
         try:
@@ -831,9 +854,11 @@ def create_transcription_router(
                 if file_path:
                     filename = os.path.basename(file_path)
                 else:
-                    # 2. 从目录中找视频文件
+                    # 2. 从目录中找视频文件（排除 proxy 视频）
                     for ext in ['.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mp3', '.wav', '.m4a']:
                         matches = list(job_dir.glob(f"*{ext}"))
+                        # 过滤掉 proxy 视频文件
+                        matches = [m for m in matches if m.name not in ['preview_360p.mp4', 'proxy_720p.mp4']]
                         if matches:
                             filename = matches[0].name
                             break
@@ -1161,36 +1186,68 @@ def create_transcription_router(
             with open(checkpoint_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
-            # 提取未对齐结果
-            unaligned_results = data.get("unaligned_results", [])
+            # V3.7.3+: 优先从 transcription.sentences_snapshot 读取（实时字幕快照）
+            transcription = data.get("transcription", {})
+            sentences_snapshot = transcription.get("sentences_snapshot", [])
 
-            # 合并所有segments
             all_segments = []
             detected_language = None
-            for result in unaligned_results:
-                if not detected_language and 'language' in result:
-                    detected_language = result['language']
-                all_segments.extend(result.get('segments', []))
 
-            # 按时间排序
-            all_segments.sort(key=lambda x: x.get('start', 0))
+            if sentences_snapshot:
+                # 使用新格式（V3.7.3+ 实时字幕快照）
+                for sentence in sentences_snapshot:
+                    all_segments.append({
+                        "id": sentence.get("_index", 0),
+                        "start": sentence.get("start", 0),
+                        "end": sentence.get("end", 0),
+                        "text": sentence.get("text", ""),
+                        "confidence": sentence.get("confidence", 0),
+                        "source": sentence.get("source", "unknown")
+                    })
 
-            # 重新编号
-            for idx, seg in enumerate(all_segments):
-                seg['id'] = idx
+                # 按 _index 排序（已经是正确顺序，但保险起见）
+                all_segments.sort(key=lambda x: x.get('id', 0))
+
+                # 语言信息从 transcription 或 job 获取
+                detected_language = transcription.get("language") or job.language
+
+                # 进度信息从 transcription 获取
+                processed_count = transcription.get("processed_count", 0)
+                total_chunks = transcription.get("total_chunks", 0)
+
+            else:
+                # 回退到旧格式（unaligned_results）
+                unaligned_results = data.get("unaligned_results", [])
+
+                for result in unaligned_results:
+                    if not detected_language and 'language' in result:
+                        detected_language = result['language']
+                    all_segments.extend(result.get('segments', []))
+
+                # 按时间排序
+                all_segments.sort(key=lambda x: x.get('start', 0))
+
+                # 重新编号
+                for idx, seg in enumerate(all_segments):
+                    seg['id'] = idx
+
+                # 进度信息从旧格式获取
+                processed_count = len(data.get("processed_indices", []))
+                total_chunks = data.get("total_segments", 0)
 
             return {
                 "job_id": job_id,
                 "has_checkpoint": True,
-                "language": detected_language or job.language or "unknown",
+                "language": detected_language or "unknown",
                 "segments": all_segments,
+                "sentence_count": transcription.get("sentence_count", len(all_segments)),
                 "progress": {
-                    "processed": len(data.get("processed_indices", [])),
-                    "total": data.get("total_segments", 0),
+                    "processed": processed_count,
+                    "total": total_chunks,
                     "percentage": round(
-                        len(data.get("processed_indices", [])) / max(1, data.get("total_segments", 1)) * 100,
+                        processed_count / max(1, total_chunks) * 100,
                         2
-                    )
+                    ) if total_chunks > 0 else 0
                 }
             }
 

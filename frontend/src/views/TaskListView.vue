@@ -3,13 +3,13 @@
     <!-- 顶部导航栏 -->
     <header class="task-header">
       <div class="header-left">
-        <h1 class="app-title">
+        <h1 class="app-title" @click="showAboutDialog = true">
           <svg class="app-icon" viewBox="0 0 24 24" fill="currentColor">
             <path
               d="M21 3H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14zM5 10h9v2H5zm0-3h9v2H5zm0 6h6v2H5z"
             />
           </svg>
-          VideoSRT
+          AnchorFlux
         </h1>
       </div>
       <div class="header-right">
@@ -127,7 +127,7 @@
                 class="meta-item"
               >
                 <el-icon><Loading /></el-icon>
-                {{ task.progress }}%
+                {{ (task.progress || 0).toFixed(1) }}%
               </span>
             </div>
 
@@ -170,7 +170,8 @@
       :close-on-click-modal="false"
     >
       <!-- 选项卡 -->
-      <el-tabs v-model="uploadMode">
+      <div class="tabs-container">
+        <el-tabs v-model="uploadMode">
         <!-- 模式A：直接上传 -->
         <el-tab-pane label="直接上传" name="upload">
           <el-upload
@@ -254,6 +255,18 @@
         </el-tab-pane>
       </el-tabs>
 
+      <!-- 打开input目录按钮 - 只在"从本地目录选择"标签页显示 -->
+      <el-button
+        v-if="uploadMode === 'select'"
+        text
+        size="small"
+        @click="handleOpenInputFolder"
+        class="open-folder-btn"
+      >
+        打开input目录
+      </el-button>
+    </div>
+
       <!-- 转录设置区域 - v3.5 预设模式 -->
       <div class="transcription-settings">
         <div class="settings-header" @click="showAdvancedSettings = !showAdvancedSettings">
@@ -314,11 +327,14 @@
         </div>
       </template>
     </el-dialog>
+
+    <!-- 关于对话框 -->
+    <AboutDialog v-model="showAboutDialog" />
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
+import { ref, computed, onMounted, watch, nextTick } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox, ElLoading } from "element-plus";
 import {
@@ -334,14 +350,16 @@ import {
 import { useUnifiedTaskStore } from "@/stores/unifiedTaskStore";
 import { transcriptionApi, systemApi } from "@/services/api";
 import fileApi from "@/services/api/fileApi"; // 导入文件 API
-import sseChannelManager from "@/services/sseChannelManager"; // 导入 SSE 频道管理器
+// V3.7.5: 移除 sseChannelManager 导入，SSE 订阅由 App.vue 统一管理
 import PresetSelector from "@/components/editor/PresetSelector.vue"; // v3.5 预设选择器
+import AboutDialog from "@/components/AboutDialog.vue"; // 关于对话框
 
 const router = useRouter();
 const taskStore = useUnifiedTaskStore();
 
 // 响应式数据 - 上传相关
 const showUploadDialog = ref(false);
+const showAboutDialog = ref(false);
 const uploadMode = ref("upload"); // 上传模式：'upload' 或 'select'
 const uploading = ref(false);
 const uploadRef = ref(null);
@@ -372,7 +390,8 @@ const taskConfig = ref({
     demucs_model: 'htdemucs',
     demucs_shifts: 1,
     spectrum_threshold: 0.35,
-    vad_filter: true
+    vad_filter: true,
+    enable_spectral_triage: true
   },
   transcription: {
     transcription_profile: 'sv_whisper_patch',
@@ -404,8 +423,7 @@ function handlePresetChange(newConfig) {
 // 计算属性 - 使用 computed 包装确保响应式
 const tasks = computed(() => taskStore.tasks);
 
-// SSE 取消订阅函数
-let unsubscribeGlobalSSE = null;
+// V3.7.5: 移除 unsubscribeGlobalSSE，SSE 订阅由 App.vue 统一管理
 
 // 监听任务列表变化，自动加载新增任务的缩略图
 watch(
@@ -443,6 +461,17 @@ async function loadInputFiles() {
     inputFiles.value = [];
   } finally {
     loadingFiles.value = false;
+  }
+}
+
+// 打开input文件夹
+async function handleOpenInputFolder() {
+  try {
+    await fileApi.openInputFolder();
+    ElMessage.success("已打开input文件夹");
+  } catch (error) {
+    console.error("打开文件夹失败:", error);
+    ElMessage.error(`打开文件夹失败: ${error.message || "未知错误"}`);
   }
 }
 
@@ -727,11 +756,15 @@ async function deleteTask(jobId) {
       // 这有助于修复幽灵任务问题
     }
 
-    // 从本地 store 中删除
+    // [V3.6.3] 优化：立即从本地删除，不再立即调用 syncTasksFromBackend
+    // 依赖 SSE job_removed 事件确保一致性
     await taskStore.deleteTask(jobId);
 
-    // 修复：删除完成后立即从后端同步任务列表（确保 UI 及时更新）
-    await taskStore.syncTasksFromBackend();
+    // [V3.6.3] 延迟同步作为兜底机制
+    // 如果 SSE 事件丢失，1秒后的同步可以保证最终一致性
+    setTimeout(() => {
+      taskStore.syncTasksFromBackend();
+    }, 1000);
 
     ElMessage.success("任务已删除");
   } catch (error) {
@@ -763,7 +796,10 @@ function getStatusText(status) {
     created: "已创建",
     queued: "排队中",
     processing: "转录中",
+    pausing: "正在暂停...",
     paused: "已暂停",
+    canceling: "正在取消...",  // V3.8.2
+    force_canceled: "已强制取消",  // V3.8.2
     finished: "已完成",
     failed: "失败",
     canceled: "已取消",
@@ -871,61 +907,32 @@ onMounted(() => {
     });
   }
 
-  // 订阅全局 SSE 以实时更新任务进度
-  subscribeGlobalSSE();
+  // V3.7.5: 移除重复的 SSE 订阅，由 App.vue 统一处理
+  // 避免重复订阅导致的任务重复添加问题
 });
 
-// 组件卸载时取消 SSE 订阅
-onUnmounted(() => {
-  if (unsubscribeGlobalSSE) {
-    unsubscribeGlobalSSE();
-    unsubscribeGlobalSSE = null;
-    console.log("[TaskListView] 已取消 SSE 订阅");
-  }
-});
+// V3.7.5: 监听任务状态变化，自动加载完成任务的缩略图
+// 替代原来在 SSE 订阅中的缩略图加载逻辑
+watch(
+  () => tasks.value,
+  (newTasks, oldTasks) => {
+    if (!newTasks || !oldTasks) return;
 
-// 订阅全局 SSE 事件
-function subscribeGlobalSSE() {
-  console.log("[TaskListView] 订阅全局 SSE");
+    // 检测状态变为 finished 的任务
+    newTasks.forEach((newTask) => {
+      const oldTask = oldTasks.find(t => t.job_id === newTask.job_id);
 
-  unsubscribeGlobalSSE = sseChannelManager.subscribeGlobal({
-    onJobProgress: (jobId, progress, data) => {
-      // 更新任务进度
-      console.log(`[TaskListView] 任务进度更新: ${jobId} -> ${progress}%`);
-      taskStore.updateTask(jobId, {
-        progress: progress,
-        status: data.status || "processing",
-        message: data.message || `转录中 ${progress}%`,
-      });
-    },
-
-    onJobStatus: (jobId, status, data) => {
-      // 更新任务状态
-      console.log(`[TaskListView] 任务状态更新: ${jobId} -> ${status}`);
-      taskStore.updateTask(jobId, {
-        status: status,
-        progress: data.progress || (status === "finished" ? 100 : 0),
-        message: data.message || "",
-      });
-
-      // 如果任务完成，尝试加载缩略图
-      if (status === "finished") {
+      // 如果任务刚完成，自动加载缩略图
+      if (newTask.status === 'finished' && oldTask?.status !== 'finished') {
+        console.log(`[TaskListView] 任务完成，加载缩略图: ${newTask.job_id}`);
         setTimeout(() => {
-          getThumbnailUrl(jobId, true);
+          getThumbnailUrl(newTask.job_id, true);
         }, 1000);
       }
-    },
-
-    onQueueUpdate: (queue) => {
-      console.log("[TaskListView] 队列更新:", queue);
-      // 可以在这里处理队列变化
-    },
-
-    onConnected: () => {
-      console.log("[TaskListView] SSE 连接成功");
-    },
-  });
-}
+    });
+  },
+  { deep: true }
+);
 
 // 获取任务缩略图（带缓存和重试机制）
 async function getThumbnailUrl(jobId, forceReload = false) {
@@ -973,7 +980,7 @@ async function getThumbnailUrl(jobId, forceReload = false) {
 async function handleExit() {
   try {
     await ElMessageBox.confirm(
-      '确定要退出系统吗？\n\n运行中的任务会自动保存进度，下次启动时继续执行。',
+      '确定要退出系统吗？所有更改都会自动保存',
       '确认退出',
       {
         confirmButtonText: '确定退出',
@@ -984,26 +991,61 @@ async function handleExit() {
 
     // 显示关闭进度
     const loading = ElLoading.service({
-      text: '正在安全关闭系统...',
+      text: '正在保存断点并关闭系统...',
       background: 'rgba(0, 0, 0, 0.7)'
     })
 
+    let shutdownSuccess = false
+    let cleanupReport = null
+
     try {
-      // 调用后端 shutdown API
-      await systemApi.shutdownSystem()
+      // 调用后端 shutdown API，设置超时
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 10000) // 10秒超时
+      
+      try {
+        const response = await systemApi.shutdownSystem({
+          cleanup_temp: false,  // 不清理临时文件，保留断点数据
+          force: false
+        })
+        
+        clearTimeout(timeoutId)
+        shutdownSuccess = response?.success || false
+        cleanupReport = response?.cleanup_report || null
+        
+        if (cleanupReport) {
+          console.log('[Exit] 清理报告:', cleanupReport)
+        }
+      } catch (e) {
+        clearTimeout(timeoutId)
+        // 请求可能因后端关闭而失败，这是预期行为
+        console.log('[Exit] 后端已关闭或请求超时:', e.message || e)
+        shutdownSuccess = true  // 如果后端已关闭，认为成功
+      }
     } catch (e) {
-      // 请求可能因后端关闭而失败，这是预期行为
-      console.log('[Exit] 后端已关闭:', e)
+      console.log('[Exit] 关闭请求异常:', e)
+      shutdownSuccess = true  // 即使异常也认为成功（后端可能已关闭）
     }
 
     loading.close()
 
     // 显示关闭完成提示
+    const message = shutdownSuccess 
+      ? '系统已安全关闭，请手动关闭此浏览器标签页。'
+      : '系统关闭可能未完全成功，请手动检查后台进程。'
+    
     await ElMessageBox.alert(
-      '系统已安全关闭。\n\n请手动关闭此浏览器标签页。\n下次启动时，运行中的任务将自动恢复。',
+      message,
       '关闭完成',
-      { type: 'success' }
+      { type: shutdownSuccess ? 'success' : 'warning' }
     )
+    
+    // 尝试关闭当前窗口（部分浏览器可能阻止）
+    try {
+      window.close()
+    } catch (e) {
+      // 忽略关闭窗口失败
+    }
   } catch (error) {
     // 用户取消退出
     if (error !== 'cancel') {
@@ -1061,6 +1103,12 @@ async function handleExit() {
     align-items: center;
     gap: 8px;
     margin: 0;
+    cursor: pointer;
+    transition: color 0.2s;
+
+    &:hover {
+      color: var(--primary);
+    }
   }
 
   .app-icon {
@@ -1278,6 +1326,30 @@ async function handleExit() {
 
     .el-button {
       flex: 1;
+    }
+  }
+}
+
+// 标签页容器 - 相对定位
+.tabs-container {
+  position: relative;
+  margin-bottom: 20px;
+
+  .open-folder-btn {
+    position: absolute;
+    top: 8px;
+    right: 0;
+    color: var(--text-secondary);
+    padding: 4px 8px;
+
+    &:hover {
+      color: var(--el-color-primary);
+      background: var(--bg-tertiary);
+    }
+
+    &:active {
+      color: var(--el-color-primary);
+      background: var(--bg-quaternary);
     }
   }
 }
@@ -1636,7 +1708,7 @@ async function handleExit() {
     }
 
     span {
-      font-size: 13px;
+      font-size: 14px;
       font-weight: 500;
       color: var(--text-secondary);
     }

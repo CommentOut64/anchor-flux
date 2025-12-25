@@ -5,7 +5,7 @@ title Video to SRT GPU
 
 echo.
 echo ========================================
-echo   Video to SRT GPU - Starting...
+echo   AnchorFlux - Starting...
 echo ========================================
 echo.
 
@@ -102,17 +102,76 @@ echo.
 echo [Step 6/6] Starting services...
 echo.
 
+REM 先清理可能残留的旧进程
+echo [Cleanup] Checking for old processes...
+
+REM 清理 FFmpeg 进程
+taskkill /F /IM ffmpeg.exe >nul 2>&1
+if %ERRORLEVEL%==0 echo [Cleanup] FFmpeg processes terminated
+
+REM 清理 ffprobe 进程
+taskkill /F /IM ffprobe.exe >nul 2>&1
+
+REM 检查并释放端口 8000（旧后端进程）
+echo [Cleanup] Checking port 8000...
+set "CLEANED_8000=0"
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":8000" ^| findstr "LISTENING"') do (
+    if not "%%a"=="" (
+        echo [Cleanup] Found process on port 8000 - PID: %%a
+        taskkill /F /PID %%a >nul 2>&1
+        if not ERRORLEVEL 1 (
+            echo [Cleanup] Killed process PID %%a
+            set "CLEANED_8000=1"
+        )
+    )
+)
+
+REM 检查并释放端口 5173（旧前端进程）
+echo [Cleanup] Checking port 5173...
+set "CLEANED_5173=0"
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":5173" ^| findstr "LISTENING"') do (
+    if not "%%a"=="" (
+        echo [Cleanup] Found process on port 5173 - PID: %%a
+        taskkill /F /PID %%a >nul 2>&1
+        if not ERRORLEVEL 1 (
+            echo [Cleanup] Killed process PID %%a
+            set "CLEANED_5173=1"
+        )
+    )
+)
+
+REM 使用 wmic 查找并终止残留的 Python 进程（运行 uvicorn）
+echo [Cleanup] Checking for old uvicorn processes...
+for /f "skip=1 tokens=1" %%p in ('wmic process where "commandline like '%%uvicorn%%app.main%%'" get processid 2^>nul') do (
+    if not "%%p"=="" (
+        echo [Cleanup] Found old uvicorn process - PID: %%p
+        taskkill /F /PID %%p >nul 2>&1
+    )
+)
+
+REM 使用 wmic 查找并终止残留的 Node 进程（运行 vite）
+echo [Cleanup] Checking for old vite processes...
+for /f "skip=1 tokens=1" %%p in ('wmic process where "commandline like '%%vite%%'" get processid 2^>nul') do (
+    if not "%%p"=="" (
+        echo [Cleanup] Found old vite process - PID: %%p
+        taskkill /F /PID %%p >nul 2>&1
+    )
+)
+
+REM 等待进程完全退出
+timeout /t 2 /nobreak >nul
+echo [OK] Old processes cleanup completed
+echo.
+
 echo [Starting] Backend service on port 8000...
-cd /d "%BACKEND_DIR%"
-start "Backend" cmd /c "title Video2SRT Backend & set KMP_DUPLICATE_LIB_OK=TRUE & set PATH=%TORCH_LIB%;%NVIDIA_CUDNN%;%NVIDIA_CUBLAS%;%TOOLS_DIR%;%PATH% & "%PYTHON_EXEC%" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 & pause"
+start "Video2SRT Backend" cmd /c "title Video2SRT Backend && cd /d %BACKEND_DIR% && set KMP_DUPLICATE_LIB_OK=TRUE && set PATH=%TORCH_LIB%;%NVIDIA_CUDNN%;%NVIDIA_CUBLAS%;%TOOLS_DIR%;%PATH% && %PYTHON_EXEC% -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
 echo [Waiting] Backend initializing...
 timeout /t 5 /nobreak >nul
 
 if "%SKIP_FRONTEND%"=="0" (
     echo [Starting] Frontend service on port 5173...
-    cd /d "%FRONTEND_DIR%"
-    start "Frontend" cmd /c "title Video2SRT Frontend & npm run dev & pause"
+    start "Video2SRT Frontend" cmd /c "title Video2SRT Frontend && cd /d %FRONTEND_DIR% && npm run dev"
 )
 
 cd /d "%PROJECT_ROOT%"
@@ -131,8 +190,27 @@ echo   Frontend: http://localhost:5173
 echo   Backend:  http://localhost:8000
 echo   API Docs: http://localhost:8000/docs
 echo.
-echo   Do not close this window!
+echo   [!] This window will close automatically
+echo       when you click "Exit System" button.
+echo.
+echo   [!] Do NOT close this window manually!
 echo.
 echo ========================================
 
-pause
+REM 循环检测后端进程是否还在运行
+REM 如果后端进程退出（用户点击"退出系统"），则自动关闭主窗口
+:wait_loop
+timeout /t 3 /nobreak >nul
+
+REM 检查端口 8000 是否还有进程监听
+netstat -ano 2>nul | findstr ":8000" | findstr "LISTENING" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo [INFO] Backend service has stopped. Closing...
+    REM 终止前端进程
+    taskkill /F /IM node.exe /FI "WINDOWTITLE eq Video2SRT*" >nul 2>&1
+    timeout /t 1 /nobreak >nul
+    exit /b 0
+)
+
+goto wait_loop

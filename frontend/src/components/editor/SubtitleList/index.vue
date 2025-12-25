@@ -28,11 +28,13 @@
       </div>
 
       <div class="toolbar-right">
-        <button class="toolbar-btn" @click="addNewSubtitle" title="添加字幕">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
-          </svg>
-        </button>
+        <el-tooltip content="添加字幕" placement="bottom" :show-after="500">
+          <button class="toolbar-btn" @click="addNewSubtitle">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+            </svg>
+          </button>
+        </el-tooltip>
       </div>
     </div>
 
@@ -47,21 +49,24 @@
       </div>
 
       <!-- Phase 5: 使用 SubtitleItem 组件替代内联渲染 -->
-      <SubtitleItem
-        v-for="(subtitle, index) in filteredSubtitles"
-        :key="subtitle.id"
-        :subtitle="subtitle"
-        :index="index"
-        :is-active="activeSubtitleId === subtitle.id"
-        :is-current="currentSubtitleId === subtitle.id"
-        :editable="props.editable"
-        @click="onSubtitleClick"
-        @update-time="updateTime"
-        @update-text="updateText"
-        @delete="deleteSubtitle"
-        @insert-before="insertBefore(index)"
-        @insert-after="insertAfter(index)"
-      />
+      <!-- 添加 TransitionGroup 实现切分动画，批量更新时禁用 -->
+      <TransitionGroup :name="animationEnabled ? 'subtitle-list' : ''" tag="div">
+        <SubtitleItem
+          v-for="(subtitle, index) in filteredSubtitles"
+          :key="subtitle.id"
+          :subtitle="subtitle"
+          :index="index"
+          :is-active="activeSubtitleId === subtitle.id"
+          :is-current="currentSubtitleId === subtitle.id"
+          :editable="props.editable"
+          @click="onSubtitleClick"
+          @update-time="updateTime"
+          @update-text="updateText"
+          @delete="deleteSubtitle"
+          @insert-before="insertBefore(index)"
+          @insert-after="insertAfter(index)"
+        />
+      </TransitionGroup>
     </div>
   </div>
 </template>
@@ -69,6 +74,7 @@
 <script setup>
 import { ref, computed, watch, nextTick } from 'vue'
 import { useProjectStore } from '@/stores/projectStore'
+import { usePlaybackManager } from '@/services/PlaybackManager'
 // Phase 5: 导入 SubtitleItem 组件
 import SubtitleItem from './SubtitleItem.vue'
 
@@ -83,11 +89,16 @@ const emit = defineEmits(['subtitle-click', 'subtitle-edit', 'subtitle-delete', 
 // Store
 const projectStore = useProjectStore()
 
+// 全局播放管理器
+const playbackManager = usePlaybackManager()
+
 // Refs
 const listRef = ref(null)
 
 // State
 const searchText = ref('')
+const animationEnabled = ref(true)  // 批量更新时禁用动画
+let previousSubtitleCount = 0  // 上一次字幕数量
 
 // Computed
 const subtitles = computed(() => projectStore.subtitles)
@@ -106,7 +117,8 @@ const filteredSubtitles = computed(() => {
 // Methods
 function onSubtitleClick(subtitle) {
   projectStore.view.selectedSubtitleId = subtitle.id
-  projectStore.seekTo(subtitle.start)
+  // 使用 PlaybackManager 进行跳转，确保视频和波形同步
+  playbackManager.seekTo(subtitle.start)
   emit('subtitle-click', subtitle)
 }
 
@@ -122,10 +134,8 @@ function updateText(id, text) {
 }
 
 function deleteSubtitle(id) {
-  if (confirm('确定删除这条字幕吗?')) {
-    projectStore.removeSubtitle(id)
-    emit('subtitle-delete', id)
-  }
+  projectStore.removeSubtitle(id)
+  emit('subtitle-delete', id)
 }
 
 function addNewSubtitle() {
@@ -179,6 +189,24 @@ watch(currentSubtitleId, (id) => {
     nextTick(() => scrollToItem(index))
   }
 })
+
+// 批量更新检测：超过阈值时禁用动画，避免重叠闪烁
+const BATCH_UPDATE_THRESHOLD = 5
+watch(subtitles, (newList) => {
+  const newCount = newList.length
+  const diff = Math.abs(newCount - previousSubtitleCount)
+
+  if (diff > BATCH_UPDATE_THRESHOLD) {
+    // 批量更新，禁用动画
+    animationEnabled.value = false
+    // 下一帧恢复动画（确保本次渲染完成）
+    nextTick(() => {
+      animationEnabled.value = true
+    })
+  }
+
+  previousSubtitleCount = newCount
+}, { flush: 'pre' })  // pre: 在 DOM 更新前触发
 </script>
 
 <style lang="scss" scoped>
@@ -280,6 +308,7 @@ watch(currentSubtitleId, (id) => {
   flex: 1;
   overflow-y: auto;
   padding: 6px;
+  position: relative;
 
   &::-webkit-scrollbar {
     width: 6px;
@@ -554,5 +583,28 @@ watch(currentSubtitleId, (id) => {
       color: var(--danger);
     }
   }
+}
+
+// 字幕切分动画
+.subtitle-list-move {
+  transition: transform 0.3s ease;
+}
+
+.subtitle-list-enter-active,
+.subtitle-list-leave-active {
+  transition: all 0.2s ease;
+}
+
+.subtitle-list-enter-from,
+.subtitle-list-leave-to {
+  opacity: 0;
+  transform: scaleY(0.3);
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.subtitle-list-leave-active {
+  position: absolute;
+  width: calc(100% - 32px);
 }
 </style>

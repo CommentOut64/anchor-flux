@@ -48,8 +48,28 @@
         @progress="onProgress"
       />
 
-      <!-- 字幕覆盖层 -->
-      <div v-if="showSubtitle && currentSubtitleText" class="subtitle-overlay">
+      <!-- 字幕覆盖层 - 可拖动版本 -->
+      <div
+        v-if="showSubtitle && currentSubtitleText"
+        class="subtitle-overlay"
+        :class="{ 'is-vertical': isSubtitleVertical, 'is-dragging': isDraggingSubtitle }"
+        :style="subtitleStyle"
+        @mousedown="handleSubtitleMouseDown"
+      >
+        <!-- 左上角：方向切换按钮 -->
+        <button class="subtitle-control-btn direction-btn" @click.stop="toggleSubtitleDirection" title="切换方向">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M9 4v3h5v12h3V7h5V4H9zm-6 8h3v7h3v-7h3V9H3v3z"/>
+          </svg>
+        </button>
+
+        <!-- 右上角：重置按钮 -->
+        <button class="subtitle-control-btn reset-btn" @click.stop="resetSubtitlePosition" title="重置位置">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+          </svg>
+        </button>
+
         <span class="subtitle-text">{{ currentSubtitleText }}</span>
       </div>
 
@@ -157,6 +177,13 @@ const stateHintType = ref('')
 const stateHintText = ref('')
 let stateHintTimer = null
 
+// 字幕拖动相关状态
+const subtitlePosition = ref({ x: 0, y: 0 })  // 字幕位置偏移（相对于默认位置）
+const isSubtitleVertical = ref(false)  // 是否竖向显示
+const isDraggingSubtitle = ref(false)  // 是否正在拖动
+const dragStartPos = ref({ x: 0, y: 0 })  // 拖动起始位置
+const dragStartSubtitlePos = ref({ x: 0, y: 0 })  // 拖动开始时的字幕位置
+
 // Computed
 const videoSource = computed(() => {
   if (props.videoUrl) return props.videoUrl
@@ -209,6 +236,14 @@ const resolutionClass = computed(() => {
 
 const currentSubtitleText = computed(() => projectStore.currentSubtitle?.text || '')
 const isPlaying = computed(() => projectStore.player.isPlaying)
+
+// 字幕样式（控制位置）
+const subtitleStyle = computed(() => {
+  return {
+    transform: `translate(calc(-50% + ${subtitlePosition.value.x}px), ${subtitlePosition.value.y}px)`,
+    cursor: isDraggingSubtitle.value ? 'grabbing' : 'grab'
+  }
+})
 
 // 视频是否就绪（用于控件拦截）
 // 只有在这些状态下，用户才能操作播放控件
@@ -660,6 +695,90 @@ function toggleFullscreen() {
   }
 }
 
+// ========== 字幕拖动相关 ==========
+
+// 处理字幕鼠标按下事件（开始拖动）
+function handleSubtitleMouseDown(e) {
+  // 只有按住 Ctrl 键时才能拖动
+  if (!e.ctrlKey) return
+
+  e.preventDefault()
+  e.stopPropagation()
+
+  isDraggingSubtitle.value = true
+  dragStartPos.value = { x: e.clientX, y: e.clientY }
+  dragStartSubtitlePos.value = { ...subtitlePosition.value }
+
+  // 添加全局鼠标事件监听
+  document.addEventListener('mousemove', handleSubtitleMouseMove)
+  document.addEventListener('mouseup', handleSubtitleMouseUp)
+}
+
+// 处理字幕鼠标移动事件（拖动中）
+function handleSubtitleMouseMove(e) {
+  if (!isDraggingSubtitle.value) return
+
+  e.preventDefault()
+
+  const deltaX = e.clientX - dragStartPos.value.x
+  const deltaY = e.clientY - dragStartPos.value.y
+
+  subtitlePosition.value = {
+    x: dragStartSubtitlePos.value.x + deltaX,
+    y: dragStartSubtitlePos.value.y + deltaY
+  }
+}
+
+// 处理字幕鼠标释放事件（结束拖动）
+function handleSubtitleMouseUp() {
+  if (!isDraggingSubtitle.value) return
+
+  isDraggingSubtitle.value = false
+
+  // 移除全局鼠标事件监听
+  document.removeEventListener('mousemove', handleSubtitleMouseMove)
+  document.removeEventListener('mouseup', handleSubtitleMouseUp)
+
+  // 保存位置到 localStorage
+  saveSubtitlePreferences()
+}
+
+// 切换字幕方向
+function toggleSubtitleDirection() {
+  isSubtitleVertical.value = !isSubtitleVertical.value
+  saveSubtitlePreferences()
+}
+
+// 重置字幕位置和方向
+function resetSubtitlePosition() {
+  subtitlePosition.value = { x: 0, y: 0 }
+  isSubtitleVertical.value = false
+  saveSubtitlePreferences()
+}
+
+// 保存字幕偏好设置
+function saveSubtitlePreferences() {
+  const preferences = {
+    position: subtitlePosition.value,
+    isVertical: isSubtitleVertical.value
+  }
+  localStorage.setItem('subtitle-preferences', JSON.stringify(preferences))
+}
+
+// 加载字幕偏好设置
+function loadSubtitlePreferences() {
+  try {
+    const saved = localStorage.getItem('subtitle-preferences')
+    if (saved) {
+      const preferences = JSON.parse(saved)
+      subtitlePosition.value = preferences.position || { x: 0, y: 0 }
+      isSubtitleVertical.value = preferences.isVertical || false
+    }
+  } catch (error) {
+    console.error('[VideoStage] 加载字幕偏好设置失败:', error)
+  }
+}
+
 // 键盘快捷键（带拦截）
 function handleKeyboard(e) {
   if (!props.enableKeyboard || !videoRef.value) return
@@ -710,7 +829,10 @@ function handleContainerClick(e) {
 onMounted(() => {
   document.addEventListener('keydown', handleKeyboard)
   document.addEventListener('fullscreenchange', handleFullscreenChange)
-  
+
+  // 加载字幕偏好设置
+  loadSubtitlePreferences()
+
   // 【关键】注册 Video 元素到 PlaybackManager
   if (videoRef.value) {
     playbackManager.registerVideo(videoRef.value)
@@ -723,7 +845,11 @@ onUnmounted(() => {
   clearTimeout(stateHintTimer)
   clearTimeout(progressiveHintTimer)
   if (clickTimer) clearTimeout(clickTimer)
-  
+
+  // 清理字幕拖动事件监听器
+  document.removeEventListener('mousemove', handleSubtitleMouseMove)
+  document.removeEventListener('mouseup', handleSubtitleMouseUp)
+
   // 【关键】注销 Video 元素
   playbackManager.unregisterVideo()
 })
@@ -762,15 +888,70 @@ onUnmounted(() => {
   }
 }
 
-// 字幕覆盖层
+// 字幕覆盖层 - 可拖动版本
 .subtitle-overlay {
   position: absolute;
   bottom: 48px;
   left: 50%;
-  transform: translateX(-50%);
+  // transform 由 subtitleStyle 计算属性控制
   max-width: 80%;
   z-index: 10;
-  pointer-events: none;
+  pointer-events: auto;  // 允许交互
+  user-select: none;  // 禁止文本选择
+  transition: opacity 0.2s;
+
+  // 控制按钮容器（默认隐藏）
+  .subtitle-control-btn {
+    position: absolute;
+    top: -8px;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 50%;
+    color: rgba(255, 255, 255, 0.7);
+    cursor: pointer;
+    opacity: 0;
+    transition: all 0.2s;
+    pointer-events: auto;
+
+    svg {
+      width: 14px;
+      height: 14px;
+    }
+
+    &:hover {
+      background: rgba(0, 0, 0, 0.95);
+      color: #fff;
+      border-color: rgba(255, 255, 255, 0.4);
+      transform: scale(1.1);
+    }
+
+    &.direction-btn {
+      left: -8px;
+    }
+
+    &.reset-btn {
+      right: -8px;
+    }
+  }
+
+  // hover 时显示控制按钮
+  &:hover .subtitle-control-btn {
+    opacity: 1;
+  }
+
+  // 拖动时的样式
+  &.is-dragging {
+    opacity: 0.8;
+
+    .subtitle-text {
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    }
+  }
 
   .subtitle-text {
     display: inline-block;
@@ -782,6 +963,28 @@ onUnmounted(() => {
     border-radius: var(--radius-sm);
     text-align: center;
     text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8);
+    transition: box-shadow 0.2s;
+    pointer-events: none;  // 文本本身不响应事件
+  }
+
+  // 竖向显示模式
+  &.is-vertical {
+    .subtitle-text {
+      writing-mode: vertical-rl;
+      text-orientation: upright;
+      padding: 20px 8px;
+      max-height: 60vh;
+      overflow-y: auto;
+
+      // 自定义滚动条
+      &::-webkit-scrollbar {
+        width: 4px;
+      }
+      &::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, 0.3);
+        border-radius: 2px;
+      }
+    }
   }
 }
 

@@ -128,7 +128,7 @@
                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
               </svg>
               <h3>问题检查</h3>
-              <p>功能已移除</p>
+              <p>即将实现</p>
             </div>
           </div>
 
@@ -188,14 +188,16 @@
  * - 可拖拽调整侧边栏宽度
  * - 智能进度显示和多任务管理
  */
-import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, provide, watch, toRef } from 'vue'
 import { useRouter, onBeforeRouteLeave } from 'vue-router'
 import { useProjectStore } from '@/stores/projectStore'
 import { useUnifiedTaskStore } from '@/stores/unifiedTaskStore'
+import { useProgressStore } from '@/stores/progressStore'
 import { mediaApi, transcriptionApi } from '@/services/api'
 import sseChannelManager from '@/services/sseChannelManager'
 import { useShortcuts } from '@/hooks/useShortcuts'
 import { useProxyVideo } from '@/composables/useProxyVideo'
+import { usePlaybackManager } from '@/services/PlaybackManager'
 
 // 组件导入
 import EditorHeader from '@/components/editor/EditorHeader.vue'
@@ -214,8 +216,14 @@ const router = useRouter()
 const projectStore = useProjectStore()
 const taskStore = useUnifiedTaskStore()
 
+// 全局播放管理器
+const playbackManager = usePlaybackManager()
+
+// 创建响应式 jobId ref，用于监听路由变化
+const jobIdRef = toRef(props, 'jobId')
+
 // Proxy 视频加载状态（新重构版本）
-const proxyVideo = useProxyVideo(props.jobId)
+const proxyVideo = useProxyVideo(jobIdRef)
 
 // Refs
 const videoStageRef = ref(null)
@@ -232,11 +240,23 @@ const isResizing = ref(false)
 const isLoading = ref(true)
 const loadError = ref(null)
 
-// 任务状态
-const taskStatus = ref(null)
-const taskPhase = ref('pending')  // 任务阶段
-const taskProgress = ref(0)
-const isTranscribing = ref(false)
+// 统一进度状态
+const progressStore = useProgressStore()
+// 修复：直接使用 getRawState 获取响应式状态对象，避免 computed 嵌套导致响应式丢失
+const jobProgress = computed(() => progressStore.getRawState(jobIdRef.value))
+const taskStatus = computed(() => jobProgress.value.status || 'idle')
+const taskPhase = computed(() => jobProgress.value.phase || 'pending')
+const taskProgress = computed(() => jobProgress.value.percent || 0)
+const isTranscribing = computed(() =>
+  ['processing', 'queued'].includes(taskStatus.value)
+)
+const dualStreamProgress = computed(() => {
+  const ds = jobProgress.value.dualStream
+  if (ds && ds.mode !== 'unknown') {
+    return ds
+  }
+  return projectStore.dualStreamProgress
+})
 let sseUnsubscribe = null
 let progressPollTimer = null
 
@@ -245,7 +265,7 @@ let progressPollTimer = null
 
 // 提供编辑器上下文给子组件
 provide('editorContext', {
-  jobId: props.jobId,
+  jobId: jobIdRef,
   saving,
   // 视频就绪状态（用于播放控制拦截）
   isVideoReady: computed(() => proxyVideo.isReady.value)
@@ -274,16 +294,86 @@ watch(() => proxyVideo.state.value, (newState, oldState) => {
   })
 })
 
+// 将 projectStore 的估算双流进度同步到统一状态，供 UI 兜底展示
+watch(
+  () => projectStore.dualStreamProgress,
+  (progress) => {
+    if (!progress) return
+    progressStore.applyDualStreamEstimate(jobIdRef.value, progress)
+  },
+  { deep: true }
+)
+
+// 监听 jobId 变化，重新加载项目（支持任务切换）
+watch(jobIdRef, async (newJobId, oldJobId) => {
+  if (newJobId === oldJobId) return
+
+  console.log('[EditorView] jobId 变化，重新加载项目:', { oldJobId, newJobId })
+
+  // 取消旧的 SSE 订阅
+  cleanupSSE()
+
+  // 重置项目状态
+  projectStore.resetProject()
+
+  // 重新加载项目
+  await loadProject()
+})
+
 // ========== 计算属性 ==========
 
-// 项目名称
+// 项目名称 - 优先显示 title，否则显示 filename（去除扩展名）
+// 【修复】过滤掉看起来像 UUID/16进制 的名称
 const projectName = computed(() => {
-  if (projectStore.meta.title) {
+  // 检查是否看起来像 UUID（16进制字符串）
+  // 匹配: 纯16进制字符串（8-36位），或带连字符的UUID格式
+  const isUuidLike = (str) => {
+    if (!str) return true
+    const cleaned = str.replace(/-/g, '')
+    // 必须是纯16进制字符，且长度在8-36位之间
+    return /^[0-9a-f]{8,36}$/i.test(cleaned)
+  }
+
+  // 从 filename 提取不带扩展名的名称
+  const getDisplayName = (filename) => {
+    if (!filename) return null
+    const lastDotIndex = filename.lastIndexOf('.')
+    return lastDotIndex > 0 ? filename.substring(0, lastDotIndex) : filename
+  }
+
+  // 1. 优先使用用户自定义的 title（非UUID）
+  if (projectStore.meta.title && !isUuidLike(projectStore.meta.title)) {
     return projectStore.meta.title
   }
-  const filename = projectStore.meta.filename || '未命名项目'
-  const lastDotIndex = filename.lastIndexOf('.')
-  return lastDotIndex > 0 ? filename.substring(0, lastDotIndex) : filename
+
+  // 2. 使用 filename（去除扩展名，非UUID）
+  const filename = projectStore.meta.filename
+  const displayName = getDisplayName(filename)
+  if (displayName && !isUuidLike(displayName)) {
+    return displayName
+  }
+
+  // 3. 尝试从 taskStore 获取（优先 title，其次 filename）
+  const task = taskStore.tasks.find(t => t.job_id === props.jobId)
+  if (task) {
+    // 优先使用 task.title
+    if (task.title && !isUuidLike(task.title)) {
+      return task.title
+    }
+    // 其次使用 task.filename
+    const taskDisplayName = getDisplayName(task.filename)
+    if (taskDisplayName && !isUuidLike(taskDisplayName)) {
+      return taskDisplayName
+    }
+  }
+
+  // 4. 最后尝试使用 filename 本身（即使看起来像UUID，也比"未命名项目"好）
+  // 但如果 filename 就是 job_id（完全匹配），则显示"未命名项目"
+  if (displayName && displayName !== props.jobId && displayName !== props.jobId.replace(/-/g, '')) {
+    return displayName
+  }
+
+  return '未命名项目'
 })
 
 // 基础状态
@@ -311,8 +401,10 @@ const activeTasks = computed(() =>
   taskStore.tasks.filter(t => ['processing', 'queued'].includes(t.status)).length
 )
 
-// Phase 5: 双流进度（从 projectStore 获取）
-const dualStreamProgress = computed(() => projectStore.dualStreamProgress)
+// 问题检查计数（统计有警告的字幕数量）
+const errorCount = computed(() =>
+  projectStore.subtitles.filter(s => s.warning_type && s.warning_type !== 'none').length
+)
 
 // Grid 布局样式
 const gridStyle = computed(() => ({
@@ -335,9 +427,19 @@ async function loadProject() {
     const jobStatus = await transcriptionApi.getJobStatus(props.jobId, true)
     console.log('[EditorView] 任务状态:', jobStatus)
 
-    taskStatus.value = jobStatus.status
-    taskPhase.value = jobStatus.phase || 'pending'  // 获取任务阶段
-    taskProgress.value = jobStatus.progress || 0
+    progressStore.applySnapshot(
+      props.jobId,
+      {
+        percent: jobStatus.progress,
+        status: jobStatus.status,
+        phase: jobStatus.phase,
+        phase_percent: jobStatus.phase_percent,
+        message: jobStatus.message,
+        processed: jobStatus.processed,
+        total: jobStatus.total
+      },
+      'http_init'
+    )
 
     // 设置元数据
     projectStore.meta.jobId = props.jobId
@@ -351,18 +453,27 @@ async function loadProject() {
     const restored = await projectStore.restoreProject(props.jobId)
     if (restored && projectStore.subtitles.length > 0) {
       console.log('[EditorView] 从本地存储恢复成功')
-      isTranscribing.value = false
+
+      // 检查缓存数据是否有 sentenceIndex 字段（新格式）
+      const hasValidFormat = projectStore.subtitles.every(s => s.sentenceIndex !== undefined)
+
+      if (!hasValidFormat && ['processing', 'queued', 'paused'].includes(jobStatus.status)) {
+        // 缓存数据是旧格式，需要重新从 API 加载以获取 sentenceIndex
+        console.log('[EditorView] 缓存数据格式过旧（缺少 sentenceIndex），重新从 API 加载')
+        await loadTranscribingSegments()
+      }
 
       // 即使从本地恢复，如果任务仍在处理中或暂停，也需要订阅SSE以接收实时更新
       if (['processing', 'queued'].includes(jobStatus.status)) {
         console.log('[EditorView] 任务仍在处理中，需要订阅SSE')
-        isTranscribing.value = true
         subscribeSSE()
         startProgressPolling()
       } else if (jobStatus.status === 'paused') {
         // 暂停状态也需要订阅SSE，以便接收恢复信号
         console.log('[EditorView] 任务已暂停，订阅SSE以接收恢复信号')
         subscribeSSE()
+        // V3.7.4: 暂停状态下立即刷新一次进度，不等待 SSE 连接
+        refreshTaskProgress()
       } else if (jobStatus.status === 'finished') {
         // 任务已完成，useProxyVideo会自动处理视频转码状态
         console.log('[EditorView] 本地恢复后任务已完成，useProxyVideo将自动检查视频转码状态')
@@ -375,19 +486,18 @@ async function loadProject() {
       await loadCompletedSRT()
       // useProxyVideo会自动检查视频状态
     } else if (['processing', 'queued'].includes(jobStatus.status)) {
-      isTranscribing.value = true
       await loadTranscribingSegments()
       // 订阅SSE获取实时更新
       subscribeSSE()
       startProgressPolling()
     } else if (jobStatus.status === 'paused') {
       // 暂停状态：加载已有的 segments，并订阅 SSE 以便接收恢复信号
-      isTranscribing.value = false
       await loadTranscribingSegments()
       // 订阅SSE，以便用户点击恢复后能收到状态变更
       subscribeSSE()
+      // V3.7.4: 暂停状态下立即刷新一次进度，不等待 SSE 连接
+      refreshTaskProgress()
     } else if (jobStatus.status === 'created') {
-      isTranscribing.value = true
       // 任务刚创建，订阅SSE等待开始
       subscribeSSE()
     } else if (jobStatus.status === 'failed') {
@@ -426,7 +536,6 @@ async function loadCompletedSRT() {
       videoPath: projectStore.meta.videoPath,
       audioPath: projectStore.meta.audioPath
     })
-    isTranscribing.value = false
   } catch (error) {
     console.warn('[EditorView] 加载 SRT 失败，尝试加载 segments:', error)
     await loadTranscribingSegments()
@@ -438,15 +547,24 @@ async function loadTranscribingSegments() {
   try {
     const textData = await transcriptionApi.getTranscriptionText(props.jobId)
     if (textData.segments && textData.segments.length > 0) {
-      const srtContent = segmentsToSRT(textData.segments)
-      projectStore.importSRT(srtContent, {
+      // 直接导入 segments，保留 sentenceIndex 字段
+      projectStore.importSegments(textData.segments, {
         jobId: props.jobId,
         filename: projectStore.meta.filename,
         duration: projectStore.meta.duration,
         videoPath: projectStore.meta.videoPath,
         audioPath: projectStore.meta.audioPath
       })
-      taskProgress.value = textData.progress?.percentage || 0
+      progressStore.applySnapshot(
+        props.jobId,
+        {
+          percent: textData.progress?.percentage,
+          phase: taskPhase.value,
+          status: taskStatus.value,
+          phase_percent: textData.progress?.phase_percent
+        },
+        'http_segments'
+      )
     }
   } catch (error) {
     console.warn('[EditorView] 加载转录文字失败:', error)
@@ -488,38 +606,25 @@ function subscribeSSE() {
   sseUnsubscribe = sseChannelManager.subscribeJob(props.jobId, {
     onInitialState(data) {
       console.log('[EditorView] SSE 初始状态:', data)
-      if (data.percent !== undefined) {
-        taskProgress.value = data.percent
-      }
-      if (data.status) {
-        taskStatus.value = data.status
-      }
-      if (data.phase) {
-        taskPhase.value = data.phase
-      }
+      progressStore.applySnapshot(props.jobId, data, 'sse_init')
     },
 
     onProgress(data) {
-      console.log('[EditorView] SSE 进度更新:', data.percent, data.phase)
-      taskProgress.value = data.percent || 0
-      taskStatus.value = data.status || taskStatus.value
-      taskPhase.value = data.phase || taskPhase.value
-
-      // 同步进度到 store，确保 TaskMonitor 实时更新
-      taskStore.updateTaskProgress(props.jobId, data.percent || 0, data.status, {
-        phase: data.phase,
-        phase_percent: data.phase_percent,
-        message: data.message,
-        processed: data.processed,
-        total: data.total,
-        language: data.language
-      })
+      console.log('[EditorView] SSE 进度更新:', data.percent, data.phase, data.detail)
+      console.log('[EditorView] SSE status:', data.status, '| taskStatus:', taskStatus.value)
+      progressStore.applySseProgress(props.jobId, data)
+      if (data.detail) {
+        projectStore.updateDualStreamProgressFromSSE({
+          fastStream: Math.round(data.detail.fast || 0),
+          slowStream: Math.round(data.detail.slow || 0),
+          totalChunks: data.total || projectStore.dualStreamProgress.totalChunks
+        })
+      }
     },
 
     async onComplete(data) {
       console.log('[EditorView] 任务完成:', data)
-      isTranscribing.value = false
-      taskStatus.value = 'finished'
+      progressStore.markStatus(props.jobId, 'finished', { percent: 100, phase: 'complete' })
       taskStore.updateTaskStatus(props.jobId, 'finished')
       await loadCompletedSRT()
       stopProgressPolling()
@@ -529,8 +634,7 @@ function subscribeSSE() {
 
     onFailed(data) {
       console.log('[EditorView] 任务失败:', data)
-      taskStatus.value = 'failed'
-      isTranscribing.value = false
+      progressStore.markStatus(props.jobId, 'failed', { message: data.message })
       taskStore.updateTaskStatus(props.jobId, 'failed')
       taskStore.updateTaskSSEStatus(props.jobId, true, data.message || '转录失败')
       stopProgressPolling()
@@ -540,16 +644,14 @@ function subscribeSSE() {
 
     onPaused(data) {
       console.log('[EditorView] 任务已暂停:', data)
-      taskStatus.value = 'paused'
-      isTranscribing.value = false
+      progressStore.markStatus(props.jobId, 'paused')
       taskStore.updateTaskStatus(props.jobId, 'paused')
       // 保持SSE连接和进度显示
     },
 
     onCanceled(data) {
       console.log('[EditorView] 任务已取消:', data)
-      taskStatus.value = 'canceled'
-      isTranscribing.value = false
+      progressStore.markStatus(props.jobId, 'canceled')
       taskStore.updateTaskStatus(props.jobId, 'canceled')
       stopProgressPolling()
       cleanupSSE()
@@ -558,9 +660,9 @@ function subscribeSSE() {
     onResumed(data) {
       // 新增：处理任务恢复信号
       console.log('[EditorView] 任务已恢复:', data)
-      taskStatus.value = data.status || 'queued'
-      isTranscribing.value = data.status === 'processing'
+      progressStore.markStatus(props.jobId, data.status || 'queued')
       taskStore.updateTaskStatus(props.jobId, data.status || 'queued')
+      startProgressPolling()
     },
 
     onConnected() {
@@ -587,6 +689,18 @@ function subscribeSSE() {
     onReplaceChunk(data) {
       console.log('[EditorView] 收到替换 Chunk:', data)
       handleReplaceChunk(data)
+    },
+
+    // V3.7.3: 恢复字幕事件（断点续传后恢复）
+    onRestored(data) {
+      console.log('[EditorView] 收到恢复字幕:', data)
+      handleRestoredChunk(data)
+    },
+
+    // V3.5: 极速模式定稿事件
+    onFinalized(data) {
+      console.log('[EditorView] 收到定稿字幕:', data)
+      handleFinalizedSubtitle(data)
     },
 
     // 新增：BGM 检测事件
@@ -673,6 +787,9 @@ function handleStreamingSubtitle(data) {
     return
   }
 
+  // 暂停历史记录，SSE 推送的内容不应被撤销
+  projectStore.pauseHistory()
+
   // 更新或添加字幕到 store
   const existingIndex = projectStore.subtitles.findIndex(
     s => s.sentenceIndex === sentenceIndex
@@ -692,9 +809,14 @@ function handleStreamingSubtitle(data) {
     // 更新已有字幕
     projectStore.updateSubtitle(existingIndex, subtitleData)
   } else {
-    // 添加新字幕
-    projectStore.addSubtitle(subtitleData)
+    // 添加新字幕 - 按时间顺序找到插入位置
+    const insertIndex = projectStore.subtitles.findIndex(s => s.start > (start ?? 0))
+    const finalIndex = insertIndex === -1 ? projectStore.subtitles.length : insertIndex
+    projectStore.addSubtitle(finalIndex, subtitleData)
   }
+
+  // 恢复历史记录
+  projectStore.resumeHistory()
 
   console.log(`[EditorView] 字幕 #${sentenceIndex} 已更新，来源: ${source}`)
 }
@@ -756,22 +878,100 @@ function handleReplaceChunk(data) {
   console.log(`[EditorView] 替换 Chunk ${chunkIndex}，共 ${formattedSentences.length} 条定稿字幕`)
 }
 
+/**
+ * V3.7.3: 处理恢复的字幕（断点续传后恢复）
+ * 后端数据格式: { chunk_index, sentences: [...], is_restore: true }
+ */
+function handleRestoredChunk(data) {
+  if (!data) return
+
+  const chunkIndex = data.chunk_index
+  const sentences = Array.isArray(data.sentences) ? data.sentences : []
+
+  if (sentences.length === 0) {
+    console.log(`[EditorView] Chunk ${chunkIndex} 恢复的字幕为空，跳过`)
+    return
+  }
+
+  // 转换为 projectStore 需要的格式
+  const formattedSentences = sentences.map((sentence, idx) => ({
+    index: sentence.index ?? idx,
+    text: sentence.text || '',
+    start: sentence.start ?? 0,
+    end: sentence.end ?? 0,
+    confidence: sentence.confidence ?? 1.0,
+    words: sentence.words || [],
+    warning_type: sentence.warning_type || 'none',
+    source: sentence.source || 'restored',
+    is_draft: sentence.is_draft ?? false,
+    is_finalized: sentence.is_finalized ?? true
+  }))
+
+  // 调用 projectStore 的恢复方法
+  projectStore.restoreChunk(chunkIndex, formattedSentences)
+
+  console.log(`[EditorView] 恢复 Chunk ${chunkIndex}，共 ${formattedSentences.length} 条字幕`)
+}
+
+/**
+ * V3.5: 处理极速模式定稿字幕
+ * 后端数据格式: { index, chunk_index, sentence: {...}, mode: 'sensevoice_only' }
+ */
+function handleFinalizedSubtitle(data) {
+  if (!data) return
+
+  // 极速模式的定稿字幕处理方式与草稿类似，但标记为定稿
+  const sentence = data.sentence || {}
+  const chunkIndex = data.chunk_index
+
+  // 格式化为单个句子的数组，复用 replaceChunk 逻辑
+  const formattedSentences = [{
+    index: data.index ?? 0,
+    text: sentence.text || '',
+    start: sentence.start ?? 0,
+    end: sentence.end ?? 0,
+    confidence: sentence.confidence ?? 1.0,
+    words: sentence.words || [],
+    warning_type: sentence.warning_type || 'none',
+    source: sentence.source || 'sensevoice'
+  }]
+
+  // 极速模式下使用 appendOrUpdateDraft，但标记为定稿
+  const sentenceData = {
+    index: data.index ?? 0,
+    text: sentence.text || '',
+    start: sentence.start ?? 0,
+    end: sentence.end ?? 0,
+    confidence: sentence.confidence ?? 1.0,
+    words: sentence.words || [],
+    warning_type: sentence.warning_type || 'none'
+  }
+
+  // 调用草稿方法，但数据已标记为定稿
+  projectStore.appendOrUpdateDraft(chunkIndex, sentenceData)
+
+  console.log(`[EditorView] 极速模式定稿 Chunk ${chunkIndex}，句子索引 ${data.index}`)
+}
+
 // 刷新任务进度（用于SSE重连后的状态同步）
 async function refreshTaskProgress() {
   try {
     const jobStatus = await transcriptionApi.getJobStatus(props.jobId, true)
     console.log('[EditorView] 刷新任务进度:', jobStatus)
 
-    taskStatus.value = jobStatus.status
-    taskPhase.value = jobStatus.phase || 'pending'
-    taskProgress.value = jobStatus.progress || 0
-
-    // 同步到store
-    taskStore.updateTaskProgress(props.jobId, jobStatus.progress || 0, jobStatus.status, {
-      phase: jobStatus.phase,
-      phase_percent: jobStatus.phase_percent,
-      message: jobStatus.message
-    })
+    progressStore.applySnapshot(
+      props.jobId,
+      {
+        percent: jobStatus.progress,
+        status: jobStatus.status,
+        phase: jobStatus.phase,
+        phase_percent: jobStatus.phase_percent,
+        message: jobStatus.message,
+        processed: jobStatus.processed,
+        total: jobStatus.total
+      },
+      'http_refresh'
+    )
   } catch (error) {
     console.warn('[EditorView] 刷新任务进度失败:', error)
   }
@@ -779,19 +979,36 @@ async function refreshTaskProgress() {
 
 function startProgressPolling() {
   stopProgressPolling()
-  // 仅作为SSE失败时的备用方案，间隔延长到60秒
+  // 仅在 SSE 长时间无心跳时触发 HTTP 兜底
   progressPollTimer = setInterval(async () => {
     if (!isTranscribing.value) {
       stopProgressPolling()
       return
     }
-    // 轮询仅作为SSE断开时的兜底保障
+    const rawState = progressStore.getRawState(props.jobId)
+    if (Date.now() - (rawState.lastSseAt || 0) < 10000) {
+      return
+    }
+
     try {
-      await loadTranscribingSegments()
+      const snapshot = await transcriptionApi.getJobStatus(props.jobId, true)
+      progressStore.applySnapshot(
+        props.jobId,
+        {
+          percent: snapshot.progress,
+          status: snapshot.status,
+          phase: snapshot.phase,
+          phase_percent: snapshot.phase_percent,
+          message: snapshot.message,
+          processed: snapshot.processed,
+          total: snapshot.total
+        },
+        'http_poll'
+      )
     } catch (e) {
       console.warn('[EditorView] 轮询刷新失败:', e)
     }
-  }, 60000)  // 改为60秒
+  }, 15000)
 }
 
 function stopProgressPolling() {
@@ -825,8 +1042,7 @@ async function saveProject() {
 async function pauseTranscription() {
   try {
     await transcriptionApi.pauseJob(props.jobId)
-    taskStatus.value = 'paused'
-    isTranscribing.value = false
+    progressStore.markStatus(props.jobId, 'paused')
     // 更新本地store状态
     taskStore.updateTaskStatus(props.jobId, 'paused')
     // 暂停后保留SSE连接，以便恢复时能继续接收更新
@@ -842,13 +1058,15 @@ async function resumeTranscription() {
     const result = await transcriptionApi.resumeJob(props.jobId)
 
     // 根据后端返回值设置状态（应该是 queued，而不是 processing）
-    taskStatus.value = result.status || 'queued'
-    isTranscribing.value = result.status === 'processing'
+    progressStore.markStatus(props.jobId, result.status || 'queued')
 
     // 更新本地store状态
     taskStore.updateTaskStatus(props.jobId, result.status || 'queued')
 
     console.log('[EditorView] 任务已恢复，状态:', result.status, '队列位置:', result.queue_position)
+
+    await refreshTaskProgress()
+    startProgressPolling()
   } catch (error) {
     console.error('恢复任务失败:', error)
   }
@@ -858,8 +1076,7 @@ async function cancelTranscription() {
   if (!confirm('确定要取消当前转录任务吗?')) return
   try {
     await transcriptionApi.cancelJob(props.jobId, false)
-    taskStatus.value = 'canceled'
-    isTranscribing.value = false
+    progressStore.markStatus(props.jobId, 'canceled')
     // 更新本地store状态
     taskStore.updateTaskStatus(props.jobId, 'canceled')
     // 取消后关闭SSE连接
@@ -900,6 +1117,9 @@ function handleExport(format) {
       content = projectStore.generateSRT()
       filename += '.srt'
       break
+    case 'ass':
+      handleASSExport()
+      return
     case 'vtt':
       content = generateVTT()
       filename += '.vtt'
@@ -915,6 +1135,31 @@ function handleExport(format) {
   }
 
   downloadFile(content, filename)
+}
+
+async function handleASSExport() {
+  try {
+    console.log('[EditorView] 开始生成 ASS 字幕文件')
+
+    // 调用后端 API 生成 ASS 文件
+    await transcriptionApi.generateASS(props.jobId, {
+      style_preset: 'default',
+      title: projectName.value.replace(/\.[^/.]+$/, ''),
+      video_width: 1920,
+      video_height: 1080
+    })
+
+    // 获取生成的 ASS 文件内容
+    const assData = await transcriptionApi.getASSContent(props.jobId)
+
+    // 下载文件
+    downloadFile(assData.content, assData.filename)
+
+    console.log('[EditorView] ASS 字幕文件导出成功:', assData.filename)
+  } catch (error) {
+    console.error('[EditorView] 导出 ASS 文件失败:', error)
+    alert('导出 ASS 文件失败: ' + (error.message || '未知错误'))
+  }
 }
 
 function generateVTT() {
@@ -1036,31 +1281,31 @@ function togglePlay() {
 function stepBackward() {
   const frameTime = 1 / 30
   const newTime = Math.max(0, projectStore.player.currentTime - frameTime)
-  projectStore.seekTo(newTime)
+  playbackManager.seekTo(newTime)
 }
 
 function stepForward() {
   const frameTime = 1 / 30
   const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + frameTime)
-  projectStore.seekTo(newTime)
+  playbackManager.seekTo(newTime)
 }
 
 function seekBackward() {
   const newTime = Math.max(0, projectStore.player.currentTime - 5)
-  projectStore.seekTo(newTime)
+  playbackManager.seekTo(newTime)
 }
 
 function seekForward() {
   const newTime = Math.min(projectStore.meta.duration, projectStore.player.currentTime + 5)
-  projectStore.seekTo(newTime)
+  playbackManager.seekTo(newTime)
 }
 
 function seekToStart() {
-  projectStore.seekTo(0)
+  playbackManager.seekTo(0)
 }
 
 function seekToEnd() {
-  projectStore.seekTo(projectStore.meta.duration)
+  playbackManager.seekTo(projectStore.meta.duration)
 }
 
 function zoomInWave() {

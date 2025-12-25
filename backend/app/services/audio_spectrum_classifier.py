@@ -3,10 +3,15 @@
 
 对每个VAD Chunk进行频谱分析，决定是否需要人声分离。
 在VAD切分之后、转录之前执行。
+
+V2 更新 (2025-12-21):
+- 新增 YAMNet 探针模式语义级分类器，替代基于规则的频谱分析
+- 优先使用 YAMNet，回退到规则方法
+- 解决人声被误判为音乐的问题 (谐波比阈值过低)
 """
 import numpy as np
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from app.models.circuit_breaker_models import (
     SpectrumFeatures, SpectrumDiagnosis, DiagnosisResult
@@ -16,12 +21,49 @@ from app.core.spectrum_thresholds import SpectrumThresholds, DEFAULT_SPECTRUM_TH
 logger = logging.getLogger(__name__)
 
 
-class AudioSpectrumClassifier:
-    """音频频谱分诊器"""
+# ========== YAMNet 集成 ==========
 
-    def __init__(self, thresholds: SpectrumThresholds = None):
+def _get_yamnet_classifier():
+    """懒加载 YAMNet 分类器（避免循环导入）"""
+    try:
+        from app.services.yamnet_classifier import get_yamnet_classifier
+        return get_yamnet_classifier()
+    except Exception as e:
+        logger.warning(f"YAMNet 分类器加载失败: {e}")
+        return None
+
+
+class AudioSpectrumClassifier:
+    """
+    音频频谱分诊器
+
+    支持两种模式：
+    1. YAMNet 探针模式（默认）：使用预训练模型进行语义级分类，准确区分人声和音乐
+    2. 规则模式（回退）：基于频谱特征的规则判断
+    """
+
+    def __init__(
+        self,
+        thresholds: SpectrumThresholds = None,
+        use_yamnet: bool = True
+    ):
+        """
+        初始化分诊器
+
+        Args:
+            thresholds: 频谱阈值配置
+            use_yamnet: 是否使用 YAMNet 语义分类器（默认 True）
+        """
         self.thresholds = thresholds or DEFAULT_SPECTRUM_THRESHOLDS
         self._librosa = None  # 懒加载
+        self._use_yamnet = use_yamnet
+        self._yamnet = None  # 懒加载
+
+    def _get_yamnet(self):
+        """获取 YAMNet 分类器实例"""
+        if self._yamnet is None and self._use_yamnet:
+            self._yamnet = _get_yamnet_classifier()
+        return self._yamnet
 
     def _ensure_librosa(self):
         """确保 librosa 已加载"""
@@ -116,6 +158,8 @@ class AudioSpectrumClassifier:
         """
         对单个Chunk进行频谱分诊
 
+        优先使用 YAMNet 语义分类器，回退到规则方法。
+
         Args:
             audio: 音频数组
             chunk_index: Chunk索引
@@ -124,14 +168,8 @@ class AudioSpectrumClassifier:
         Returns:
             SpectrumDiagnosis: 分诊结果
         """
-        th = self.thresholds
         duration_sec = len(audio) / sr
-        
-        # 短 Chunk 保守策略：降低敏感度
-        # 对于 < 2秒的片段，频谱特征不稳定，提高判定阈值避免误判
-        short_chunk_threshold = 2.0  # 秒
-        is_short_chunk = duration_sec < short_chunk_threshold
-        
+
         # 极短片段（< 0.5秒）直接返回 CLEAN，样本量不足无法可靠分析
         if duration_sec < 0.5:
             logger.debug(f"Chunk {chunk_index}: 极短片段({duration_sec:.2f}s)，跳过分诊")
@@ -146,20 +184,107 @@ class AudioSpectrumClassifier:
                 features=SpectrumFeatures(),
                 reason=f"极短片段({duration_sec:.2f}s)，跳过分诊"
             )
-        
+
+        # 尝试使用 YAMNet 语义分类器
+        yamnet = self._get_yamnet()
+        if yamnet is not None and yamnet.is_available():
+            return self._diagnose_with_yamnet(audio, chunk_index, sr, yamnet)
+
+        # 回退到规则方法
+        return self._diagnose_with_rules(audio, chunk_index, sr)
+
+    def _diagnose_with_yamnet(
+        self,
+        audio: np.ndarray,
+        chunk_index: int,
+        sr: int,
+        yamnet
+    ) -> SpectrumDiagnosis:
+        """
+        使用 YAMNet 进行语义级分诊
+
+        Args:
+            audio: 音频数组
+            chunk_index: Chunk索引
+            sr: 采样率
+            yamnet: YAMNet 分类器实例
+
+        Returns:
+            SpectrumDiagnosis: 分诊结果
+        """
+        th = self.thresholds
+
+        # YAMNet 分类
+        result = yamnet.classify_chunk(audio, chunk_id=chunk_index)
+
+        # 转换为 SpectrumDiagnosis 格式
+        if result.is_music:
+            diagnosis = DiagnosisResult.MUSIC
+            need_separation = True
+            # 统一使用 htdemucs（shift=1 模式）
+            recommended_model = "htdemucs"
+            reason = f"[YAMNet] 检测到音乐 (score={result.music_score:.2f})"
+        else:
+            diagnosis = DiagnosisResult.CLEAN
+            need_separation = False
+            recommended_model = None
+            reason = f"[YAMNet] {', '.join(result.tags)} (speech={result.speech_score:.2f})"
+
+        # 日志记录
+        logger.debug(
+            f"Chunk {chunk_index} [YAMNet]: is_music={result.is_music}, "
+            f"music={result.music_score:.3f}, speech={result.speech_score:.3f}, "
+            f"tags={result.tags}"
+        )
+
+        return SpectrumDiagnosis(
+            chunk_index=chunk_index,
+            diagnosis=diagnosis,
+            need_separation=need_separation,
+            music_score=result.music_score,
+            noise_score=0.0,  # YAMNet 不单独计算噪音分数
+            clean_score=result.speech_score,  # 用 speech_score 作为 clean_score
+            recommended_model=recommended_model,
+            features=SpectrumFeatures(),  # YAMNet 模式不提取传统特征
+            reason=reason
+        )
+
+    def _diagnose_with_rules(
+        self,
+        audio: np.ndarray,
+        chunk_index: int,
+        sr: int = 16000
+    ) -> SpectrumDiagnosis:
+        """
+        使用规则方法进行频谱分诊（回退方法）
+
+        Args:
+            audio: 音频数组
+            chunk_index: Chunk索引
+            sr: 采样率
+
+        Returns:
+            SpectrumDiagnosis: 分诊结果
+        """
+        th = self.thresholds
+        duration_sec = len(audio) / sr
+
+        # 短 Chunk 保守策略：降低敏感度
+        short_chunk_threshold = 2.0
+        is_short_chunk = duration_sec < short_chunk_threshold
+
         features = self.extract_features(audio, sr)
 
         # 计算各项得分
         music_score = self._calculate_music_score(features)
         noise_score = self._calculate_noise_score(features)
         clean_score = 1.0 - max(music_score, noise_score)
-        
+
         # 短 Chunk 敏感度调整：提高阈值 30%
-        # 这样可以减少因样本不足导致的误判
         if is_short_chunk:
             effective_music_threshold = th.music_score_threshold * 1.3
             effective_noise_threshold = th.noise_score_threshold * 1.3
-            effective_mixed_threshold = 0.2 * 1.3  # 原值 0.2
+            effective_mixed_threshold = 0.2 * 1.3
             logger.debug(
                 f"Chunk {chunk_index}: 短片段({duration_sec:.2f}s)，"
                 f"提高阈值 music>{effective_music_threshold:.2f}, noise>{effective_noise_threshold:.2f}"
@@ -169,27 +294,21 @@ class AudioSpectrumClassifier:
             effective_noise_threshold = th.noise_score_threshold
             effective_mixed_threshold = 0.2
 
-        # 综合判定（使用调整后的阈值）
+        # 综合判定
         diagnosis = DiagnosisResult.CLEAN
         need_separation = False
         recommended_model = None
         reason = "纯净人声"
-        
+
         if is_short_chunk:
             reason = f"纯净人声 (短片段{duration_sec:.1f}s)"
 
         if music_score >= effective_music_threshold:
             diagnosis = DiagnosisResult.MUSIC
             need_separation = True
+            # 统一使用 htdemucs（shift=1 模式）
+            recommended_model = "htdemucs"
             reason = f"检测到音乐 (score={music_score:.2f})"
-
-            # 选择分离模型
-            if music_score >= th.heavy_bgm_threshold:
-                recommended_model = "mdx_extra"
-                reason += " [重度BGM]"
-            else:
-                recommended_model = "htdemucs"
-                reason += " [轻度BGM]"
 
         elif noise_score >= effective_noise_threshold:
             diagnosis = DiagnosisResult.NOISE

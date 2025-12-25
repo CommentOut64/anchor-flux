@@ -123,14 +123,14 @@ def setup_logging(
     # 创建格式化器
     console_formatter = MillisecondFormatter()
 
-    # 控制台输出（始终使用可读格式）
+    # 控制台输出：固定 INFO 级别（给用户看）
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(log_level)
+    console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(console_formatter)
     console_handler.addFilter(ThirdPartyFilter())
     root_logger.addHandler(console_handler)
 
-    # 文件输出（支持轮转）
+    # 文件输出：固定 DEBUG 级别（给开发者看）
     if enable_rotation:
         # 使用轮转文件处理器
         file_handler = RotatingFileHandler(
@@ -143,7 +143,7 @@ def setup_logging(
         # 使用普通文件处理器
         file_handler = logging.FileHandler(config.LOG_FILE, encoding='utf-8')
 
-    file_handler.setLevel(log_level)
+    file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(console_formatter)
     file_handler.addFilter(ThirdPartyFilter())
     root_logger.addHandler(file_handler)
@@ -178,7 +178,7 @@ def setup_logging(
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
     logger = logging.getLogger(__name__)
-    logger.info(f"日志系统已初始化 - 级别: {config.LOG_LEVEL}")
+    logger.info(f"日志系统已初始化 - 控制台: INFO, 文件: DEBUG")
     logger.info(f"日志文件: {config.LOG_FILE}")
     if enable_rotation:
         logger.info(f"日志轮转已启用 - 最大: {max_bytes // (1024*1024)}MB, 备份: {backup_count}个")
