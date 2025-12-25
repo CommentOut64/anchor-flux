@@ -193,7 +193,7 @@ class YAMNetClassifier:
         self._init_model()
 
     def _init_model(self):
-        """初始化 ONNX 模型（使用 cpu_optimizer 优化）"""
+        """初始化 ONNX 模型（GPU 优先，CPU 回退）"""
         try:
             import onnxruntime as ort
 
@@ -201,24 +201,38 @@ class YAMNetClassifier:
                 logger.warning(f"YAMNet model not found: {self.model_path}")
                 return
 
-            # 使用 cpu_optimizer 获取优化的 SessionOptions
-            sess_options = self._create_optimized_session_options()
+            # 检测可用的 providers
+            available_providers = ort.get_available_providers()
 
-            # 使用 CPU 推理
-            self.session = ort.InferenceSession(
-                str(self.model_path),
-                providers=['CPUExecutionProvider'],
-                sess_options=sess_options
-            )
+            # GPU 优先策略：CUDA > CPU
+            if 'CUDAExecutionProvider' in available_providers:
+                # GPU 模式：使用 CUDA
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                self.session = ort.InferenceSession(
+                    str(self.model_path),
+                    providers=providers
+                )
+                self._device = 'cuda'
+                logger.info(f"YAMNet 使用 GPU 推理 (CUDA)")
+            else:
+                # CPU 模式：使用优化的 SessionOptions
+                sess_options = self._create_optimized_session_options()
+                self.session = ort.InferenceSession(
+                    str(self.model_path),
+                    providers=['CPUExecutionProvider'],
+                    sess_options=sess_options
+                )
+                self._device = 'cpu'
 
-            # 设置 P-Core 亲和性（在 Intel 混合架构上）
-            self._setup_pcore_affinity()
+                # 设置 P-Core 亲和性（仅 CPU 模式需要）
+                self._setup_pcore_affinity()
 
-            logger.info(f"Loaded YAMNet model from {self.model_path}")
+            logger.info(f"Loaded YAMNet model from {self.model_path} (device={self._device})")
 
         except Exception as e:
             logger.error(f"Failed to load YAMNet: {e}")
             self.session = None
+            self._device = None
 
     def _create_optimized_session_options(self):
         """创建优化的 ONNX SessionOptions"""

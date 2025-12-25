@@ -242,7 +242,8 @@ const loadError = ref(null)
 
 // 统一进度状态
 const progressStore = useProgressStore()
-const jobProgress = computed(() => progressStore.getJobProgress(jobIdRef.value))
+// 修复：直接使用 getRawState 获取响应式状态对象，避免 computed 嵌套导致响应式丢失
+const jobProgress = computed(() => progressStore.getRawState(jobIdRef.value))
 const taskStatus = computed(() => jobProgress.value.status || 'idle')
 const taskPhase = computed(() => jobProgress.value.phase || 'pending')
 const taskProgress = computed(() => jobProgress.value.percent || 0)
@@ -610,6 +611,7 @@ function subscribeSSE() {
 
     onProgress(data) {
       console.log('[EditorView] SSE 进度更新:', data.percent, data.phase, data.detail)
+      console.log('[EditorView] SSE status:', data.status, '| taskStatus:', taskStatus.value)
       progressStore.applySseProgress(props.jobId, data)
       if (data.detail) {
         projectStore.updateDualStreamProgressFromSSE({

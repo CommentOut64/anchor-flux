@@ -103,7 +103,22 @@ echo.
 echo [OK] Dependencies installed
 echo.
 
-echo [Step 3/3] Fixing PyTorch DLL dependencies...
+echo [Step 3/4] Fixing onnxruntime version conflict...
+REM funasr-onnx 会自动安装 onnxruntime (CPU版), 但我们只需要 onnxruntime-gpu
+REM onnxruntime-gpu 完全兼容 CPU 推理, 可以满足所有依赖
+REM 两个包共用 onnxruntime 目录, 卸载时可能留下残留, 需要清理后重装
+"%PYTHON_EXEC%" -m pip uninstall onnxruntime -y >nul 2>&1
+if exist "%SITE_PACKAGES%\onnxruntime" (
+    echo [INFO] Cleaning residual onnxruntime directory...
+    rmdir /s /q "%SITE_PACKAGES%\onnxruntime" >nul 2>&1
+)
+REM 重新安装 GPU 版本以确保完整性
+echo [INFO] Reinstalling onnxruntime-gpu to ensure integrity...
+"%PYTHON_EXEC%" -m pip install --force-reinstall --no-deps onnxruntime-gpu==1.18.0 -i %PYPI_MIRROR% -q
+echo [OK] onnxruntime-gpu installed (CPU version removed)
+echo.
+
+echo [Step 4/4] Fixing PyTorch DLL dependencies...
 if exist "%SITE_PACKAGES%\torch\lib\libiomp5md.dll" (
     if not exist "%SITE_PACKAGES%\torch\lib\libomp140.x86_64.dll" (
         echo [INFO] Copying libiomp5md.dll to libomp140.x86_64.dll...
