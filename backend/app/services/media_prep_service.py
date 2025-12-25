@@ -450,8 +450,8 @@ class MediaPrepService:
             include_audio = preview_config.get('audio', False)
             audio_bitrate = preview_config.get('audio_bitrate', '64k')
 
-            # 获取 CPU 线程数配置（避免全核心占用导致降频）
-            cpu_threads = config.PROXY_CONFIG.get('ffmpeg_cpu_threads', 4)
+            # 获取 CPU 线程数配置（延迟计算，避免循环导入）
+            cpu_threads = config.get_ffmpeg_cpu_threads()
 
             # 构建 FFmpeg 命令 - 360p 快速预览（参数从配置读取）
             ffmpeg_cmd = config.get_ffmpeg_command()
@@ -630,8 +630,8 @@ class MediaPrepService:
                 encoder_type = "GPU (NVENC)"
             else:
                 # CPU 编码配置（回退方案）
-                # 获取 CPU 线程数配置（避免全核心占用导致降频）
-                cpu_threads = config.PROXY_CONFIG.get('ffmpeg_cpu_threads', 4)
+                # 获取 CPU 线程数配置（延迟计算，避免循环导入）
+                cpu_threads = config.get_ffmpeg_cpu_threads()
                 preset_cpu = proxy_config.get('preset', 'fast')
                 cmd = [
                     ffmpeg_cmd,

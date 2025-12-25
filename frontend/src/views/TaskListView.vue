@@ -796,7 +796,10 @@ function getStatusText(status) {
     created: "已创建",
     queued: "排队中",
     processing: "转录中",
+    pausing: "正在暂停...",
     paused: "已暂停",
+    canceling: "正在取消...",  // V3.8.2
+    force_canceled: "已强制取消",  // V3.8.2
     finished: "已完成",
     failed: "失败",
     canceled: "已取消",

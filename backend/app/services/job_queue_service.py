@@ -117,6 +117,13 @@ class JobQueueService:
         # [V3.7] 取消令牌注册表
         self.cancellation_tokens: Dict[str, CancellationToken] = {}
 
+        # [V3.8.2] 取消超时保障机制
+        # 用于确保取消操作最终生效，防止任务卡死导致队列阻塞
+        self._pending_cancel_requests: Dict[str, float] = {}  # {job_id: cancel_request_time}
+        self._pending_delete_after_cancel: set = set()  # 取消后需要删除数据的任务
+        self._force_cancel_timeout: float = 60.0  # 超时时间（秒）
+        self._current_executing_job_id: Optional[str] = None  # Worker 当前实际执行的任务ID（不受 cancel 影响）
+
         # 依赖服务
         self.transcription_service = transcription_service
         self.sse_manager = get_sse_manager()
@@ -144,6 +151,15 @@ class JobQueueService:
         )
         self.worker_thread.start()
         logger.info("任务队列Worker线程已启动")
+
+        # [V3.8.2] 启动取消超时监控线程
+        self._cancel_timeout_thread = threading.Thread(
+            target=self._cancel_timeout_monitor,
+            daemon=True,
+            name="CancelTimeoutMonitor"
+        )
+        self._cancel_timeout_thread.start()
+        logger.info("[V3.8.2] 取消超时监控线程已启动")
 
     def add_job(self, job: JobState):
         """
@@ -318,6 +334,10 @@ class JobQueueService:
         V3.7 更新:
         - 集成 CancellationToken，触发协作式取消
 
+        V3.8.2 更新:
+        - 正在运行的任务进入"canceling"状态，不再立即清除 running_job_id
+        - 增加超时保障机制，确保任务最终被清除
+
         Args:
             job_id: 任务ID
             delete_data: 是否删除任务数据
@@ -343,10 +363,11 @@ class JobQueueService:
                     logger.warning(f"删除任务 {job_id} 失败: {e}")
             return False
 
+        is_running = False  # [V3.8.2] 标记是否为正在运行的任务
+
         with self.lock:
             # 设置取消标志
             job.canceled = True
-            job.message = "取消中..."
 
             # [V3.7] 触发取消令牌的取消
             token = self.cancellation_tokens.get(job_id)
@@ -354,20 +375,36 @@ class JobQueueService:
                 token.cancel()
                 logger.info(f"[V3.7] 已触发取消令牌取消: {job_id}")
 
-            # 如果在队列中，移除
+            # 如果在队列中，直接移除并标记为已取消
             if job_id in self.queue:
                 self.queue.remove(job_id)
                 job.status = "canceled"
                 job.message = "已取消（未开始）"
 
-            # 如果是正在运行的任务，清理 running_job_id
-            if self.running_job_id == job_id:
-                logger.info(f"清理正在运行的任务: {job_id}")
-                self.running_job_id = None
-                job.status = "canceled"
-                job.message = "已取消（运行中）"
+            # [V3.8.2] 如果是正在运行的任务，进入"取消中"状态
+            # 不再立即清除 running_job_id，让 Worker 的 finally 块处理
+            elif self.running_job_id == job_id:
+                is_running = True
+                job.status = "canceling"  # 新状态：取消中
+                job.message = "正在取消，等待当前操作完成..."
+                # 记录取消请求时间，用于超时保障
+                self._pending_cancel_requests[job_id] = time.time()
+                if delete_data:
+                    self._pending_delete_after_cancel.add(job_id)
+                logger.info(f"[V3.8.2] 任务进入取消中状态: {job_id}")
 
-        # 如果需要删除数据，调用transcription_service的清理逻辑
+        # [V3.8.2] 正在运行的任务：延迟处理删除，由 Worker 或超时监控完成
+        if is_running:
+            # 不在这里删除数据，等待任务真正结束
+            # 保存队列状态
+            self._save_state()
+            # 推送状态变更
+            self._notify_queue_change()
+            self._notify_job_status(job_id, job.status)
+            self._notify_job_signal(job_id, "job_canceling")  # 新信号
+            return True
+
+        # 非运行中的任务：立即处理
         if delete_data:
             result = self.transcription_service.cancel_job(job_id, delete_data=True)
 
@@ -430,7 +467,7 @@ class JobQueueService:
                             self.queue.popleft()
                             continue
 
-                        if job.status in ["paused", "canceled"]:
+                        if job.status in ["paused", "canceled", "canceling", "force_canceled"]:
                             logger.info(f"⏭️ 跳过已暂停/取消的任务: {job_id}")
                             self.queue.popleft()
                             continue
@@ -438,6 +475,7 @@ class JobQueueService:
                         # 正式从队列移除
                         self.queue.popleft()
                         self.running_job_id = job_id
+                        self._current_executing_job_id = job_id  # [V3.8.2] 记录实际执行的任务ID
                         job.status = "processing"
                         job.message = "开始处理"
 
@@ -534,15 +572,37 @@ class JobQueueService:
 
                 finally:
                     # 4. 清理资源（关键！）
-                    finished_job_id = self.running_job_id
+                    # [V3.8.2] 使用 _current_executing_job_id 而非 running_job_id
+                    # 因为 running_job_id 可能被超时监控清除
+                    finished_job_id = self._current_executing_job_id
                     with self.lock:
                         self.running_job_id = None
+                        self._current_executing_job_id = None
+                        # [V3.8.2] 从待取消列表移除
+                        self._pending_cancel_requests.pop(finished_job_id, None)
 
                     # [V3.7] 清理取消令牌
                     self._remove_cancellation_token(finished_job_id)
 
                     # 资源大清洗
                     self._cleanup_resources()
+
+                    # [V3.8.2] 处理取消后的延迟删除
+                    need_delete_data = finished_job_id in self._pending_delete_after_cancel
+                    if need_delete_data:
+                        self._pending_delete_after_cancel.discard(finished_job_id)
+                        logger.info(f"[V3.8.2] 执行取消后的延迟删除: {finished_job_id}")
+                        try:
+                            self.transcription_service.cancel_job(finished_job_id, delete_data=True)
+                            with self.lock:
+                                if finished_job_id in self.jobs:
+                                    del self.jobs[finished_job_id]
+                            self._notify_job_removed(finished_job_id)
+                            # 跳过后续的状态保存和通知
+                            self._save_state()
+                            continue
+                        except Exception as e:
+                            logger.error(f"[V3.8.2] 延迟删除失败: {finished_job_id}, {e}")
 
                     # 保存任务最终状态到 job_meta.json
                     self.transcription_service.save_job_meta(job)
@@ -582,6 +642,94 @@ class JobQueueService:
                 time.sleep(1)
 
         logger.info("Worker循环已停止")
+
+    def _cancel_timeout_monitor(self):
+        """
+        [V3.8.2] 取消超时监控线程
+
+        职责：
+        1. 定期检查待取消任务是否超时
+        2. 超时后强制清除 running_job_id，允许队列继续
+        3. 确保任务最终被清除，防止队列阻塞
+
+        设计原则：
+        - 最小侵入：不干扰正常的协作式取消流程
+        - 超时保障：只在任务卡死时介入
+        - 资源安全：等待流水线自然退出后再清理资源
+        """
+        logger.info("[V3.8.2] 取消超时监控线程已启动")
+
+        while not self.stop_event.is_set():
+            try:
+                time.sleep(5)  # 每5秒检查一次
+
+                now = time.time()
+                force_cancel_list = []
+
+                with self.lock:
+                    for job_id, cancel_time in list(self._pending_cancel_requests.items()):
+                        elapsed = now - cancel_time
+                        if elapsed > self._force_cancel_timeout:
+                            force_cancel_list.append((job_id, elapsed))
+
+                # 处理超时的取消请求
+                for job_id, elapsed in force_cancel_list:
+                    self._force_cancel_timeout_job(job_id, elapsed)
+
+            except Exception as e:
+                logger.error(f"[V3.8.2] 超时监控异常: {e}", exc_info=True)
+
+        logger.info("[V3.8.2] 取消超时监控线程已停止")
+
+    def _force_cancel_timeout_job(self, job_id: str, elapsed: float):
+        """
+        [V3.8.2] 强制取消超时的任务
+
+        当任务取消请求超时（流水线未响应）时调用此方法。
+        强制清除 running_job_id，允许队列继续处理其他任务。
+
+        注意：
+        - 流水线可能仍在后台运行，但队列不再等待它
+        - 当流水线最终退出时，Worker 的 finally 块会完成清理
+        - 这是一种"放弃等待"策略，而非"强制终止"
+
+        Args:
+            job_id: 超时的任务ID
+            elapsed: 已等待时间（秒）
+        """
+        logger.warning(
+            f"[V3.8.2] 任务取消超时，强制放行队列: {job_id} "
+            f"(等待了 {elapsed:.1f}s，超时阈值 {self._force_cancel_timeout}s)"
+        )
+
+        with self.lock:
+            # 从待取消列表移除
+            self._pending_cancel_requests.pop(job_id, None)
+
+            job = self.jobs.get(job_id)
+            if job:
+                job.status = "force_canceled"
+                job.message = f"已强制取消（响应超时 {elapsed:.0f}s）"
+                logger.info(f"[V3.8.2] 任务状态更新为 force_canceled: {job_id}")
+
+            # 关键：强制清除 running_job_id，允许下一个任务开始
+            # 注意：_current_executing_job_id 保持不变，让 Worker finally 块知道要清理谁
+            if self.running_job_id == job_id:
+                self.running_job_id = None
+                logger.warning(f"[V3.8.2] 强制清除 running_job_id: {job_id}")
+
+        # 保存状态
+        self._save_state()
+
+        # 推送通知
+        self._notify_queue_change()
+        self._notify_job_status(job_id, "force_canceled")
+        self._notify_job_signal(job_id, "job_force_canceled")
+
+        # 如果需要删除数据，保留在 _pending_delete_after_cancel 中
+        # 等 Worker 的 finally 块执行时处理
+        if job_id in self._pending_delete_after_cancel:
+            logger.info(f"[V3.8.2] 任务 {job_id} 的数据将在流水线退出后删除")
 
     async def _run_dual_alignment_pipeline(self, job: 'JobState', preset_id: str):
         """

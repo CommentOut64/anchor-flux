@@ -49,8 +49,8 @@
       </div>
 
       <!-- Phase 5: 使用 SubtitleItem 组件替代内联渲染 -->
-      <!-- 添加 TransitionGroup 实现切分动画 -->
-      <TransitionGroup name="subtitle-list" tag="div">
+      <!-- 添加 TransitionGroup 实现切分动画，批量更新时禁用 -->
+      <TransitionGroup :name="animationEnabled ? 'subtitle-list' : ''" tag="div">
         <SubtitleItem
           v-for="(subtitle, index) in filteredSubtitles"
           :key="subtitle.id"
@@ -97,6 +97,8 @@ const listRef = ref(null)
 
 // State
 const searchText = ref('')
+const animationEnabled = ref(true)  // 批量更新时禁用动画
+let previousSubtitleCount = 0  // 上一次字幕数量
 
 // Computed
 const subtitles = computed(() => projectStore.subtitles)
@@ -187,6 +189,24 @@ watch(currentSubtitleId, (id) => {
     nextTick(() => scrollToItem(index))
   }
 })
+
+// 批量更新检测：超过阈值时禁用动画，避免重叠闪烁
+const BATCH_UPDATE_THRESHOLD = 5
+watch(subtitles, (newList) => {
+  const newCount = newList.length
+  const diff = Math.abs(newCount - previousSubtitleCount)
+
+  if (diff > BATCH_UPDATE_THRESHOLD) {
+    // 批量更新，禁用动画
+    animationEnabled.value = false
+    // 下一帧恢复动画（确保本次渲染完成）
+    nextTick(() => {
+      animationEnabled.value = true
+    })
+  }
+
+  previousSubtitleCount = newCount
+}, { flush: 'pre' })  // pre: 在 DOM 更新前触发
 </script>
 
 <style lang="scss" scoped>

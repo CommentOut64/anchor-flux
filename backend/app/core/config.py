@@ -144,10 +144,12 @@ class ProjectConfig:
 
         # ========== Proxy 视频配置（重构新增）==========
         # 统一管理所有 Proxy 转码相关参数
+        # 注意: ffmpeg_cpu_threads 使用延迟计算，避免循环导入
+        self._ffmpeg_cpu_threads_cache = None  # 延迟计算缓存
         self.PROXY_CONFIG = {
             # FFmpeg CPU 线程配置（避免使用全部核心导致降频）
-            # 使用 cpu_optimizer 的智能线程计算
-            "ffmpeg_cpu_threads": self._calculate_ffmpeg_threads(),
+            # 注意: 实际值通过 get_ffmpeg_cpu_threads() 方法获取（延迟计算）
+            "ffmpeg_cpu_threads": None,  # 占位符，实际使用 get_ffmpeg_cpu_threads()
             # 360p 预览参数（极速模式）
             "preview_360p": {
                 "scale": 360,
@@ -308,6 +310,17 @@ class ProjectConfig:
             # psutil 不可用或出错，回退到保守默认值
             logger.warning(f"无法检测系统内存，使用默认队列大小 10: {e}")
             return 10
+
+    def get_ffmpeg_cpu_threads(self) -> int:
+        """
+        获取 FFmpeg CPU 线程数（延迟计算，避免循环导入）
+
+        Returns:
+            int: FFmpeg 线程数
+        """
+        if self._ffmpeg_cpu_threads_cache is None:
+            self._ffmpeg_cpu_threads_cache = self._calculate_ffmpeg_threads()
+        return self._ffmpeg_cpu_threads_cache
 
     def get_ffmpeg_command(self) -> str:
         """
