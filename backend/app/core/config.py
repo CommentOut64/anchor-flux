@@ -145,6 +145,9 @@ class ProjectConfig:
         # ========== Proxy 视频配置（重构新增）==========
         # 统一管理所有 Proxy 转码相关参数
         self.PROXY_CONFIG = {
+            # FFmpeg CPU 线程配置（避免使用全部核心导致降频）
+            # 使用 cpu_optimizer 的智能线程计算
+            "ffmpeg_cpu_threads": self._calculate_ffmpeg_threads(),
             # 360p 预览参数（极速模式）
             "preview_360p": {
                 "scale": 360,
@@ -213,6 +216,50 @@ class ProjectConfig:
             self.PIPELINE_QUEUE_MAXSIZE = self._calculate_adaptive_queue_size()
         else:
             self.PIPELINE_QUEUE_MAXSIZE = int(queue_size_config)
+
+    def _calculate_ffmpeg_threads(self) -> int:
+        """
+        计算 FFmpeg 转码使用的 CPU 线程数
+
+        使用 cpu_optimizer 模块的智能计算，避免全核心占用导致 CPU 降频
+
+        策略：
+        - Intel 混合架构：仅使用 P-Core 的 60%
+        - Intel 传统架构/AMD：使用物理核心的 60%
+        - 未知架构：使用物理核心的 50%
+
+        Returns:
+            int: 推荐的 FFmpeg 线程数
+        """
+        try:
+            from app.utils.cpu_optimizer import ONNXThreadOptimizer
+
+            # 使用 cpu_optimizer 计算最优线程数（与 ONNX 使用相同策略）
+            optimal_threads, info = ONNXThreadOptimizer.calculate_optimal_threads(
+                usage_ratio=0.6  # 使用 60% 的核心
+            )
+
+            logger.info(
+                f"FFmpeg CPU 线程配置: {optimal_threads} 线程 "
+                f"({info.get('strategy', 'unknown')})"
+            )
+            return optimal_threads
+
+        except Exception as e:
+            # 回退：使用 psutil 获取物理核心数的 60%
+            try:
+                import psutil
+                physical_cores = psutil.cpu_count(logical=False) or 4
+                threads = max(1, int(physical_cores * 0.6))
+                logger.warning(
+                    f"cpu_optimizer 不可用，回退计算: {threads} 线程 "
+                    f"(物理核心 {physical_cores} × 60%): {e}"
+                )
+                return threads
+            except:
+                # 最终回退
+                logger.warning(f"无法检测 CPU 核心数，使用默认值 4 线程: {e}")
+                return 4
 
     def _calculate_adaptive_queue_size(self) -> int:
         """

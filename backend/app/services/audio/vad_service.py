@@ -28,6 +28,219 @@ class VADMethod(Enum):
     PYANNOTE = "pyannote"  # 可选，需要HF Token，精度更高
 
 
+class OptimizedOnnxWrapper:
+    """
+    优化版 Silero VAD ONNX Wrapper
+
+    相比原版 OnnxWrapper 的改进：
+    1. 使用 cpu_optimizer 智能计算线程数（而非硬编码为 1）
+    2. 支持 Intel 混合架构 P-Core 亲和性绑定
+    3. 启用 ONNX Runtime CPU 优化选项
+    """
+
+    def __init__(self, path: str, logger: Optional[logging.Logger] = None):
+        """
+        初始化优化版 ONNX Wrapper
+
+        Args:
+            path: ONNX 模型文件路径
+            logger: 日志记录器
+        """
+        import onnxruntime as ort
+
+        self.logger = logger or logging.getLogger(__name__)
+        self._np = __import__('numpy')
+
+        # 使用 cpu_optimizer 获取优化的 SessionOptions
+        sess_options = self._create_optimized_session_options()
+
+        # 创建 ONNX 推理会话（强制使用 CPU，确保 P-Core 亲和性生效）
+        self.session = ort.InferenceSession(
+            path,
+            providers=['CPUExecutionProvider'],
+            sess_options=sess_options
+        )
+
+        # 设置 P-Core 亲和性（在 Intel 混合架构上）
+        self._setup_pcore_affinity()
+
+        self.reset_states()
+        if '16k' in path:
+            self.sample_rates = [16000]
+        else:
+            self.sample_rates = [8000, 16000]
+
+    def _create_optimized_session_options(self):
+        """创建优化的 ONNX SessionOptions"""
+        try:
+            from app.utils.cpu_optimizer import ONNXThreadOptimizer
+
+            # 使用 cpu_optimizer 计算最优线程数
+            optimal_threads, info = ONNXThreadOptimizer.calculate_optimal_threads(
+                usage_ratio=0.6  # 使用 60% 核心
+            )
+
+            # 获取配置好的 SessionOptions
+            sess_options = ONNXThreadOptimizer.get_onnx_session_options(
+                optimal_threads=optimal_threads
+            )
+
+            self.logger.info(
+                f"Silero VAD ONNX 优化: {optimal_threads} 线程 "
+                f"({info.get('strategy', 'unknown')})"
+            )
+
+            return sess_options
+
+        except Exception as e:
+            # 回退：使用默认配置
+            import onnxruntime as ort
+            self.logger.warning(f"cpu_optimizer 不可用，使用默认配置: {e}")
+
+            sess_options = ort.SessionOptions()
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sess_options.intra_op_num_threads = 4  # 回退默认值
+            sess_options.inter_op_num_threads = 1
+            return sess_options
+
+    def _setup_pcore_affinity(self):
+        """
+        设置 P-Core 亲和性（仅 Intel 混合架构）
+
+        在 Intel 12代+ 混合架构 CPU 上，将当前线程绑定到 P-Core，
+        避免 ONNX 推理任务被调度到 E-Core 导致性能下降。
+        """
+        try:
+            from app.utils.cpu_optimizer import CPUArchitectureDetector
+            import psutil
+
+            detector = CPUArchitectureDetector()
+            cpu_name = None
+
+            # 尝试获取 CPU 名称
+            try:
+                from app.services.hardware_service import get_hardware_detector
+                hw = get_hardware_detector().detect()
+                cpu_name = hw.cpu_name
+            except:
+                pass
+
+            # 检测是否为 Intel 混合架构
+            if not detector.is_intel_hybrid_architecture(cpu_name):
+                self.logger.debug("非 Intel 混合架构，跳过 P-Core 亲和性设置")
+                return
+
+            # 获取 P-Core 数量
+            physical_cores = detector.get_physical_cores()
+            p_cores = detector.detect_intel_p_cores(cpu_name, physical_cores)
+
+            # P-Core 通常是前 N 个逻辑核心（每个 P-Core 有 2 个超线程）
+            # 例如 i7-12700: P-Core 0-7 对应逻辑核心 0-15
+            p_core_logical_ids = list(range(p_cores * 2))
+
+            # 设置当前进程的 CPU 亲和性
+            process = psutil.Process()
+            process.cpu_affinity(p_core_logical_ids)
+
+            self.logger.info(
+                f"Silero VAD P-Core 亲和性: 绑定到核心 {p_core_logical_ids[:4]}... "
+                f"(共 {len(p_core_logical_ids)} 个逻辑核心)"
+            )
+
+        except Exception as e:
+            # 亲和性设置失败不是致命错误
+            self.logger.debug(f"P-Core 亲和性设置失败（非致命）: {e}")
+
+    def _validate_input(self, x, sr: int):
+        """验证输入"""
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        if x.dim() > 2:
+            raise ValueError(f"Too many dimensions for input audio chunk {x.dim()}")
+
+        if sr != 16000 and (sr % 16000 == 0):
+            step = sr // 16000
+            x = x[:, ::step]
+            sr = 16000
+
+        if sr not in self.sample_rates:
+            raise ValueError(f"Supported sampling rates: {self.sample_rates} (or multiply of 16000)")
+        if sr / x.shape[1] > 31.25:
+            raise ValueError("Input audio chunk is too short")
+
+        return x, sr
+
+    def reset_states(self, batch_size=1):
+        """重置状态"""
+        self._state = torch.zeros((2, batch_size, 128)).float()
+        self._context = torch.zeros(0)
+        self._last_sr = 0
+        self._last_batch_size = 0
+
+    def __call__(self, x, sr: int):
+        """执行 VAD 推理"""
+        x, sr = self._validate_input(x, sr)
+        num_samples = 512 if sr == 16000 else 256
+
+        if x.shape[-1] != num_samples:
+            raise ValueError(
+                f"Provided number of samples is {x.shape[-1]} "
+                f"(Supported values: 256 for 8000 sample rate, 512 for 16000)"
+            )
+
+        batch_size = x.shape[0]
+        context_size = 64 if sr == 16000 else 32
+
+        if not self._last_batch_size:
+            self.reset_states(batch_size)
+        if self._last_sr and self._last_sr != sr:
+            self.reset_states(batch_size)
+        if self._last_batch_size and self._last_batch_size != batch_size:
+            self.reset_states(batch_size)
+
+        if not len(self._context):
+            self._context = torch.zeros(batch_size, context_size)
+
+        x = torch.cat([self._context, x], dim=1)
+        if sr in [8000, 16000]:
+            ort_inputs = {
+                'input': x.numpy(),
+                'state': self._state.numpy(),
+                'sr': self._np.array(sr, dtype='int64')
+            }
+            ort_outs = self.session.run(None, ort_inputs)
+            out, state = ort_outs
+            self._state = torch.from_numpy(state)
+        else:
+            raise ValueError()
+
+        self._context = x[..., -context_size:]
+        self._last_sr = sr
+        self._last_batch_size = batch_size
+
+        out = torch.from_numpy(out)
+        return out
+
+    def audio_forward(self, x, sr: int):
+        """处理完整音频"""
+        outs = []
+        x, sr = self._validate_input(x, sr)
+        self.reset_states()
+        num_samples = 512 if sr == 16000 else 256
+
+        if x.shape[1] % num_samples:
+            pad_num = num_samples - (x.shape[1] % num_samples)
+            x = torch.nn.functional.pad(x, (0, pad_num), 'constant', value=0.0)
+
+        for i in range(0, x.shape[1], num_samples):
+            wavs_batch = x[:, i:i + num_samples]
+            out_chunk = self.__call__(wavs_batch, sr)
+            outs.append(out_chunk)
+
+        stacked = torch.cat(outs, dim=1)
+        return stacked.cpu()
+
+
 @dataclass
 class VADConfig:
     """
@@ -169,11 +382,10 @@ class VADService:
         Returns:
             List[Dict]: 分段元数据列表
         """
-        self.logger.info("加载Silero VAD模型（内置ONNX）...")
+        self.logger.info("加载Silero VAD模型（优化版 ONNX）...")
 
-        # 使用 silero-vad 库（基于 onnxruntime）
+        # 使用 silero-vad 库的 get_speech_timestamps 函数
         from silero_vad import get_speech_timestamps
-        from silero_vad.utils_vad import OnnxWrapper
 
         # 使用项目内置的 ONNX 模型
         builtin_model_path = Path(__file__).parent.parent.parent / "assets" / "silero" / "silero_vad.onnx"
@@ -186,8 +398,8 @@ class VADService:
 
         self.logger.info(f"使用内置模型: {builtin_model_path}")
 
-        # 加载ONNX模型（直接从本地路径）
-        model = OnnxWrapper(str(builtin_model_path), force_onnx_cpu=False)
+        # 使用优化版 OnnxWrapper（多线程 + P-Core 亲和性）
+        model = OptimizedOnnxWrapper(str(builtin_model_path), logger=self.logger)
 
         # 转换为torch tensor（silero-vad 需要）
         audio_tensor = torch.from_numpy(audio_array)
