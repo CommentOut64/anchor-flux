@@ -90,3 +90,4 @@ tests_output/
 
 CLAUDE.md
 backend/models/pretrained/sensevoice/
+tools/python
