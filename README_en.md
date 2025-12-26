@@ -9,7 +9,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?logo=fastapi&logoColor=white)
 
-<img src="https://raw.githubusercontent.com/CommentOut64/anchor-flux/main/assets/pic1.png" />
+<img src="https://raw.githubusercontent.com/CommentOut64/anchor-flux/main/assets/pic1.png" image-rendering: crisp-edges />
 
 AnchorFlux employs an innovative dual-anchor architecture: **SenseVoice anchors time boundaries, Whisper anchors semantic content**, coordinated through an asynchronous dual-stream pipeline to achieve a balance between transcription speed and quality.
 
