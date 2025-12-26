@@ -9,7 +9,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-009688?logo=fastapi&logoColor=white)
 
-<img src="https://raw.githubusercontent.com/CommentOut64/anchor-flux/main/assets/pic1.png" />
+<img src="https://raw.githubusercontent.com/CommentOut64/anchor-flux/main/assets/pic1.png" image-rendering: crisp-edges />
 
 AnchorFlux 采用创新的双锚架构：**SenseVoice 锚定时间边界，Whisper 锚定语义内容**，利用异步双流流水线协调两者，实现了转录速度与质量的平衡。
 
