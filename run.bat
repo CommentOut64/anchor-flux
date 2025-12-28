@@ -1,5 +1,7 @@
 @echo off
 chcp 65001 >nul 2>&1
+set PYTHONIOENCODING=utf-8
+set PYTHONUTF8=1
 
 title Video to SRT GPU
 
@@ -140,18 +142,18 @@ for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":5173" ^| findstr "LI
     )
 )
 
-REM 使用 wmic 查找并终止残留的 Python 进程（运行 uvicorn）
+REM 使用 PowerShell 查找并终止残留的 Python 进程（运行 uvicorn）
 echo [Cleanup] Checking for old uvicorn processes...
-for /f "skip=1 tokens=1" %%p in ('wmic process where "commandline like '%%uvicorn%%app.main%%'" get processid 2^>nul') do (
+for /f "tokens=*" %%p in ('powershell -NoProfile -Command "Get-Process -Name python -ErrorAction SilentlyContinue | Where-Object {$_.CommandLine -like '*uvicorn*app.main*'} | Select-Object -ExpandProperty Id" 2^>nul') do (
     if not "%%p"=="" (
         echo [Cleanup] Found old uvicorn process - PID: %%p
         taskkill /F /PID %%p >nul 2>&1
     )
 )
 
-REM 使用 wmic 查找并终止残留的 Node 进程（运行 vite）
+REM 使用 PowerShell 查找并终止残留的 Node 进程（运行 vite）
 echo [Cleanup] Checking for old vite processes...
-for /f "skip=1 tokens=1" %%p in ('wmic process where "commandline like '%%vite%%'" get processid 2^>nul') do (
+for /f "tokens=*" %%p in ('powershell -NoProfile -Command "Get-Process -Name node -ErrorAction SilentlyContinue | Where-Object {$_.CommandLine -like '*vite*'} | Select-Object -ExpandProperty Id" 2^>nul') do (
     if not "%%p"=="" (
         echo [Cleanup] Found old vite process - PID: %%p
         taskkill /F /PID %%p >nul 2>&1
@@ -202,8 +204,8 @@ REM 如果后端进程退出（用户点击"退出系统"），则自动关闭�
 :wait_loop
 timeout /t 3 /nobreak >nul
 
-REM 检查端口 8000 是否还有进程监听
-netstat -ano 2>nul | findstr ":8000" | findstr "LISTENING" >nul 2>&1
+REM 检查端口 8000 是否还有进程监听（改进版本兼容性）
+netstat -ano 2>nul | find ":8000" | find "LISTENING" >nul 2>&1
 if errorlevel 1 (
     echo.
     echo [INFO] Backend service has stopped. Closing...

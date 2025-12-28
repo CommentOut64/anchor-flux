@@ -136,7 +136,7 @@ async def _get_video_resolution(video_path: Path) -> tuple:
             stderr=asyncio.subprocess.PIPE
         )
         stdout, _ = await process.communicate()
-        data = json.loads(stdout.decode())
+        data = json.loads(stdout.decode('utf-8'))
         streams = data.get('streams', [])
         if streams:
             width = streams[0].get('width', 0)
@@ -164,7 +164,7 @@ def _get_video_codec(video_path: Path) -> Optional[str]:
 
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=10,
+            cmd, capture_output=True, text=True, timeout=10, encoding='utf-8',
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
         if result.returncode == 0:
@@ -200,6 +200,7 @@ async def _get_video_duration(video_path: Path) -> float:
             capture_output=True,
             text=True,
             timeout=30,
+            encoding='utf-8',
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
 
@@ -243,7 +244,7 @@ def _generate_peaks_with_ffmpeg(audio_path: Path, samples: int = 2000) -> Tuple[
 
     try:
         result = subprocess.run(
-            probe_cmd, capture_output=True, text=True,
+            probe_cmd, capture_output=True, text=True, encoding='utf-8',
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
         duration = float(result.stdout.strip())
@@ -742,7 +743,7 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
     # 检查缓存
     if peaks_cache_file.exists():
         try:
-            with open(peaks_cache_file, 'r') as f:
+            with open(peaks_cache_file, 'r', encoding='utf-8') as f:
                 cached_data = json.load(f)
                 # 验证缓存版本
                 if cached_data.get("cache_version") == PEAKS_CACHE_VERSION:
@@ -787,7 +788,7 @@ async def get_audio_peaks(job_id: str, samples: int = 0, method: str = "auto"):
 
         # 缓存结果
         try:
-            with open(peaks_cache_file, 'w') as f:
+            with open(peaks_cache_file, 'w', encoding='utf-8') as f:
                 json.dump(result, f)
         except:
             pass
