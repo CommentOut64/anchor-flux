@@ -25,8 +25,8 @@ from app.core import config
 logger = logging.getLogger(__name__)
 
 # ========== 模型配置常量 ==========
-# 默认模型名称
-DEFAULT_WHISPER_MODEL = "medium"
+# 默认模型名称 (可通过.env文件中的 WHISPER_MODEL 环境变量覆盖)
+DEFAULT_WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "medium")
 
 # 支持的模型列表及其 HuggingFace 仓库 ID
 WHISPER_MODELS = {

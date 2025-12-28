@@ -21,9 +21,45 @@ set "BACKEND_DIR=%PROJECT_ROOT%\backend"
 set "FRONTEND_DIR=%PROJECT_ROOT%\frontend"
 set "REQ_FILE=%PROJECT_ROOT%\requirements.txt"
 set "MARKER_FILE=%PROJECT_ROOT%\.env_installed"
-set "PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple"
+set "ENV_FILE=%PROJECT_ROOT%\.env"
 set "KMP_DUPLICATE_LIB_OK=TRUE"
+
+REM 从 .env 文件读取 PyPI 镜像源配置
+set "PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple"
 set "HF_ENDPOINT=https://hf-mirror.com"
+
+if exist "%ENV_FILE%" (
+    for /f "usebackq tokens=1,* delims==" %%a in ("%ENV_FILE%") do (
+        set "LINE=%%a"
+        setlocal enabledelayedexpansion
+        REM 去除前导空格
+        for /f "tokens=* delims= " %%i in ("!LINE!") do set "LINE=%%i"
+        REM 跳过注释行和空行
+        if not "!LINE:~0,1!"=="#" if not "!LINE!"=="" (
+            endlocal
+            if "%%a"=="PYPI_MIRROR" set "PYPI_MIRROR=%%b"
+            if "%%a"=="USE_HF_MIRROR" (
+                if "%%b"=="true" (
+                    set "HF_ENDPOINT=https://hf-mirror.com"
+                ) else (
+                    set "HF_ENDPOINT="
+                )
+            )
+        ) else (
+            endlocal
+        )
+    )
+    echo [Config] Loaded configuration from .env
+) else (
+    echo [Config] .env file not found, using default settings
+)
+
+REM 如果 PYPI_MIRROR 为空,则使用官方源
+if not defined PYPI_MIRROR (
+    echo [Config] PyPI Mirror: Official PyPI
+) else (
+    echo [Config] PyPI Mirror: %PYPI_MIRROR%
+)
 
 REM ========================================
 REM  Python 路径配置 (双模式: 嵌入式优先, 回退venv)
@@ -72,6 +108,7 @@ set "PYTHON_MODE=venv"
 echo [OK] Virtual environment created
 
 :python_found
+echo.
 echo [Config] Project: %PROJECT_ROOT%
 echo [Config] Python Mode: %PYTHON_MODE%
 echo [Config] Python: %PYTHON_EXEC%
@@ -94,11 +131,18 @@ REM 升级 pip
 echo [1.1] Upgrading pip...
 "%PYTHON_EXEC%" -m pip install --upgrade pip -i %PYPI_MIRROR% -q
 if errorlevel 1 (
-    echo [ERROR] Failed to upgrade pip
-    pause
-    exit /b 1
+    echo [WARNING] Mirror source failed, trying official PyPI...
+    "%PYTHON_EXEC%" -m pip install --upgrade pip -q
+    if errorlevel 1 (
+        echo [ERROR] Failed to upgrade pip
+        pause
+        exit /b 1
+    )
+    set "PYPI_MIRROR="
+    echo [OK] pip upgraded using official source
+) else (
+    echo [OK] pip upgraded
 )
-echo [OK] pip upgraded
 echo.
 
 REM 分步安装: 先安装 PyTorch (官方源, 增加超时和重试)
@@ -119,26 +163,49 @@ echo.
 
 REM 安装其他依赖 (不含 PyTorch)
 echo [1.3] Installing other dependencies...
-echo [INFO] Using mirror: %PYPI_MIRROR%
-echo.
-"%PYTHON_EXEC%" -m pip install -r "%REQ_FILE%" -i %PYPI_MIRROR% --timeout 120
-if errorlevel 1 (
+if defined PYPI_MIRROR (
+    echo [INFO] Using mirror: %PYPI_MIRROR%
     echo.
-    echo [ERROR] Failed to install dependencies
-    echo [INFO] Common issues:
-    echo        1. Network connection problem
-    echo        2. Insufficient disk space
-    echo        3. Version conflict
+    "%PYTHON_EXEC%" -m pip install -r "%REQ_FILE%" -i %PYPI_MIRROR% --timeout 120
+    if errorlevel 1 (
+        echo.
+        echo [WARNING] Mirror source failed, trying official PyPI...
+        "%PYTHON_EXEC%" -m pip install -r "%REQ_FILE%" --timeout 120
+        if errorlevel 1 (
+            echo.
+            echo [ERROR] Failed to install dependencies
+            echo [INFO] Common issues:
+            echo        1. Network connection problem
+            echo        2. Insufficient disk space
+            echo        3. Version conflict
+            echo.
+            pause
+            exit /b 1
+        )
+        echo [OK] Dependencies installed using official source
+    )
+) else (
+    echo [INFO] Using official PyPI source
     echo.
-    pause
-    exit /b 1
+    "%PYTHON_EXEC%" -m pip install -r "%REQ_FILE%" --timeout 120
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Failed to install dependencies
+        echo [INFO] Common issues:
+        echo        1. Network connection problem
+        echo        2. Insufficient disk space
+        echo        3. Version conflict
+        echo.
+        pause
+        exit /b 1
+    )
 )
 echo.
 echo [OK] Dependencies installed
 echo.
 
 REM 修复 onnxruntime 版本冲突
-echo [1.3] Fixing onnxruntime version conflict...
+echo [1.4] Fixing onnxruntime version conflict...
 REM funasr-onnx 会自动安装 onnxruntime (CPU版), 但我们只需要 onnxruntime-gpu
 "%PYTHON_EXEC%" -m pip uninstall onnxruntime -y >nul 2>&1
 if exist "%SITE_PACKAGES%\onnxruntime" (
@@ -146,12 +213,23 @@ if exist "%SITE_PACKAGES%\onnxruntime" (
     rmdir /s /q "%SITE_PACKAGES%\onnxruntime" >nul 2>&1
 )
 echo [INFO] Reinstalling onnxruntime-gpu to ensure integrity...
-"%PYTHON_EXEC%" -m pip install --force-reinstall --no-deps onnxruntime-gpu==1.18.0 -i %PYPI_MIRROR% -q
+if defined PYPI_MIRROR (
+    "%PYTHON_EXEC%" -m pip install --force-reinstall --no-deps onnxruntime-gpu==1.18.0 -i %PYPI_MIRROR% -q
+    if errorlevel 1 (
+        echo [WARNING] Mirror source failed, trying official PyPI...
+        "%PYTHON_EXEC%" -m pip install --force-reinstall --no-deps onnxruntime-gpu==1.18.0 -q
+        if errorlevel 1 (
+            echo [WARNING] Failed to install onnxruntime-gpu
+        )
+    )
+) else (
+    "%PYTHON_EXEC%" -m pip install --force-reinstall --no-deps onnxruntime-gpu==1.18.0 -q
+)
 echo [OK] onnxruntime-gpu installed
 echo.
 
 REM 修复 PyTorch DLL 依赖
-echo [1.4] Fixing PyTorch DLL dependencies...
+echo [1.5] Fixing PyTorch DLL dependencies...
 if exist "%SITE_PACKAGES%\torch\lib\libiomp5md.dll" (
     if not exist "%SITE_PACKAGES%\torch\lib\libomp140.x86_64.dll" (
         echo [INFO] Copying libiomp5md.dll to libomp140.x86_64.dll...
