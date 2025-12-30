@@ -215,7 +215,7 @@ class JobSettings:
 
     # === 旧版设置 (兼容) ===
     model: str = "medium"
-    compute_type: str = "float16"
+    compute_type: str = "auto"  # auto: 根据显存自动选择 (>=8GB用int8_float16, <8GB用int8)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size: int = 16
     word_timestamps: bool = False
@@ -326,7 +326,7 @@ class JobSettings:
             # 旧版配置
             engine=data.get("engine", "sensevoice"),
             model=data.get("model", "medium"),
-            compute_type=data.get("compute_type", "float16"),
+            compute_type=data.get("compute_type", "auto"),
             device=data.get("device", "cuda"),
             batch_size=data.get("batch_size", 16),
             word_timestamps=data.get("word_timestamps", False),

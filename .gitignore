@@ -55,7 +55,6 @@ Thumbs.db
 venv/
 env/
 ENV/
-.env
 
 # 临时文件
 *.tmp

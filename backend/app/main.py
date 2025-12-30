@@ -347,7 +347,7 @@ ModelPreloadConfig.print_config()
 
 class TranscribeSettings(BaseModel):
     model: str = "medium"
-    compute_type: str = "float16"
+    compute_type: str = "auto"  # auto: 根据显存自动选择
     device: str = "cuda"
     batch_size: int = 16
     word_timestamps: bool = False
@@ -758,7 +758,7 @@ async def unload_model(request: dict):
 
         model_id = request.get("model_id")
         device = request.get("device", "cuda")
-        compute_type = request.get("compute_type", "float16")
+        compute_type = request.get("compute_type", "auto")
 
         if not model_id:
             return {
@@ -825,7 +825,7 @@ async def load_specific_model(request: dict):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         settings = JobSettings(
             model=model_id,
-            compute_type="float16",
+            compute_type="auto",  # 自动根据显存选择
             device=device
         )
 

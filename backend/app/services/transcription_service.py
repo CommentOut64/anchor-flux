@@ -744,7 +744,7 @@ class TranscriptionService:
         if self._optimization_config:
             optimized = JobSettings(
                 model=base_settings.model if base_settings else "medium",
-                compute_type=base_settings.compute_type if base_settings else "float16",
+                compute_type=base_settings.compute_type if base_settings else "auto",
                 device=self._optimization_config.recommended_device,
                 batch_size=self._optimization_config.batch_size,
                 word_timestamps=base_settings.word_timestamps if base_settings else False
@@ -2625,6 +2625,13 @@ class TranscriptionService:
             if job:
                 job.message = f"加载模型 {settings.model}"
 
+            # 处理 auto 模式：解析为具体的计算类型
+            compute_type_resolved = settings.compute_type
+            if compute_type_resolved == "auto":
+                from app.services.whisper_service import get_auto_compute_type
+                compute_type_resolved = get_auto_compute_type(settings.device)
+                self.logger.info(f"auto模式已解析为: {compute_type_resolved}")
+
             # 首先尝试仅使用本地文件 (使用 Faster-Whisper)
             try:
                 from app.core.config import config
@@ -2632,7 +2639,7 @@ class TranscriptionService:
                 m = WhisperModel(
                     settings.model,
                     device=settings.device,
-                    compute_type=settings.compute_type,
+                    compute_type=compute_type_resolved,  # 使用解析后的计算类型
                     download_root=str(config.HF_CACHE_DIR),
                     local_files_only=True  # 禁止自动下载，只使用本地文件
                 )
@@ -2648,7 +2655,7 @@ class TranscriptionService:
                 m = WhisperModel(
                     settings.model,
                     device=settings.device,
-                    compute_type=settings.compute_type,
+                    compute_type=compute_type_resolved,  # 使用解析后的计算类型
                     download_root=str(config.HF_CACHE_DIR),
                     local_files_only=False  # 允许下载
                 )

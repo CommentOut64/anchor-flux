@@ -147,7 +147,7 @@ class TranscribeSettings(BaseModel):
     # === 旧版配置 (兼容) ===
     engine: str = "sensevoice"  # whisper 或 sensevoice
     model: str = "medium"
-    compute_type: str = "float16"
+    compute_type: str = "auto"  # auto: 根据显存自动选择
     device: str = "cuda"
     batch_size: int = 16
     word_timestamps: bool = False
@@ -433,7 +433,7 @@ def create_transcription_router(
                         # 保留旧版字段兼容
                         engine=settings_dict.get('engine', 'sensevoice'),
                         model=settings_dict.get('model', 'medium'),
-                        compute_type=settings_dict.get('compute_type', 'float16'),
+                        compute_type=settings_dict.get('compute_type', 'auto'),
                         device=settings_dict.get('device', 'cuda'),
                         batch_size=settings_dict.get('batch_size', 16),
                         word_timestamps=settings_dict.get('word_timestamps', False),
