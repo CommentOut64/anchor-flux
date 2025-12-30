@@ -549,7 +549,7 @@ function stopPeaksPolling() {
 }
 
 // 渲染字幕区域
-// V3.7.3: 增强日志，便于调试 regions 消失问题
+// V3.1.0: 增强日志，便于调试 regions 消失问题
 function renderSubtitleRegions() {
   // 前置检查
   if (!isReady.value) {
@@ -1286,7 +1286,7 @@ function formatTime(seconds) {
 }
 
 // 监听字幕变化
-// V3.7.3: 修复 watch 监听失效问题 - 同时监听数组长度确保 splice 操作也能触发
+// V3.1.0: 修复 watch 监听失效问题 - 同时监听数组长度确保 splice 操作也能触发
 watch(
   () => projectStore.subtitles,
   (newVal, oldVal) => {
@@ -1299,7 +1299,7 @@ watch(
         renderSubtitleRegions();
       }, 100);
     } else {
-      // V3.7.3: 如果当前条件不满足，延迟重试
+      // V3.1.0: 如果当前条件不满足，延迟重试
       if (!isReady.value) {
         console.log('[WaveformTimeline] 波形未就绪，延迟 500ms 后重试渲染 regions');
         setTimeout(() => {

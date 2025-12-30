@@ -472,7 +472,7 @@ async function loadProject() {
         // 暂停状态也需要订阅SSE，以便接收恢复信号
         console.log('[EditorView] 任务已暂停，订阅SSE以接收恢复信号')
         subscribeSSE()
-        // V3.7.4: 暂停状态下立即刷新一次进度，不等待 SSE 连接
+        // V3.1.0: 暂停状态下立即刷新一次进度，不等待 SSE 连接
         refreshTaskProgress()
       } else if (jobStatus.status === 'finished') {
         // 任务已完成，useProxyVideo会自动处理视频转码状态
@@ -495,7 +495,7 @@ async function loadProject() {
       await loadTranscribingSegments()
       // 订阅SSE，以便用户点击恢复后能收到状态变更
       subscribeSSE()
-      // V3.7.4: 暂停状态下立即刷新一次进度，不等待 SSE 连接
+      // V3.1.0: 暂停状态下立即刷新一次进度，不等待 SSE 连接
       refreshTaskProgress()
     } else if (jobStatus.status === 'created') {
       // 任务刚创建，订阅SSE等待开始
@@ -691,7 +691,7 @@ function subscribeSSE() {
       handleReplaceChunk(data)
     },
 
-    // V3.7.3: 恢复字幕事件（断点续传后恢复）
+    // V3.1.0: 恢复字幕事件（断点续传后恢复）
     onRestored(data) {
       console.log('[EditorView] 收到恢复字幕:', data)
       handleRestoredChunk(data)
@@ -879,7 +879,7 @@ function handleReplaceChunk(data) {
 }
 
 /**
- * V3.7.3: 处理恢复的字幕（断点续传后恢复）
+ * V3.1.0: 处理恢复的字幕（断点续传后恢复）
  * 后端数据格式: { chunk_index, sentences: [...], is_restore: true }
  */
 function handleRestoredChunk(data) {

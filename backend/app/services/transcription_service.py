@@ -1235,7 +1235,7 @@ class TranscriptionService:
 
     def _force_remove_directory(self, directory: Path, job_id: str, max_retries: int = 3):
         """
-        V3.7.5: 强制删除目录，处理 Windows 文件占用问题
+        V3.1.0: 强制删除目录，处理 Windows 文件占用问题
 
         策略：
         1. 先触发垃圾回收，释放可能的文件句柄
@@ -1342,7 +1342,7 @@ class TranscriptionService:
 
                 # 最后删除任务目录
                 if job_dir.exists():
-                    # V3.7.5: 使用强制删除逻辑，处理 Windows 文件占用问题
+                    # V3.1.0: 使用强制删除逻辑，处理 Windows 文件占用问题
                     self._force_remove_directory(job_dir, job_id)
                     self.logger.info(f"已删除任务数据: {job_id}")
             except Exception as e:
@@ -4365,7 +4365,7 @@ class TranscriptionService:
         # 调试日志：确认方法被调用
         self.logger.debug(f"开始后处理增强: {len(sentences)} 句, enhancement={solution_config.enhancement.value}")
 
-        # V3.5.2: 极速模式（sensevoice_only）完全跳过 Whisper 补刀
+        # V3.1.0: 极速模式（sensevoice_only）完全跳过 Whisper 补刀
         # 极速模式的设计目标是纯 SenseVoice 输出，不加载 Whisper 模型
         if solution_config.enhancement == EnhancementMode.OFF:
             self.logger.info("极速模式: 跳过所有 Whisper 补刀和仲裁")
@@ -4614,7 +4614,7 @@ class TranscriptionService:
 
             self.logger.info("使用新架构 PreprocessingPipeline（Stage模式）")
 
-            # V3.9.1: 根据语言选择 VAD 配置
+            # V3.1.0: 根据语言选择 VAD 配置
             # 英语使用 Whisper，需要合并 VAD（避免幻觉）
             # 其他语言使用 SenseVoice，需要保留停顿信息以获得更好的断句
             language = getattr(job.settings, 'language', 'auto')

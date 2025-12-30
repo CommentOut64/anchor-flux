@@ -692,7 +692,7 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   /**
-   * V3.7.3: 恢复字幕（断点续传后恢复）
+   * V3.1.0: 恢复字幕（断点续传后恢复）
    *
    * 当收到 subtitle.restored 事件时调用
    * 将从 Checkpoint 恢复的字幕添加到前端，确保不会与已有字幕冲突
@@ -835,7 +835,7 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   /**
-   * V3.7.2: 从 SSE 后端推送更新双流进度
+   * V3.1.0: 从 SSE 后端推送更新双流进度
    * 这是更准确的进度来源，因为后端知道真实的 Chunk 处理进度
    *
    * @param {Object} progress - 从 SSE progress.overall 事件获取的进度数据
@@ -1048,9 +1048,9 @@ export const useProjectStore = defineStore("project", () => {
     // Phase 5: 双模态架构方法
     appendOrUpdateDraft,
     replaceChunk,
-    restoreChunk, // V3.7.3: 断点续传字幕恢复
+    restoreChunk, // V3.1.0: 断点续传字幕恢复
     updateDualStreamProgress,
-    updateDualStreamProgressFromSSE,  // V3.7.2: 从 SSE 更新双流进度
+    updateDualStreamProgressFromSSE,  // V3.1.0: 从 SSE 更新双流进度
 
     // 辅助方法
     formatTimestamp,

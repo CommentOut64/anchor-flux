@@ -64,7 +64,7 @@ onMounted(async () => {
       // 同步任务列表到 store（第二阶段修复：实时更新）
       if (state.jobs && Array.isArray(state.jobs)) {
         state.jobs.forEach(job => {
-          // V3.7.5: 过滤掉 filename 为空的任务，避免显示"未知任务"
+          // V3.1.0: 过滤掉 filename 为空的任务，避免显示"未知任务"
           if (!job.filename || job.filename.trim() === '') {
             console.warn(`[App] 跳过 filename 为空的任务: ${job.id}`)
             return
@@ -119,7 +119,7 @@ onMounted(async () => {
       // 更新 store 中的任务状态
       const task = taskStore.getTask(jobId)
       if (task) {
-        // V3.7.4: onJobStatus 只更新 status 和 message，不更新 progress
+        // V3.1.0: onJobStatus 只更新 status 和 message，不更新 progress
         // 避免后端推送的低进度（如恢复时的 0）覆盖前端已有的高进度
         // progress 的更新由 onJobProgress 专门负责
         taskStore.updateTaskStatus(jobId, status, data.message || '')
@@ -159,7 +159,7 @@ onMounted(async () => {
       })
     },
 
-    // [V3.6.3] 新增：任务删除事件处理，解决幽灵任务问题
+    // [V3.1.0] 新增：任务删除事件处理，解决幽灵任务问题
     onJobRemoved(jobId) {
       console.log(`[App] 收到任务删除事件: ${jobId}`)
 

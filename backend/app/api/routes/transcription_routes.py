@@ -803,7 +803,7 @@ def create_transcription_router(
         all_tasks = {}  # 使用 dict 避免重复，key 为 job_id
 
         # 1. 队列中的任务（处理中或等待中）- 优先级最高
-        # [V3.6.3] 过滤幽灵任务：检测目录是否存在，不存在则从内存移除
+        # [V3.1.0] 过滤幽灵任务：检测目录是否存在，不存在则从内存移除
         ghost_job_ids = []
         with queue_service.lock:
             for job_id, job in list(queue_service.jobs.items()):
@@ -824,7 +824,7 @@ def create_transcription_router(
                     "phase": job.phase if hasattr(job, 'phase') else 'unknown'
                 }
 
-        # [V3.6.3] 清理检测到的幽灵任务
+        # [V3.1.0] 清理检测到的幽灵任务
         if ghost_job_ids:
             logger = logging.getLogger(__name__)
             with queue_service.lock:
@@ -1186,7 +1186,7 @@ def create_transcription_router(
             with open(checkpoint_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
-            # V3.7.3+: 优先从 transcription.sentences_snapshot 读取（实时字幕快照）
+            # V3.1.0+: 优先从 transcription.sentences_snapshot 读取（实时字幕快照）
             transcription = data.get("transcription", {})
             sentences_snapshot = transcription.get("sentences_snapshot", [])
 
@@ -1194,7 +1194,7 @@ def create_transcription_router(
             detected_language = None
 
             if sentences_snapshot:
-                # 使用新格式（V3.7.3+ 实时字幕快照）
+                # 使用新格式（V3.1.0+ 实时字幕快照）
                 for sentence in sentences_snapshot:
                     all_segments.append({
                         "id": sentence.get("_index", 0),
